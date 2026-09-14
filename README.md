@@ -32,12 +32,12 @@ scripts/build-payload.sh <payload.raw> <runtime-size> [bootstack-directory] [out
 For example:
 
 ```sh
-scripts/build-payload.sh path/to/payload.raw 0x100000 path/to/bootstack .cache/payload
+scripts/build-payload.sh path/to/payload.raw 0x100000 path/to/bootstack
 ```
 
 `runtime-size` is the full memory extent of the payload, including BSS. It must be at least the file size. Numeric arguments accept decimal or `0x` hexadecimal notation.
 
-The script builds Switchvisor and prints the paths to `bl33.bin` and `manifest.json`. Their new `build.XXXXXX` directory contains:
+The script builds Switchvisor and writes these files to `dist/`:
 
 | File | Contents |
 |---|---|
@@ -45,14 +45,16 @@ The script builds Switchvisor and prints the paths to `bl33.bin` and `manifest.j
 | `manifest.json` | Payload entry, sizes, hashes, and bootstack pins |
 | `bootstrap.raw` | Switchvisor bootstrap for packaging another payload |
 
-The default bootstack directory is `../scarlet-project-switch/projects/aarch64-switch-console/.scarlet/bootstack`. The default output directory is `.cache/payload`.
+The default bootstack directory is `../scarlet-project-switch/projects/aarch64-switch-console/.scarlet/bootstack`. An optional output-directory argument overrides `dist/`. The three output files are replaced after the build and packaging succeed.
+
+Copy `dist/bl33.bin` to the microSD path configured for BL33 in your Hekate L4T entry. For the Scarlet Switch Console entry, replace `/switchroot/scarlet-console/bl33.bin`.
 
 ### Using U-Boot
 
 The pinned native BL33 can be used directly as the external payload:
 
 ```sh
-scripts/build-payload.sh path/to/bootstack/bl33.bin 0x68200 path/to/bootstack .cache/payload
+scripts/build-payload.sh path/to/bootstack/bl33.bin 0x68200 path/to/bootstack
 ```
 
 The runtime size above applies to the pinned BL33 in `config/bootstack.json`. For another image, supply its own full runtime extent.
@@ -74,7 +76,7 @@ This subtracts the VMM from memory banks and preserves existing firmware reserva
 Pass payload options after both directory arguments:
 
 ```sh
-scripts/build-payload.sh path/to/payload.raw 0x100000 path/to/bootstack .cache/payload \
+scripts/build-payload.sh path/to/payload.raw 0x100000 path/to/bootstack dist \
   --entry-offset 0x40 --x0 0x42
 ```
 
@@ -82,12 +84,12 @@ scripts/build-payload.sh path/to/payload.raw 0x100000 path/to/bootstack .cache/p
 
 ### Replacing the payload
 
-Reuse `bootstrap.raw` from that build directory to package another raw file without rebuilding Switchvisor. Replace `build.XXXXXX` below with the directory from your build:
+Reuse `dist/bootstrap.raw` to package another raw file without rebuilding Switchvisor:
 
 ```sh
 target/debug/switchvisor-tool pack-payload \
-  .cache/payload/build.XXXXXX/bootstrap.raw path/to/bootstack \
-  path/to/another.raw 0x100000 .cache/another-bl33.bin
+  dist/bootstrap.raw path/to/bootstack \
+  path/to/another.raw 0x100000 dist/another-bl33.bin
 ```
 
 The same entry and register options can be appended to this command. The output file must be new.

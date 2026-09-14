@@ -1,4 +1,5 @@
 /target/
+/dist/
 /.cache/
 /.direnv/
 __pycache__/
