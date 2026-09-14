@@ -171,6 +171,7 @@ fn launch_payload(
     }
     smp::initialize();
     let _ = writeln!(screen, "STAGE2 ON - VMM RAM EXCLUDED");
+    smp::record(smp::Stage::Guest);
     unsafe { enter_payload(registers.as_ptr(), entry, STACK_TOP) }
 }
 
@@ -193,6 +194,7 @@ extern "C" fn rust_exception(registers: &mut [u64; 31]) {
             // Other SMCCC calls retain the native EL3 firmware service.
             unsafe { forward_smc(registers.as_mut_ptr()) };
         }
+        smp::record(smp::Stage::Guest);
         unsafe {
             asm!("msr elr_el2, {value}", "msr spsr_el2, {spsr}",
                 value = in(reg) (elr + 4), spsr = in(reg) spsr, options(nostack));
@@ -223,6 +225,10 @@ extern "C" fn rust_exception(registers: &mut [u64; 31]) {
         screen,
         "FATAL EL2 EXCEPTION\nESR = {esr:016x}\nFAR = {far:016x}\nHPFAR = {hpfar:016x}\nELR = {elr:016x}\nSPSR = {spsr:016x}\nCPU PARKED"
     );
+    smp::diagnostics(&mut screen);
+    if esr >> 26 == 0x2f {
+        let _ = writeln!(screen, "SERROR: FAR AND ELR MAY BE UNRELATED");
+    }
     unsafe {
         asm!("dsb sy", options(nostack));
     }

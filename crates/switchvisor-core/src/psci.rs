@@ -1,12 +1,13 @@
 //! Four pinned virtual CPUs. Firmware always receives the EL2 trampoline.
 //!
-//! Atomic state must be accessed through Normal, shareable EL2 mappings.
+//! EL2 keeps its data cache off. Use only atomic loads/stores, never exclusive
+//! read-modify-write instructions that require an external memory-system monitor.
 use crate::{
     IPA_LIMIT,
     payload::{RESIDENT_BASE, RESIDENT_SIZE},
     stage2::RAM_BASE,
 };
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering, fence};
 
 pub const CPU_COUNT: usize = 4;
 pub const CPU_OFF: u32 = 0x8400_0002;
@@ -30,81 +31,193 @@ pub struct Launch {
     pub context: u64,
 }
 
-pub struct Cpu {
+struct Cpu {
     state: AtomicU8,
     physical_started: AtomicBool,
     entry: AtomicU64,
     context: AtomicU64,
 }
 
-impl Default for Cpu {
+impl Cpu {
+    const fn new(boot_cpu: bool) -> Self {
+        Self {
+            state: AtomicU8::new(if boot_cpu { ON } else { OFF }),
+            physical_started: AtomicBool::new(boot_cpu),
+            entry: AtomicU64::new(0),
+            context: AtomicU64::new(0),
+        }
+    }
+}
+
+// Each participant owns one slot. Bit 0 means choosing; the other bits hold its
+// Bakery number. Sequentially consistent accesses order the selection protocol.
+// This is Lamport's algorithm, independently implemented using loads/stores.
+// TF-A uses Bakery locks for its cache-off power-state paths for the same reason:
+// https://trustedfirmware-a.readthedocs.io/en/latest/design/firmware-design.html#runtime-services-initialization
+struct Claims {
+    slots: [AtomicU64; CPU_COUNT],
+}
+
+impl Claims {
+    const fn new() -> Self {
+        Self {
+            slots: [const { AtomicU64::new(0) }; CPU_COUNT],
+        }
+    }
+
+    fn enter(&self, caller: usize) -> Claim<'_> {
+        let number = loop {
+            self.slots[caller].store(1, Ordering::SeqCst);
+            fence(Ordering::SeqCst);
+            let maximum = self
+                .slots
+                .iter()
+                .map(|slot| slot.load(Ordering::SeqCst) >> 1)
+                .max()
+                .unwrap_or(0);
+            if maximum == u64::MAX >> 1 {
+                // Withdraw before retrying so overflow cannot block a chooser.
+                self.slots[caller].store(0, Ordering::SeqCst);
+                core::hint::spin_loop();
+                continue;
+            }
+            let number = maximum + 1;
+            self.slots[caller].store(number << 1, Ordering::SeqCst);
+            break number;
+        };
+        for (other, slot) in self.slots.iter().enumerate() {
+            if other == caller {
+                continue;
+            }
+            while slot.load(Ordering::SeqCst) & 1 != 0 {
+                core::hint::spin_loop();
+            }
+            loop {
+                let theirs = slot.load(Ordering::SeqCst) >> 1;
+                if theirs == 0 || (theirs, other) >= (number, caller) {
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+        }
+        Claim(&self.slots[caller])
+    }
+}
+
+struct Claim<'a>(&'a AtomicU64);
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        self.0.store(0, Ordering::SeqCst);
+    }
+}
+
+pub struct Machine {
+    cpus: [Cpu; CPU_COUNT],
+    claims: Claims,
+}
+
+impl Default for Machine {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Cpu {
+impl Machine {
     pub const fn new() -> Self {
         Self {
-            state: AtomicU8::new(OFF),
-            physical_started: AtomicBool::new(false),
-            entry: AtomicU64::new(0),
-            context: AtomicU64::new(0),
+            cpus: [
+                Cpu::new(true),
+                Cpu::new(false),
+                Cpu::new(false),
+                Cpu::new(false),
+            ],
+            claims: Claims::new(),
         }
     }
 
-    pub fn initialize_boot_cpu(&self) {
-        self.physical_started.store(true, Ordering::Relaxed);
-        self.state.store(ON, Ordering::Release);
+    /// Mint exactly one non-cloneable participant per pinned physical CPU.
+    /// The mutable borrow prevents another set while these participants exist.
+    pub fn split(&mut self) -> [Participant<'_>; CPU_COUNT] {
+        let machine: &Self = self;
+        core::array::from_fn(|caller| Participant { machine, caller })
     }
+}
 
-    pub fn affinity(&self) -> i64 {
-        let state = self.state.load(Ordering::Acquire);
+/// Exclusive ownership of one caller slot and that CPU's launch consumer.
+/// Runtime operations need a mutable borrow, so a participant cannot re-enter.
+pub struct Participant<'a> {
+    machine: &'a Machine,
+    caller: usize,
+}
+
+impl Participant<'_> {
+    pub fn affinity(&self, target: usize) -> i64 {
+        let Some(cpu) = self.machine.cpus.get(target) else {
+            return INVALID_PARAMS;
+        };
+        let state = cpu.state.load(Ordering::Acquire);
         i64::from(if state == CLAIMED { PENDING } else { state })
     }
 
     /// Only the caller that claims OFF may publish a new context or boot hardware.
     /// No launch is visible until firmware has accepted its EL2 entry.
-    pub fn request(&self, launch: Launch, boot_physical: impl FnOnce() -> i64) -> i64 {
+    pub fn request(
+        &mut self,
+        target: usize,
+        launch: Launch,
+        boot_physical: impl FnOnce() -> i64,
+    ) -> i64 {
+        let Some(cpu) = self.machine.cpus.get(target) else {
+            return INVALID_PARAMS;
+        };
         if !guest_entry(launch.entry) {
             return INVALID_PARAMS;
         }
-        match self
-            .state
-            .compare_exchange(OFF, CLAIMED, Ordering::AcqRel, Ordering::Acquire)
         {
-            Ok(_) => (),
-            Err(ON) => return ALREADY_ON,
-            Err(_) => return ON_PENDING,
+            let _claim = self.machine.claims.enter(self.caller);
+            match cpu.state.load(Ordering::Acquire) {
+                OFF => cpu.state.store(CLAIMED, Ordering::Release),
+                ON => return ALREADY_ON,
+                _ => return ON_PENDING,
+            }
         }
-        self.entry.store(launch.entry, Ordering::Relaxed);
-        self.context.store(launch.context, Ordering::Relaxed);
-        if !self.physical_started.load(Ordering::Acquire) {
+        // Release the Bakery lock before calling firmware. Other callers may
+        // observe CLAIMED or claim another CPU while this physical boot runs.
+        cpu.entry.store(launch.entry, Ordering::Relaxed);
+        cpu.context.store(launch.context, Ordering::Relaxed);
+        if !cpu.physical_started.load(Ordering::Acquire) {
             let status = boot_physical();
             if status != 0 {
-                self.state.store(OFF, Ordering::Release);
+                cpu.state.store(OFF, Ordering::Release);
                 return status;
             }
-            self.physical_started.store(true, Ordering::Release);
+            cpu.physical_started.store(true, Ordering::Release);
         }
-        self.state.store(PENDING, Ordering::Release);
+        cpu.state.store(PENDING, Ordering::Release);
         0
     }
 
     /// The target calls this only after its vectors, EL2 mappings and Stage-2 exist.
-    pub fn take_launch(&self) -> Option<Launch> {
-        self.state
-            .compare_exchange(PENDING, ON, Ordering::AcqRel, Ordering::Acquire)
-            .ok()?;
-        Some(Launch {
-            entry: self.entry.load(Ordering::Relaxed),
-            context: self.context.load(Ordering::Relaxed),
-        })
+    pub fn take_launch(&mut self) -> Option<Launch> {
+        let cpu = &self.machine.cpus[self.caller];
+        if cpu.state.load(Ordering::Acquire) != PENDING {
+            return None;
+        }
+        // Only this non-cloneable participant consumes its CPU's launch. Read
+        // the context before ON permits the next power-off/CPU_ON generation.
+        let launch = Launch {
+            entry: cpu.entry.load(Ordering::Relaxed),
+            context: cpu.context.load(Ordering::Relaxed),
+        };
+        cpu.state.store(ON, Ordering::Release);
+        Some(launch)
     }
 
     /// The physical CPU remains in EL2, ready for a later virtual CPU_ON.
-    pub fn power_off(&self) {
-        self.state.store(OFF, Ordering::Release);
+    pub fn power_off(&mut self) {
+        self.machine.cpus[self.caller]
+            .state
+            .store(OFF, Ordering::Release);
     }
 }
 

@@ -1,5 +1,6 @@
-//! Static 36-bit EL2 identity map. Normal non-cacheable RAM permits shared atomics
-//! and DMA without a cacheable EL2 alias. MMIO stays Device-nGnRnE and XN.
+//! Static 36-bit EL2 identity map. Normal non-cacheable RAM permits shared
+//! loads/stores and DMA without a cacheable EL2 alias. Exclusive atomic RMW is
+//! not supported by this cache-off contract. MMIO stays Device-nGnRnE and XN.
 use crate::{
     IPA_LIMIT, PAGE_SIZE,
     stage2::{GIB, RAM_BASE, Table},

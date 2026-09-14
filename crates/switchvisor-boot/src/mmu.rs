@@ -24,6 +24,7 @@ pub unsafe fn enable() {
             root = in(reg) ROOT.0.get() as u64, options(nostack));
         asm!("mrs {sctlr}, sctlr_el2", sctlr = out(reg) sctlr, options(nomem, nostack));
         // Keep EL2 caches disabled; the entire RAM map is Normal non-cacheable.
-        asm!("msr sctlr_el2, {sctlr}", "isb", sctlr = in(reg) (sctlr | 1), options(nostack));
+        asm!("msr sctlr_el2, {sctlr}", "isb",
+            sctlr = in(reg) ((sctlr | 1) & !((1 << 2) | (1 << 12))), options(nostack));
     }
 }
