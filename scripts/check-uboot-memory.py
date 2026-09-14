@@ -111,7 +111,7 @@ static bd_t bd;
         c.write_text(prefix + functions + (ROOT / "tests/fixtures/uboot-memory.c").read_text())
         bridge = temp / "libmc_policy.a"
         subprocess.run(["rustc", "--edition=2024", "--crate-type=staticlib", "-C", "panic=abort",
-            "-C", "opt-level=2", "--extern", f"switchvisor_core={ROOT / 'target/debug/libswitchvisor_core.rlib'}",
+            "-C", "opt-level=2", "--extern", f"switchvisor={ROOT / 'target/debug/libswitchvisor.rlib'}",
             str(ROOT / "tests/fixtures/mc-policy.rs"), "-o", str(bridge)], check=True)
         sources = [library / name for name in ["fdt.c", "fdt_ro.c", "fdt_rw.c", "fdt_wip.c",
             "fdt_sw.c", "fdt_strerror.c", "fdt_empty_tree.c", "fdt_addresses.c"]]

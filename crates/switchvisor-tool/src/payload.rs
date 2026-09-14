@@ -1,7 +1,7 @@
 use std::{ffi::OsString, fs, io::Write as _, path::Path};
 
 use serde_json::{Value, json};
-use switchvisor_core::{
+use switchvisor::{
     image::UbootImage,
     payload::{
         CONFIG_OFFSET, CONFIG_SIZE, LOAD_BASE, MAX_PACKAGE_SIZE, Payload, RESIDENT_BASE,
@@ -34,14 +34,25 @@ fn field(bytes: &[u8], offset: usize) -> Result<u64, String> {
 }
 
 pub fn pack(args: &[OsString]) -> Result<Value, String> {
-    if args.len() < 5 || (args.len() - 5) % 2 != 0 {
+    if args.len() < 5 {
         return Err(crate::USAGE.into());
     }
     let mut entry_offset = 0;
     let mut registers = [0u64; 8];
     let mut custom_registers = false;
     let mut used = [false; 9];
-    for pair in args[5..].chunks_exact(2) {
+    let mut usb_uart = false;
+    let mut cursor = 5;
+    while cursor < args.len() {
+        if args[cursor] == "--usb-uart" {
+            if usb_uart {
+                return Err("duplicate payload option --usb-uart".into());
+            }
+            usb_uart = true;
+            cursor += 1;
+            continue;
+        }
+        let pair = args.get(cursor..cursor + 2).ok_or(crate::USAGE)?;
         let flag = pair[0].to_str().ok_or("option is not UTF-8")?;
         let index = match flag {
             "--entry-offset" => 8,
@@ -66,6 +77,7 @@ pub fn pack(args: &[OsString]) -> Result<Value, String> {
             registers[index] = value;
             custom_registers = true;
         }
+        cursor += 2;
     }
     let runtime_size = number(&args[3])?;
     let raw = read(Path::new(&args[0]))?;
@@ -120,6 +132,7 @@ pub fn pack(args: &[OsString]) -> Result<Value, String> {
         entry_offset,
         registers,
         preserve_boot_args: !custom_registers,
+        usb_uart,
         crc32: crc32(&data),
     };
     let descriptor = payload.encode().map_err(|e| e.to_string())?;
@@ -155,8 +168,8 @@ pub fn pack(args: &[OsString]) -> Result<Value, String> {
     Ok(json!({
         "kind":"el1-raw-payload", "hardware_validated":false, "stage2_enabled":true,
         "stage2":{"ipa_equals_pa":true,"ipa_bits":36,"resident_size_bytes":RESIDENT_SIZE,
-            "physical_interrupts":"el1","cpu_count":switchvisor_core::psci::CPU_COUNT,
-            "mc_trap_base":format!("{:#x}",switchvisor_core::mc::BASE), "virtual_carveout":"gsc5"},
+            "physical_interrupts":"el1","cpu_count":switchvisor::psci::CPU_COUNT,
+            "mc_trap_base":format!("{:#x}",switchvisor::mc::BASE), "virtual_carveout":"gsc5"},
         "output":output.display().to_string(), "sha256":digest(&bytes), "file_size_bytes":bytes.len(),
         "bootstrap":{"load_base":format!("{LOAD_BASE:#x}"), "resident_base":format!("{RESIDENT_BASE:#x}"),
             "file_size_bytes":raw.len(), "runtime_size_bytes":field(&raw,32)?, "raw_sha256":digest(&raw)},
@@ -165,5 +178,9 @@ pub fn pack(args: &[OsString]) -> Result<Value, String> {
             "load_base":format!("{LOAD_BASE:#x}"), "entry":format!("{:#x}",payload.entry().map_err(|e|e.to_string())?),
             "stack_top":format!("{STACK_TOP:#x}"), "preserve_boot_args":payload.preserve_boot_args, "registers":registers},
         "probe_fdt_offset":raw.len(), "probe_fdt_sha256":digest(probe), "bootstack":bootstack
+        ,"usb_uart":{"enabled":usb_uart,"compatible":"ns16550a",
+            "gpa":format!("{:#x}",switchvisor::vdev::uart::BASE),"interrupts":false,
+            "transport":"cdc-acm","vid":switchvisor::drivers::usb::cdc::VID,
+            "pid":switchvisor::drivers::usb::cdc::PID}
     }))
 }

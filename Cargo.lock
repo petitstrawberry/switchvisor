@@ -147,14 +147,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "switchvisor-boot"
-version = "0.1.0"
-dependencies = [
- "switchvisor-core",
-]
-
-[[package]]
-name = "switchvisor-core"
+name = "switchvisor"
 version = "0.1.0"
 
 [[package]]
@@ -164,7 +157,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "switchvisor-core",
+ "switchvisor",
 ]
 
 [[package]]

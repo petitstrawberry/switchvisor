@@ -25,7 +25,7 @@
           };
         in {
           default = pkgs.mkShell {
-            packages = [ rust pkgs.llvmPackages.llvm pkgs.ripgrep pkgs.git pkgs.qemu pkgs.python3 ];
+            packages = [ rust pkgs.llvmPackages.llvm pkgs.ripgrep pkgs.git pkgs.qemu pkgs.python3 pkgs.dtc ];
             shellHook = ''
               # Listing Cargo's bin explicitly prevents it from taking priority over Nix tools.
               export PATH="${rust}/bin:$PATH:''${CARGO_HOME:-$HOME/.cargo}/bin"

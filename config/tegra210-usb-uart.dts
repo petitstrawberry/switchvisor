@@ -1,0 +1,61 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Guest console/USB policy for the pinned Noble ODIN (Erista) platform DTB.
+/dts-v1/;
+/plugin/;
+
+/ {
+    fragment@0 {
+        target-path = "/";
+        __overlay__ {
+            #address-cells = <2>;
+            #size-cells = <2>;
+            serial@700ff000 {
+                compatible = "ns16550a";
+                reg = <0 0x700ff000 0 0x1000>;
+                clock-frequency = <1843200>;
+                reg-shift = <0>;
+                reg-io-width = <1>;
+                status = "okay";
+            };
+        };
+    };
+    fragment@1 {
+        target-path = "/chosen";
+        __overlay__ {
+            stdout-path = "/serial@700ff000";
+            stderr-path = "/serial@700ff000";
+        };
+    };
+    fragment@2 {
+        target-path = "/xusb@70090000";
+        __overlay__ { status = "disabled"; };
+    };
+    fragment@3 {
+        target-path = "/xusb_padctl@7009f000";
+        __overlay__ { status = "disabled"; };
+    };
+    fragment@4 {
+        target-path = "/usb_cd";
+        __overlay__ { status = "disabled"; };
+    };
+    fragment@5 {
+        target-path = "/mailbox@70098000";
+        __overlay__ { status = "disabled"; };
+    };
+    fragment@6 {
+        target-path = "/i2c@7000c000/bm92t@18";
+        __overlay__ { status = "disabled"; };
+    };
+    fragment@7 {
+        target-path = "/power-domain/xusba-pd";
+        __overlay__ { status = "disabled"; };
+    };
+    fragment@8 {
+        target-path = "/power-domain/xusbb-pd";
+        __overlay__ { status = "disabled"; };
+    };
+    fragment@9 {
+        target-path = "/power-domain/xusbc-pd";
+        __overlay__ { status = "disabled"; };
+    };
+};

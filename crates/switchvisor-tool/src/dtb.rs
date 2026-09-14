@@ -1,7 +1,7 @@
 use crate::{digest, read};
 use serde_json::{Value, json};
 use std::{ffi::OsString, fs, io::Write as _, path::Path};
-use switchvisor_core::{
+use switchvisor::{
     fdt_memory,
     memory::AddressRange,
     payload::{MAX_PACKAGE_SIZE, RESIDENT_BASE, RESIDENT_SIZE},

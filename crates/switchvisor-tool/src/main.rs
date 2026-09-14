@@ -1,18 +1,19 @@
 mod dtb;
 mod payload;
 mod profile;
+mod script;
 
 use std::{collections::BTreeMap, env, fs, io::Write as _, path::Path, process::ExitCode};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use switchvisor_core::{
+use switchvisor::{
     fdt::Fdt,
     image::{ScarletImage, UbootImage},
 };
 
-const USAGE: &str = "Usage: switchvisor-tool <command> <path>\n\nCommands:\n  inspect-bootstack <directory>    Verify the pinned BL31/BL33/nx-plat.dtimg\n  inspect-image <Image>            Inspect a raw Scarlet Linux Image\n  validate-profile <profile.json>  Validate complete, declared physical geometry\n  prepare-dtb <input.dtb> <output.dtb>\n                                  Exclude resident EL2 RAM from a guest DTB\n  pack-diagnostic <raw> <bootstack-directory> <output.bin>\n                                  Append the pinned Hekate probe FDT\n  pack-payload <bootstrap.raw> <bootstack-directory> <payload.raw> <runtime-size> <output.bin>\n               [--entry-offset <number>] [--x0 <number> ... --x7 <number>]\n                                  Inject an external raw EL1 payload\n\nCommands print JSON. Packers create new files; no command installs or boots an image.";
+const USAGE: &str = "Usage: switchvisor-tool <command> <path>\n\nCommands:\n  inspect-bootstack <directory>    Verify the pinned BL31/BL33/nx-plat.dtimg\n  inspect-image <Image>            Inspect a raw Scarlet Linux Image\n  validate-profile <profile.json>  Validate complete, declared physical geometry\n  prepare-dtb <input.dtb> <output.dtb>\n                                  Exclude resident EL2 RAM from a guest DTB\n  pack-diagnostic <raw> <bootstack-directory> <output.bin>\n                                  Append the pinned Hekate probe FDT\n  pack-payload <bootstrap.raw> <bootstack-directory> <payload.raw> <runtime-size> <output.bin>\n               [--entry-offset <number>] [--x0 <number> ... --x7 <number>] [--usb-uart]\n                                  Inject an external raw EL1 payload\n  pack-script <boot.cmd> <boot.scr>  Package a legacy U-Boot boot script\n\nCommands print JSON. Packers create new files; no command installs or boots an image.";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -145,7 +146,7 @@ fn pack_diagnostic(raw_path: &Path, directory: &Path, output: &Path) -> Result<V
                 .map_err(|_| "truncated diagnostic header")?,
         ))
     };
-    if field(8)? != switchvisor_core::BL33_LOAD_BASE
+    if field(8)? != switchvisor::BL33_LOAD_BASE
         || field(16)? != raw.len() as u64
         || field(24)? < raw.len() as u64
         || field(32)? < field(24)?
@@ -155,8 +156,8 @@ fn pack_diagnostic(raw_path: &Path, directory: &Path, output: &Path) -> Result<V
     }
     let slot = raw
         .get(
-            switchvisor_core::payload::CONFIG_OFFSET
-                ..switchvisor_core::payload::CONFIG_OFFSET + switchvisor_core::payload::CONFIG_SIZE,
+            switchvisor::payload::CONFIG_OFFSET
+                ..switchvisor::payload::CONFIG_OFFSET + switchvisor::payload::CONFIG_SIZE,
         )
         .ok_or("diagnostic has no payload descriptor slot")?;
     if slot.iter().any(|byte| *byte != 0) {
@@ -211,6 +212,14 @@ fn run() -> Result<(), String> {
     }
     if args.first().is_some_and(|command| command == "prepare-dtb") {
         let result = dtb::prepare(&args[1..])?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?
+        );
+        return Ok(());
+    }
+    if args.first().is_some_and(|command| command == "pack-script") {
+        let result = script::pack(&args[1..])?;
         println!(
             "{}",
             serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?

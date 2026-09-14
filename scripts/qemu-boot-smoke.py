@@ -38,7 +38,8 @@ def glyph_at(raw, row, column):
 
 def visible_markers(raw):
     checks = [(0,0,"S"), (15,0,"E"), (15,1,"N"), (16,0,"G")]
-    checks += [(row,12+i,c) for row in [0,2] for i,c in enumerate("EL2")]
+    # The title is SWITCHVISOR; CurrentEL is printed on row 2.
+    checks += [(2,12+i,c) for i,c in enumerate("EL2")]
     # Nonzero x0..x7 originate in the EL2t trampoline. Verify x0 and x7's 0x10x suffix.
     checks += [(row,18,"1") for row in [6,13]]
     checks += [(6,19,"0"), (6,20,"0"), (13,20,"7")]
@@ -131,6 +132,7 @@ def main():
                         visible = exception_markers(raw) if args.inject_exception_from else visible_markers(raw)
                         if len(raw)==FB_SIZE and visible and park_offset(final,loaded) is not None: break
                         if time.monotonic()>deadline:
+                            png(raw,output/"framebuffer.png")
                             registers = execute("human-monitor-command",{"command-line":"info registers"})
                             raise RuntimeError("Missing EL2/framebuffer/handoff/final markers:\n"+registers)
                         execute("cont")

@@ -6,9 +6,9 @@ task_output=${2:-dist/diagnostic}
 mkdir -p "$task_output"
 task_run_dir=$(mktemp -d "$task_output/.build.XXXXXX")
 trap 'rm -rf "$task_run_dir"' EXIT
-cargo build-boot
+cargo build-hv
 cargo build -p switchvisor-tool
-llvm-objcopy -O binary target/aarch64-unknown-none-softfloat/release/switchvisor-boot "$task_run_dir/bootstrap.raw"
+llvm-objcopy -O binary target/aarch64-unknown-none-softfloat/release/switchvisor "$task_run_dir/bootstrap.raw"
 target/debug/switchvisor-tool pack-diagnostic "$task_run_dir/bootstrap.raw" "$task_bootstack" "$task_run_dir/bl33.bin" > "$task_run_dir/manifest.json"
 python3 - "$task_run_dir/manifest.json" "$task_output" "$task_bootstack" <<'PY'
 import json

@@ -94,6 +94,58 @@ target/debug/switchvisor-tool pack-payload \
 
 The same entry and register options can be appended to this command. The output file must be new.
 
+## USB console
+
+Enable the EL2-owned USB 2.0 CDC ACM transport when packaging:
+
+```sh
+scripts/build-payload.sh path/to/bootstack/bl33.bin 0x68200 path/to/bootstack dist --usb-uart
+```
+
+Copy `dist/bl33.bin` to your BL33 path. This build also produces `dist/usb-uart.dtbo`, an overlay for the pinned Noble ODIN platform DTB. It adds a transmit-only `ns16550a` at GPA `0x700FF000` with byte-spaced registers and no `interrupts` property, selects it in `/chosen/stdout-path`, and disables guest USB, PADCTL, its mailbox, USB-C role control, and USB power domains.
+
+For the Scarlet Switch Console entry, put the overlay at `/switchroot/scarlet-console/usb-uart.dtbo`. Copy the entry's `boot.cmd`, and insert the following immediately before `bootm`, after the OS DTB has been selected and configured:
+
+```sh
+if itest.l *70019d4c == fec00000; then
+    if load mmc ${devnum}:${distro_bootpart} 0x8c000000 ${boot_dir}/usb-uart.dtbo && fdt addr ${fdtraddr} && fdt resize 8192 && fdt apply 0x8c000000; then
+        echoe Switchvisor USB console enabled
+    else
+        echoe Failed to apply Switchvisor USB console overlay
+        sleep 3
+        reset
+    fi
+fi
+```
+
+The GSC5 check selects the Switchvisor path; a native boot entry using this script keeps its original console and USB settings. Package the edited script into a new file:
+
+```sh
+cargo run -p switchvisor-tool -- pack-script path/to/boot.cmd dist/boot.scr
+```
+
+Copy that `boot.scr` to `/switchroot/scarlet-console/boot.scr` alongside the overlay and BL33. The packer refuses to overwrite an existing output file; use a new output path when rebuilding it.
+
+The pinned native BL33 already supports `fdt apply`. For another guest DTB, declare the same UART and disable that DTB's physical USB/PHY/role nodes; the supplied overlay targets the Noble node paths.
+
+Connect the Switch to a host with a USB data cable. On macOS, open the new CDC ACM port:
+
+```sh
+ls /dev/cu.usbmodem*
+USB_PORT=/dev/cu.usbmodemSWV00011
+screen "$USB_PORT" 115200
+```
+
+Set `USB_PORT` to the actual port name printed by `ls`.
+
+USB transmits the guest's UART bytes unchanged. Handle terminal newline conversion in the guest console or TTY layer, or configure it in the host terminal.
+
+With `--usb-uart`, Switchvisor polls USB for two seconds before starting the payload and prints the port/endpoint state, event/setup counts, and last error on Hekate's framebuffer. Connect the host cable before boot to capture enumeration progress. Boot continues when this probe finishes even if no host is present.
+
+Baud and line-coding settings are USB metadata. Guest transmit uses THR and polls LSR.THRE/TEMT; both stay ready even when the host is absent. RX is empty, IER reads zero, IIR reports no interrupt, and host input is discarded. The UART buffers up to 64 KiB; later bytes are dropped if that queue fills. Opening the host port asserts DTR and drains the queued logs.
+
+The polling USB profile services UART/owned-MMIO/SMC exits and traps guest WFI. USB polling is limited to once per 250 µs across all cores; queued bytes are copied only when the transport has staging space. Guest idle loops still keep the physical CPU awake, and a busy guest that makes no exits can delay USB service. Physical IRQ/FIQ/SError still pass directly to EL1. Guest USB controller accesses return an absent bus, while shared clock/reset/PMC writes preserve USB-owned resources and the XUDC SMMU client stays in bypass.
+
 ## Payload entry contract
 
 Supply a raw binary that can execute at the fixed BL33 load address. Its file bytes are copied unchanged, and the remaining memory through `runtime-size` is cleared.
@@ -125,9 +177,10 @@ Keep the VMM region out of bootloader allocations, OS memory banks, and device D
 ```sh
 cargo test --workspace
 cargo check-el2
-cargo build-boot
+cargo build-hv
 ```
 
 ## License
 
 Switchvisor is licensed under the GNU General Public License version 2 only. See [LICENSE](LICENSE).
+See [THIRD_PARTY.md](THIRD_PARTY.md) for Hekate attribution.

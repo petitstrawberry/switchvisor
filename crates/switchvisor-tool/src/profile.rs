@@ -1,8 +1,6 @@
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
-use switchvisor_core::memory::{
-    AddressRange, BootProfile, GuestRegion, GuestRegionKind, NamedRegion,
-};
+use switchvisor::memory::{AddressRange, BootProfile, GuestRegion, GuestRegionKind, NamedRegion};
 
 #[derive(Clone, Copy)]
 struct Address(u64);

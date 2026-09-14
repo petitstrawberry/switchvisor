@@ -1,6 +1,6 @@
 [alias]
-check-el2 = "check -p switchvisor-core --target aarch64-unknown-none-softfloat"
-build-boot = "build -p switchvisor-boot --features baremetal --target aarch64-unknown-none-softfloat --release"
+check-el2 = "check -p switchvisor --target aarch64-unknown-none-softfloat"
+build-hv = "build -p switchvisor --bin switchvisor --features baremetal --target aarch64-unknown-none-softfloat --release"
 
 [target.aarch64-unknown-none-softfloat]
 rustflags = ["-C", "target-cpu=cortex-a57", "-C", "target-feature=-neon"]

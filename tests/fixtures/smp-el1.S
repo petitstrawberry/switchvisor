@@ -77,6 +77,7 @@
 .if SV_FAULT != 0
     b wait_forever // the host inspects the faulting AP instead of CPU0.
 .else
+    bl uart_output
     // Send a physical SGI to all three APs, without vGIC emulation.
     ldr x9, =0x08000f00
     ldr w10, =0x000e0001
@@ -148,6 +149,7 @@ secondary:
 .if SV_MMU
     bl enable_s1
 .endif
+    bl uart_output
     mov x11, #0xbeef
     cmp x0, x11
     b.eq restarted
@@ -217,6 +219,20 @@ restarted:
     smc #0
     b failure
 .endif
+uart_output:
+    // CPU0 and APs contend on the real load/store-only virtual-device mutex.
+    ldr x9, =0x700ff000
+    mov x10, #128
+    mrs x11, mpidr_el1
+    and w11, w11, #3
+    add w11, w11, #'0'
+1:  ldrb w12, [x9, #5]
+    cmp w12, #0x60
+    b.ne failure
+    strb w11, [x9]
+    subs x10, x10, #1
+    b.ne 1b
+    ret
 enable_s1:
     ldr x9, =0xaa0b0000
     msr ttbr0_el1, x9

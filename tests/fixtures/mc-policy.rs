@@ -1,7 +1,7 @@
 //! Host-only C bridge to the production Rust memory-discovery policy.
 #![no_std]
 
-use switchvisor_core::mc;
+use switchvisor::mc;
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo<'_>) -> ! {

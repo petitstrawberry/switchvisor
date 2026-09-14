@@ -211,6 +211,113 @@ wait_irq:
     ldr x10, =SV_ADDRESS
     ldr x11, [x10]
     b failure
+.elseif SV_ACTION == 12 || SV_ACTION == 13 // Byte-spaced NS16550A, including a Stage-1 alias.
+.if SV_ACTION == 13
+    ldr x10, =0xaa092000
+    ldr x11, =0xaa093003
+    str x11, [x10, #2048]
+    ldr x10, =0xaa093000
+    ldr x11, =0x600000700ff707
+    str x11, [x10, #128]
+    mov x10, #0xaa090000
+    str xzr, [x10, #8]
+    dsb ish
+    tlbi vmalle1
+    dsb ish
+    ldr x11, =0xaa092003
+    str x11, [x10, #8]
+    dsb ish
+    isb
+    ldr x10, =0x60010000
+.else
+    ldr x10, =0x700ff000
+.endif
+    mov x9, #0xaa080000
+    // Scarlet's initialization writes DLAB/divisors before enabling 8N1/FIFO.
+    mov w11, #0x80
+    strb w11, [x10, #3]
+    mov w11, #1
+    strb w11, [x10]
+    strb wzr, [x10, #1]
+    ldrb w12, [x10]
+    str x12, [x9, #16]
+    mov w11, #3
+    strb w11, [x10, #3]
+    mov w11, #7
+    strb w11, [x10, #2]
+    strb w11, [x10, #1] // Interrupts remain disabled.
+    ldrb w12, [x10, #5]
+    str x12, [x9, #24]
+    ldrb w12, [x10, #2]
+    str x12, [x9, #32]
+    ldrb w12, [x10, #1]
+    str x12, [x9, #40]
+    mov w11, #0xa5
+    strb w11, [x10, #7]
+    ldrsb w12, [x10, #7]
+    str x12, [x9, #48]
+    ldrsb x12, [x10, #7]
+    str x12, [x9, #56]
+    add x13, x10, #7
+    ldarb w12, [x13]
+    str x12, [x9, #64]
+    ldrb wzr, [x13]
+    mov w11, #'A'
+    strb w11, [x10]
+    stlrb wzr, [x13]
+    ldrb w12, [x13]
+    str x12, [x9, #72]
+    ldrb w12, [x10] // No RX loopback or host input.
+    str x12, [x9, #80]
+.elseif SV_ACTION == 14 // USB is absent to EL1; shared resources retain EL2-owned bits.
+    .irp address,0x70090000,0x7009f000,0x700d0000,0x700d9180,0x7d000000,0x7d004000,0x7d008000,0x7d1ffff8
+    ldr x10, =\address
+    ldr x11, =0x1122334455667788
+    str x11, [x10]
+    ldr x12, [x10]
+    cbnz x12, failure
+    strb wzr, [x10]
+    ldrb w12, [x10]
+    cbnz w12, failure
+    strh wzr, [x10]
+    ldrh w12, [x10]
+    cbnz w12, failure
+    str wzr, [x10]
+    ldr w12, [x10]
+    cbnz w12, failure
+    .endr
+    mov x9, #0xaa080000
+    ldr x10, =0x60006000
+    mov w11, #-1
+    str w11, [x10, #0x10]
+    ldr w12, [x10, #0x10]
+    str x12, [x9, #16]
+    str wzr, [x10, #0x610] // XUSB clock source is read-only to the guest.
+    ldr w12, [x10, #0x610]
+    str x12, [x9, #24]
+    str w11, [x10, #0x330] // SET/CLR preserve write-one semantics.
+    ldr w12, [x10, #0x330]
+    str x12, [x9, #32]
+    ldr x10, =0x7000e400
+    str wzr, [x10, #0xf0]
+    ldr w12, [x10, #0xf0]
+    str x12, [x9, #40]
+    mov w11, #0x114 // Guest cannot toggle XUSBA power.
+    str w11, [x10, #0x30]
+    ldr w12, [x10, #0x30]
+    str x12, [x9, #48]
+    mov w11, #0x107 // Other power domains remain accessible.
+    str w11, [x10, #0x30]
+    ldr w12, [x10, #0x30]
+    str x12, [x9, #56]
+    ldr x10, =0x7001928c
+    str wzr, [x10]
+    ldr w12, [x10]
+    str x12, [x9, #64]
+.elseif SV_ACTION == 15 // Unsupported UART access width must not touch the physical page.
+    ldr x10, =SV_ADDRESS
+    ldr w11, [x10]
+    b failure
 .endif
     mov x9, #0xaa080000
     mov x10, #1
