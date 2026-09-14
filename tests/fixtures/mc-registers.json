@@ -1,0 +1,15 @@
+{
+  "description": "Synthetic MC registers using the pinned Hekate default Erista L4T carveout layout; not captured from hardware.",
+  "source": "https://github.com/CTCaer/hekate/blob/e487de8fdd6ca9c3f608d1d18c097a86355912b9/bootloader/l4t/l4t.c",
+  "words": {
+    "0x50": "0x1000",
+    "0x670": "0xfff00000",
+    "0x674": "0x1",
+    "0xc0c": "0xffe00000",
+    "0xc14": "0x8",
+    "0xc5c": "0xffd00000",
+    "0xc64": "0x2",
+    "0xcac": "0xffd40000",
+    "0xcb4": "0x6"
+  }
+}

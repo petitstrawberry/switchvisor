@@ -1,4 +1,4 @@
-//! CPU0 EL2 entry scaffold: diagnose entry and optionally hand off an external raw BL33.
+//! CPU0 EL2 monitor with protected resident RAM and an external raw BL33.
 #![no_std]
 #![no_main]
 
@@ -9,10 +9,16 @@ use core::{
 };
 use switchvisor_core::framebuffer::{Console, FramebufferLayout, PixelSink};
 use switchvisor_core::payload::{
-    CONFIG_SIZE, EXIT_HVC, LOAD_BASE, Payload, RESIDENT_BASE, STACK_TOP,
+    CONFIG_SIZE, EXIT_HVC, LOAD_BASE, Payload, RESIDENT_BASE, RESIDENT_SIZE, STACK_TOP,
 };
 
-global_asm!(include_str!("entry.S"));
+mod mc;
+mod stage2;
+
+global_asm!(include_str!("entry.S"),
+    hcr_low = const (switchvisor_core::stage2::HCR & 0xffff),
+    hcr_high = const (switchvisor_core::stage2::HCR >> 16),
+);
 
 // The packager patches this reserved slot. Volatile reads prevent constant folding its zeros.
 #[used]
@@ -23,7 +29,9 @@ unsafe extern "C" {
     static _boot_handoff: [u64; 8];
     static _start: u8;
     static __image_end: u8;
+    static __bss_end: u8;
     fn enter_payload(registers: *const u64, entry: u64, stack_top: u64) -> !;
+    fn forward_smc(registers: *mut u64);
 }
 
 struct PhysicalFramebuffer {
@@ -105,7 +113,10 @@ fn launch_payload(
 ) -> ! {
     let resident = core::ptr::addr_of!(_start) as u64;
     let image_end = core::ptr::addr_of!(__image_end) as u64;
-    if resident != RESIDENT_BASE || image_end - resident != payload.bootstrap_size {
+    if resident != RESIDENT_BASE
+        || image_end - resident != payload.bootstrap_size
+        || core::ptr::addr_of!(__bss_end) as u64 > RESIDENT_BASE + RESIDENT_SIZE
+    {
         let _ = writeln!(screen, "\nPAYLOAD REJECTED: BOOTSTRAP PLACEMENT");
         park()
     }
@@ -147,28 +158,59 @@ fn launch_payload(
         );
         core::ptr::write_bytes((STACK_TOP - 64 * 1024) as *mut u8, 0, 64 * 1024);
         asm!("dsb sy", "ic iallu", "dsb sy", "isb", options(nostack));
-        enter_payload(registers.as_ptr(), entry, STACK_TOP)
     }
+    if stage2::install().is_err() {
+        let _ = writeln!(screen, "STAGE2 REJECTED: TABLE PLACEMENT");
+        park()
+    }
+    let _ = writeln!(screen, "STAGE2 ON - VMM RAM EXCLUDED");
+    unsafe { enter_payload(registers.as_ptr(), entry, STACK_TOP) }
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn rust_exception(guest_x0: u64) -> ! {
+extern "C" fn rust_exception(registers: &mut [u64; 31]) {
     let esr: u64;
     let far: u64;
+    let hpfar: u64;
     let elr: u64;
     let spsr: u64;
     unsafe {
         asm!("mrs {value}, esr_el2", value = out(reg) esr, options(nomem, nostack));
         asm!("mrs {value}, far_el2", value = out(reg) far, options(nomem, nostack));
+        asm!("mrs {value}, hpfar_el2", value = out(reg) hpfar, options(nomem, nostack));
         asm!("mrs {value}, elr_el2", value = out(reg) elr, options(nomem, nostack));
         asm!("mrs {value}, spsr_el2", value = out(reg) spsr, options(nomem, nostack));
+    }
+    if esr >> 26 == 0x17 && esr & 0xffff == 0 && spsr & 0xf == 5 {
+        if switchvisor_core::stage2::unsupported_psci(registers[0])
+            || registers[0] as u32 == 0x8400_000a
+                && switchvisor_core::stage2::unsupported_psci(registers[1])
+        {
+            registers[0] = u64::MAX; // PSCI NOT_SUPPORTED.
+        } else {
+            // Other SMCCC calls retain the native EL3 firmware service.
+            unsafe { forward_smc(registers.as_mut_ptr()) };
+        }
+        unsafe {
+            asm!("msr elr_el2, {value}", "msr spsr_el2, {spsr}",
+                value = in(reg) (elr + 4), spsr = in(reg) spsr, options(nostack));
+        }
+        return;
+    }
+    if spsr & 0xf == 5 && mc::handle(esr, far, hpfar, registers) {
+        unsafe {
+            asm!("msr elr_el2, {value}", "msr spsr_el2, {spsr}",
+                value = in(reg) (elr + 4), spsr = in(reg) spsr, options(nostack));
+        }
+        return;
     }
     let mut screen = console();
     screen.clear();
     if esr >> 26 == 0x16 && esr & 0xffff == u64::from(EXIT_HVC) && spsr & 0xf == 5 {
         let _ = writeln!(
             screen,
-            "PAYLOAD EXIT\nCODE = {guest_x0:016x}\nEL1 PAYLOAD RETURNED\nCPU0 PARKED"
+            "PAYLOAD EXIT\nCODE = {:016x}\nEL1 PAYLOAD RETURNED\nCPU0 PARKED",
+            registers[0]
         );
         unsafe {
             asm!("dsb sy", options(nostack));
@@ -177,7 +219,7 @@ extern "C" fn rust_exception(guest_x0: u64) -> ! {
     }
     let _ = writeln!(
         screen,
-        "FATAL EL2 EXCEPTION\nESR = {esr:016x}\nFAR = {far:016x}\nELR = {elr:016x}\nSPSR = {spsr:016x}\nCPU PARKED"
+        "FATAL EL2 EXCEPTION\nESR = {esr:016x}\nFAR = {far:016x}\nHPFAR = {hpfar:016x}\nELR = {elr:016x}\nSPSR = {spsr:016x}\nCPU PARKED"
     );
     unsafe {
         asm!("dsb sy", options(nostack));

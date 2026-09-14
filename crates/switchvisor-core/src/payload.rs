@@ -4,7 +4,8 @@ use core::fmt;
 use crate::BL33_LOAD_BASE;
 
 pub const LOAD_BASE: u64 = BL33_LOAD_BASE;
-pub const RESIDENT_BASE: u64 = 0xb000_0000;
+pub const RESIDENT_BASE: u64 = 0xfec0_0000;
+pub const RESIDENT_SIZE: u64 = crate::HV_SIZE_BUDGET;
 pub const MAX_PACKAGE_SIZE: u64 = 64 * 1024 * 1024;
 pub const MAX_RUNTIME_SIZE: u64 = 64 * 1024 * 1024;
 pub const STACK_TOP: u64 = 0x8a80_0000;

@@ -4,8 +4,8 @@ use serde_json::{Value, json};
 use switchvisor_core::{
     image::UbootImage,
     payload::{
-        CONFIG_OFFSET, CONFIG_SIZE, LOAD_BASE, MAX_PACKAGE_SIZE, Payload, RESIDENT_BASE, STACK_TOP,
-        crc32,
+        CONFIG_OFFSET, CONFIG_SIZE, LOAD_BASE, MAX_PACKAGE_SIZE, Payload, RESIDENT_BASE,
+        RESIDENT_SIZE, STACK_TOP, crc32,
     },
 };
 
@@ -69,11 +69,11 @@ pub fn pack(args: &[OsString]) -> Result<Value, String> {
     }
     let runtime_size = number(&args[3])?;
     let raw = read(Path::new(&args[0]))?;
-    if raw.get(40..48) != Some(b"SVBOOT01".as_slice())
+    if raw.get(40..48) != Some(b"SVBOOT03".as_slice())
         || field(&raw, 8)? != RESIDENT_BASE
         || field(&raw, 16)? != raw.len() as u64
-        || field(&raw, 24)? != raw.len() as u64
-        || field(&raw, 32)? < raw.len() as u64
+        || field(&raw, 24)? < raw.len() as u64
+        || field(&raw, 32)? < field(&raw, 24)?
         || field(&raw, 32)? > 1024 * 1024
     {
         return Err(
@@ -153,7 +153,10 @@ pub fn pack(args: &[OsString]) -> Result<Value, String> {
     file.write_all(&bytes)
         .map_err(|e| format!("{}: {e}", output.display()))?;
     Ok(json!({
-        "kind":"el1-raw-payload", "hardware_validated":false, "stage2_enabled":false,
+        "kind":"el1-raw-payload", "hardware_validated":false, "stage2_enabled":true,
+        "stage2":{"ipa_equals_pa":true,"ipa_bits":36,"resident_size_bytes":RESIDENT_SIZE,
+            "physical_interrupts":"el1","cpu_count":1,
+            "mc_trap_base":format!("{:#x}",switchvisor_core::mc::BASE), "virtual_carveout":"gsc5"},
         "output":output.display().to_string(), "sha256":digest(&bytes), "file_size_bytes":bytes.len(),
         "bootstrap":{"load_base":format!("{LOAD_BASE:#x}"), "resident_base":format!("{RESIDENT_BASE:#x}"),
             "file_size_bytes":raw.len(), "runtime_size_bytes":field(&raw,32)?, "raw_sha256":digest(&raw)},

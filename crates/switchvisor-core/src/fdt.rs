@@ -11,6 +11,10 @@ pub enum FdtError {
     String,
     PathCapacity,
     DuplicateProperty,
+    OutputCapacity,
+    MemoryCells,
+    MemoryRanges,
+    ReservationConflict,
 }
 
 impl fmt::Display for FdtError {
@@ -126,7 +130,10 @@ impl<'a> Fdt<'a> {
         Ok(found)
     }
 
-    fn walk(&self, mut visit: impl FnMut(&str, &str, Property<'a>)) -> Result<(), FdtError> {
+    pub(crate) fn walk(
+        &self,
+        mut visit: impl FnMut(&str, &str, Property<'a>),
+    ) -> Result<(), FdtError> {
         let mut path = [0u8; 512];
         let mut saved_lengths = [0usize; 32];
         let mut path_len = 0;

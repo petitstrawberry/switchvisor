@@ -3,10 +3,14 @@
 #![forbid(unsafe_code)]
 
 pub mod fdt;
+pub mod fdt_memory;
 pub mod framebuffer;
 pub mod image;
+pub mod mc;
 pub mod memory;
+pub mod mmio;
 pub mod payload;
+pub mod stage2;
 
 pub const CPU_COUNT: usize = 4;
 pub const IPA_LIMIT: u64 = 1 << 36;

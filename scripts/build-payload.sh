@@ -13,7 +13,7 @@ task_options=()
 if [[ $# -gt 4 ]]; then task_options=("${@:5}"); fi
 mkdir -p "$task_output"
 task_run_dir=$(mktemp -d "$task_output/build.XXXXXX")
-SWITCHVISOR_LINK_BASE=0xB0000000 cargo build-boot
+SWITCHVISOR_LINK_BASE=0xFEC00000 cargo build-boot
 cargo build -p switchvisor-tool
 llvm-objcopy -O binary target/aarch64-unknown-none-softfloat/release/switchvisor-boot "$task_run_dir/bootstrap.raw"
 target/debug/switchvisor-tool pack-payload "$task_run_dir/bootstrap.raw" "$task_bootstack" "$task_payload" "$task_runtime_size" "$task_run_dir/bl33.bin" "${task_options[@]}" > "$task_run_dir/manifest.json"

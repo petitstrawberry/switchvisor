@@ -27,7 +27,8 @@ SECTIONS {
         __exception_stack_top = .;
         __bss_end = .;
     }
-    ASSERT(_start == 0xAA000000 || _start == 0xB0000000, "unsupported bootstrap placement")
+    ASSERT(_start == 0xAA000000 || _start == 0xFEC00000, "unsupported bootstrap placement")
     ASSERT(__bss_end - _start <= 1M, "diagnostic exceeds transient BL33 budget")
+    ASSERT(_start != 0xFEC00000 || __bss_end <= 0xFFC00000, "VMM exceeds protected region")
     /DISCARD/ : { *(.eh_frame*) *(.comment*) *(.note*) }
 }

@@ -7,11 +7,14 @@ _start:
     .quad __image_end - _start
     .quad __bss_start - _start
     .quad __bss_end - _start
-    .ascii "SVBOOT01"
+    .ascii "SVBOOT03"
 .Lentry:
     msr daifset, #15
     mrs x9, CurrentEL
     cmp x9, #8
+    b.ne .Lpark
+    mrs x9, mpidr_el1
+    tst x9, #0xff
     b.ne .Lpark
     mrs x10, sctlr_el2
     tbnz x10, #0, .Lpark
@@ -27,6 +30,13 @@ _start:
     ldr x21, [x20, #8]
     cmp x20, x21
     b.eq .Lrelocated
+    // Validate physical RAM before the first write to resident EL2 memory.
+    // The Rust helper is position independent and uses no resident/global data.
+    msr spsel, #1
+    adr x9, .Lentry_stack_top
+    mov sp, x9
+    bl mc_placement_valid
+    cbz x0, .Lpark
     mov x9, x20
     mov x10, x21
     ldr x11, [x20, #16]
@@ -66,6 +76,9 @@ _start:
 .Lpark:
     wfe
     b .Lpark
+    .balign 16
+    .space 2048
+.Lentry_stack_top:
 
 .section .text.vectors, "ax"
 .balign 2048
@@ -77,23 +90,64 @@ _el2_vectors:
     .endr
 .Lexception:
     msr daifset, #15
+    sub sp, sp, #256
+    stp x0, x1, [sp, #0]
+    stp x2, x3, [sp, #16]
+    stp x4, x5, [sp, #32]
+    stp x6, x7, [sp, #48]
+    stp x8, x9, [sp, #64]
+    stp x10, x11, [sp, #80]
+    stp x12, x13, [sp, #96]
+    stp x14, x15, [sp, #112]
+    stp x16, x17, [sp, #128]
+    stp x18, x19, [sp, #144]
+    stp x20, x21, [sp, #160]
+    stp x22, x23, [sp, #176]
+    stp x24, x25, [sp, #192]
+    stp x26, x27, [sp, #208]
+    stp x28, x29, [sp, #224]
+    str x30, [sp, #240]
     adrp x9, _exception_active
     add x9, x9, :lo12:_exception_active
     ldr x10, [x9]
     cbnz x10, .Lexception_park
     mov x10, #1
     str x10, [x9]
+    mov x19, sp
+    mov x0, sp
     msr spsel, #1
     adrp x9, __exception_stack_top
     add x9, x9, :lo12:__exception_stack_top
     mov sp, x9
-    b rust_exception
+    bl rust_exception
+    mov sp, x19
+    adrp x9, _exception_active
+    add x9, x9, :lo12:_exception_active
+    str xzr, [x9]
+    ldp x0, x1, [sp, #0]
+    ldp x2, x3, [sp, #16]
+    ldp x4, x5, [sp, #32]
+    ldp x6, x7, [sp, #48]
+    ldp x8, x9, [sp, #64]
+    ldp x10, x11, [sp, #80]
+    ldp x12, x13, [sp, #96]
+    ldp x14, x15, [sp, #112]
+    ldp x16, x17, [sp, #128]
+    ldp x18, x19, [sp, #144]
+    ldp x20, x21, [sp, #160]
+    ldp x22, x23, [sp, #176]
+    ldp x24, x25, [sp, #192]
+    ldp x26, x27, [sp, #208]
+    ldp x28, x29, [sp, #224]
+    ldr x30, [sp, #240]
+    add sp, sp, #256
+    eret
 .Lexception_park:
     wfe
     b .Lexception_park
 
 // Raw BL33 entry. The existing bootloader establishes its own runtime after this handoff.
-// CPU0 scaffold only; Stage-2, virtual PSCI/vGIC and device ownership are subsequent phases.
+// CPU0, Stage-2 identity map, physical interrupts passed directly to EL1.
 .section .text.handoff, "ax"
 .global enter_payload
 .type enter_payload, %function
@@ -129,13 +183,14 @@ enter_payload:
     mov x10, #0x300000
     msr cpacr_el1, x10
     msr hstr_el2, xzr
+    msr mdcr_el2, xzr
     mrs x10, midr_el1
     msr vpidr_el2, x10
     mrs x10, mpidr_el1
     msr vmpidr_el2, x10
-    // AArch64 EL1; physical exceptions and guest SMC enter EL2. Stage-2 remains off here.
-    movz x10, #0x0038
-    movk x10, #0x8008, lsl #16
+    // RW | VM | TSC. No IMO/FMO/AMO: physical exceptions remain at EL1.
+    movz x10, #{hcr_low}
+    movk x10, #{hcr_high}, lsl #16
     msr hcr_el2, x10
     isb
     tlbi vmalle1is
@@ -170,6 +225,36 @@ enter_payload:
     mov x30, xzr
     eret
 .size enter_payload, . - enter_payload
+
+// Native SMCCC forwarding. Rust/EL2 helpers use no FP/SIMD, so guest Q registers
+// are untouched. The SMCCC firmware must preserve x18-x30 and FP/SIMD state.
+.global forward_smc
+.type forward_smc, %function
+forward_smc:
+    stp x19, x30, [sp, #-16]!
+    mov x19, x0
+    ldp x0, x1, [x19, #0]
+    ldp x2, x3, [x19, #16]
+    ldp x4, x5, [x19, #32]
+    ldp x6, x7, [x19, #48]
+    ldp x8, x9, [x19, #64]
+    ldp x10, x11, [x19, #80]
+    ldp x12, x13, [x19, #96]
+    ldp x14, x15, [x19, #112]
+    ldp x16, x17, [x19, #128]
+    smc #0
+    stp x0, x1, [x19, #0]
+    stp x2, x3, [x19, #16]
+    stp x4, x5, [x19, #32]
+    stp x6, x7, [x19, #48]
+    stp x8, x9, [x19, #64]
+    stp x10, x11, [x19, #80]
+    stp x12, x13, [x19, #96]
+    stp x14, x15, [x19, #112]
+    stp x16, x17, [x19, #128]
+    ldp x19, x30, [sp], #16
+    ret
+.size forward_smc, . - forward_smc
 
 .section .data.handoff, "aw"
 .balign 8

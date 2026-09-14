@@ -1,3 +1,4 @@
+mod dtb;
 mod payload;
 mod profile;
 
@@ -11,7 +12,7 @@ use switchvisor_core::{
     image::{ScarletImage, UbootImage},
 };
 
-const USAGE: &str = "Usage: switchvisor-tool <command> <path>\n\nCommands:\n  inspect-bootstack <directory>    Verify the pinned BL31/BL33/nx-plat.dtimg\n  inspect-image <Image>            Inspect a raw Scarlet Linux Image\n  validate-profile <profile.json>  Validate complete, declared physical geometry\n  pack-diagnostic <raw> <bootstack-directory> <output.bin>\n                                  Append the pinned Hekate probe FDT\n  pack-payload <bootstrap.raw> <bootstack-directory> <payload.raw> <runtime-size> <output.bin>\n               [--entry-offset <number>] [--x0 <number> ... --x7 <number>]\n                                  Inject an external raw EL1 payload\n\nCommands print JSON. Packers create new files; no command installs or boots an image.";
+const USAGE: &str = "Usage: switchvisor-tool <command> <path>\n\nCommands:\n  inspect-bootstack <directory>    Verify the pinned BL31/BL33/nx-plat.dtimg\n  inspect-image <Image>            Inspect a raw Scarlet Linux Image\n  validate-profile <profile.json>  Validate complete, declared physical geometry\n  prepare-dtb <input.dtb> <output.dtb>\n                                  Exclude resident EL2 RAM from a guest DTB\n  pack-diagnostic <raw> <bootstack-directory> <output.bin>\n                                  Append the pinned Hekate probe FDT\n  pack-payload <bootstrap.raw> <bootstack-directory> <payload.raw> <runtime-size> <output.bin>\n               [--entry-offset <number>] [--x0 <number> ... --x7 <number>]\n                                  Inject an external raw EL1 payload\n\nCommands print JSON. Packers create new files; no command installs or boots an image.";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -131,7 +132,7 @@ fn inspect_image(path: &Path) -> Result<Value, String> {
 fn pack_diagnostic(raw_path: &Path, directory: &Path, output: &Path) -> Result<Value, String> {
     let bootstack = inspect_bootstack(directory)?;
     let raw = read(raw_path)?;
-    if raw.get(40..48) != Some(b"SVBOOT01".as_slice()) {
+    if raw.get(40..48) != Some(b"SVBOOT03".as_slice()) {
         return Err("raw image is not a Switchvisor EL2 diagnostic".into());
     }
     let field = |offset| -> Result<u64, String> {
@@ -146,8 +147,8 @@ fn pack_diagnostic(raw_path: &Path, directory: &Path, output: &Path) -> Result<V
     };
     if field(8)? != switchvisor_core::BL33_LOAD_BASE
         || field(16)? != raw.len() as u64
-        || field(24)? != raw.len() as u64
-        || field(32)? < raw.len() as u64
+        || field(24)? < raw.len() as u64
+        || field(32)? < field(24)?
         || field(32)? > 1024 * 1024
     {
         return Err("diagnostic header/load address/runtime extent mismatch".into());
@@ -206,6 +207,14 @@ fn run() -> Result<(), String> {
     let args: Vec<_> = env::args_os().skip(1).collect();
     if args.len() == 1 && (args[0] == "--help" || args[0] == "help" || args[0] == "-h") {
         println!("{USAGE}");
+        return Ok(());
+    }
+    if args.first().is_some_and(|command| command == "prepare-dtb") {
+        let result = dtb::prepare(&args[1..])?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?
+        );
         return Ok(());
     }
     if args
