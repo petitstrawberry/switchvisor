@@ -12,8 +12,8 @@
   outputs = { nixpkgs, rust-overlay, ... }:
     let
       systems = [ "aarch64-darwin" "aarch64-linux" "x86_64-linux" ];
-      forSystems = nixpkgs.lib.genAttrs systems;
-      environment = system:
+    in {
+      devShells = nixpkgs.lib.genAttrs systems (system:
         let
           pkgs = import nixpkgs {
             inherit system;
@@ -23,14 +23,6 @@
             extensions = [ "rust-src" "rust-analyzer" ];
             targets = [ "aarch64-unknown-none-softfloat" ];
           };
-        in { inherit pkgs rust; };
-    in {
-      packages = forSystems (system: {
-        rust-toolchain = (environment system).rust;
-      });
-
-      devShells = forSystems (system:
-        let inherit (environment system) pkgs rust;
         in {
           default = pkgs.mkShell {
             packages = [ rust pkgs.llvmPackages.llvm pkgs.ripgrep pkgs.git pkgs.qemu pkgs.python3 ];

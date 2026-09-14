@@ -16,8 +16,10 @@ Hekate -> BL31 -> Switchvisor (EL2) -> U-Boot (EL1) -> guest OS
 From the repository root, enter the Nix development shell:
 
 ```sh
-./scripts/dev.sh
+nix develop
 ```
+
+Run the following build and development commands inside this shell.
 
 ## Building a payload
 
