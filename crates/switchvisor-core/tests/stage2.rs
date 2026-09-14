@@ -103,17 +103,11 @@ fn all_table_addresses_are_validated_before_any_mutation() {
 }
 
 #[test]
-fn firmware_cannot_start_or_resume_an_unprotected_cpu() {
-    for call in [
-        0x8400_0001,
-        0xc400_0001,
-        0x8400_0003,
-        0xc400_0003,
-        0xc400_000e,
-    ] {
-        assert!(stage2::unsupported_psci(call));
+fn firmware_cannot_resume_an_unprotected_cpu() {
+    for call in [0x8400_0001, 0xc400_0001, 0xc400_000e] {
+        assert!(switchvisor_core::psci::suspend(call));
     }
     for call in [0x8400_0000, 0x8400_0002, 0x8400_0008, 0x8400_0009] {
-        assert!(!stage2::unsupported_psci(call));
+        assert!(!switchvisor_core::psci::suspend(call));
     }
 }

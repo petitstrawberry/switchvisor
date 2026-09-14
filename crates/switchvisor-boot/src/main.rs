@@ -1,4 +1,4 @@
-//! CPU0 EL2 monitor with protected resident RAM and an external raw BL33.
+//! EL2 monitor with protected resident RAM and an external raw BL33.
 #![no_std]
 #![no_main]
 
@@ -13,6 +13,8 @@ use switchvisor_core::payload::{
 };
 
 mod mc;
+mod mmu;
+mod smp;
 mod stage2;
 
 global_asm!(include_str!("entry.S"),
@@ -80,7 +82,7 @@ extern "C" fn rust_boot() -> ! {
     }
     let mut screen = console();
     screen.clear();
-    let _ = writeln!(screen, "SWITCHVISOR EL2 DIAGNOSTIC\n");
+    let _ = writeln!(screen, "SWITCHVISOR\n");
     let _ = writeln!(screen, "CURRENTEL = EL{}", current_el >> 2);
     let _ = writeln!(screen, "SCTLR_EL2 = {sctlr:016x}");
     let _ = writeln!(screen, "FRAMEBUFFER = F5A00000 BGRA ROTATION=3\n");
@@ -159,10 +161,15 @@ fn launch_payload(
         core::ptr::write_bytes((STACK_TOP - 64 * 1024) as *mut u8, 0, 64 * 1024);
         asm!("dsb sy", "ic iallu", "dsb sy", "isb", options(nostack));
     }
-    if stage2::install().is_err() {
+    if stage2::prepare().is_err() || mmu::prepare().is_err() {
         let _ = writeln!(screen, "STAGE2 REJECTED: TABLE PLACEMENT");
         park()
     }
+    unsafe {
+        mmu::enable();
+        stage2::enable();
+    }
+    smp::initialize();
     let _ = writeln!(screen, "STAGE2 ON - VMM RAM EXCLUDED");
     unsafe { enter_payload(registers.as_ptr(), entry, STACK_TOP) }
 }
@@ -182,12 +189,7 @@ extern "C" fn rust_exception(registers: &mut [u64; 31]) {
         asm!("mrs {value}, spsr_el2", value = out(reg) spsr, options(nomem, nostack));
     }
     if esr >> 26 == 0x17 && esr & 0xffff == 0 && spsr & 0xf == 5 {
-        if switchvisor_core::stage2::unsupported_psci(registers[0])
-            || registers[0] as u32 == 0x8400_000a
-                && switchvisor_core::stage2::unsupported_psci(registers[1])
-        {
-            registers[0] = u64::MAX; // PSCI NOT_SUPPORTED.
-        } else {
+        if !smp::handle(registers) {
             // Other SMCCC calls retain the native EL3 firmware service.
             unsafe { forward_smc(registers.as_mut_ptr()) };
         }

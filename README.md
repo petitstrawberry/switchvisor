@@ -104,7 +104,7 @@ Supply a raw binary that can execute at the fixed BL33 load address. Its file by
 | Guest address space | GPA=HPA, 36-bit Stage-2; VMM RAM `0xFEC00000`–`0xFFC00000` is unmapped |
 | Memory discovery | MC page `0x70019000` is trapped; disabled GSC5 advertises the VMM reservation |
 | Interrupts | Physical IRQ/FIQ/SError delivered directly to EL1 |
-| Firmware calls | Native SMC forwarding; PSCI CPU_ON and suspend are unsupported |
+| Firmware calls | PSCI CPU_ON, CPU_OFF, CPU-level AFFINITY_INFO and their FEATURES queries; other native SMCs forwarded; suspend unsupported |
 | x0-x7 | Original BL31 inputs, or explicit register options |
 | x8-x30 | Zero |
 | Initial stack | SP_EL1=`0x8A800000`; the preceding 64 KiB are cleared |
@@ -114,7 +114,9 @@ Package overhead reduces the maximum raw file size. The Hekate environment windo
 
 MC emulation supports aligned 32-bit loads/stores with valid AArch64 abort syndrome information, including signed loads. The virtual GSC5 address and size registers are read-only; other accesses in the MC page pass through to hardware. Unsupported MC accesses stop the payload.
 
-Run payloads on CPU0. Keep the VMM region out of bootloader allocations, OS memory banks, and device DMA buffers. A CPU access to this region faults at EL2 and stops the payload. Stage-2 does not constrain device DMA. The fixed VMM placement requires usable RAM throughout that region on the target boot configuration.
+The initial BL33 runs on CPU0. A guest may start CPUs 1–3 through PSCI using MPIDR affinities 1–3. Each CPU enters EL2, installs private stacks/vectors and the shared memory maps, then enters the supplied guest address at EL1h with MMU/caches off and DAIF masked. x0 receives the context, x1-x30 are zero, and SP_EL1 is zero; the secondary entry must install its own stack. CPU_ON entry addresses must be 4-byte aligned, in Normal guest memory, and outside the VMM region. CPU_OFF leaves the physical CPU waiting in EL2 for another virtual CPU_ON. Physical timers and IPIs remain assigned to the guest.
+
+Keep the VMM region out of bootloader allocations, OS memory banks, and device DMA buffers. A CPU access to this region faults at EL2 and parks the faulting CPU. Stage-2 does not constrain device DMA. The fixed VMM placement requires usable RAM throughout that region on the target boot configuration.
 
 ## Development
 

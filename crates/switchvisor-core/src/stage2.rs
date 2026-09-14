@@ -12,8 +12,8 @@ pub const GIB: u64 = 1 << 30;
 pub const ENTRIES: usize = 512;
 pub const RAM_BASE: u64 = 0x8000_0000;
 pub const VTCR: u64 = (1 << 31) | (1 << 16) | (3 << 12) | (1 << 10) | (1 << 8) | (1 << 6) | 28;
-// Physical IRQ/FIQ/SError remain at EL1. Trap SMC only to prevent CPU_ON/suspend
-// from entering a CPU without this Stage-2 configuration; other SMCs are forwarded.
+// Physical IRQ/FIQ/SError remain at EL1. Trap SMC for virtual CPU power state
+// and protected EL2 secondary entry; other native services are forwarded.
 pub const HCR: u64 = (1 << 31) | (1 << 19) | 1;
 pub const VMID: u64 = 1;
 pub const SPLIT_INDEX: usize = (RESIDENT_BASE / GIB) as usize;
@@ -89,12 +89,4 @@ pub fn build(
     root.0[MC_INDEX] = addresses[2] | 3;
     root.0[SPLIT_INDEX] = (addresses[1] & ADDRESS_MASK) | 3;
     Ok((VMID << 48) | addresses[0])
-}
-
-/// Suspend and secondary entry would let firmware resume outside this CPU0 monitor.
-pub fn unsupported_psci(function: u64) -> bool {
-    matches!(
-        function as u32,
-        0x8400_0001 | 0xc400_0001 | 0x8400_0003 | 0xc400_0003 | 0x8400_000e | 0xc400_000e
-    )
 }

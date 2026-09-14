@@ -2,6 +2,7 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+pub mod el2_mmu;
 pub mod fdt;
 pub mod fdt_memory;
 pub mod framebuffer;
@@ -10,6 +11,7 @@ pub mod mc;
 pub mod memory;
 pub mod mmio;
 pub mod payload;
+pub mod psci;
 pub mod stage2;
 
 pub const CPU_COUNT: usize = 4;

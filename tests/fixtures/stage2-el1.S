@@ -94,12 +94,12 @@ wait_irq:
     cbz x10, wait_irq
     cmp x10, #4
     b.ne failure
-.elseif SV_ACTION == 5 // PSCI CPU_ON cannot bypass the protected CPU0 entry.
+.elseif SV_ACTION == 5 // Unimplemented suspend cannot bypass the protected EL2 entry.
     .irp reg,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30
     mov x\reg, #(0x200 + \reg)
     .endr
     mov x0, #0xc4000000
-    add x0, x0, #3
+    add x0, x0, #1
     smc #0
     cmn x0, #1
     b.ne failure

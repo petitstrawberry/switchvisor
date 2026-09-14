@@ -60,7 +60,7 @@ def markers(raw, rejected, fault=False):
 
 def execute_guest(image, payload, registers, nonce, output, rejected=False, *,
                   fault=None, result_words=None, extra_loaders=(), secure=False, entry_source=None,
-                  placement_rejected=False, physical_words=()):
+                  placement_rejected=False, physical_words=(), cpu_count=1, firmware=False, inspect_cpu=0):
     loaded = image.read_bytes()
     output.mkdir(parents=True, exist_ok=False)
     with tempfile.TemporaryDirectory(prefix="sv-raw-qemu-") as directory:
@@ -78,14 +78,17 @@ def execute_guest(image, payload, registers, nonce, output, rejected=False, *,
         (temp / "mc.bin").write_bytes(mc)
         qmp = temp / "qmp.sock"
         command = ["qemu-system-aarch64", "-machine", "virt,virtualization=on,gic-version=2" + (",secure=on" if secure else ""),
-                   "-cpu", "cortex-a57", "-smp", "1", "-m", "3G", "-display", "none",
+                   "-cpu", "cortex-a57", "-smp", str(cpu_count), "-m", "3G", "-display", "none",
                    "-serial", "none", "-monitor", "none", "-S", "-qmp",
                    f"unix:{qmp},server=on,wait=off", "-device",
                    f"loader,file={image},addr=0xaa000000,force-raw=on", "-device",
                    f"loader,file={temp / 'dirty.bin'},addr={RESULT_BASE:#x},force-raw=on",
                    "-device", f"loader,file={temp / 'dirty.bin'},addr={STACK_TOP - RESULT_SIZE:#x},force-raw=on",
-                   "-device", f"loader,file={temp / 'mc.bin'},addr={MC_BASE:#x},force-raw=on",
-                   "-device", f"loader,file={temp / 'entry.bin'},addr=0x80000000,force-raw=on,cpu-num=0"]
+                   "-device", f"loader,file={temp / 'mc.bin'},addr={MC_BASE:#x},force-raw=on"]
+        if firmware:
+            command.extend(["-bios",str(temp / "entry.bin")])
+        else:
+            command.extend(["-device",f"loader,file={temp / 'entry.bin'},addr=0x80000000,force-raw=on,cpu-num=0"])
         for address, data in extra_loaders:
             if MC_BASE <= address < MC_BASE + len(mc):
                 continue
@@ -135,19 +138,26 @@ def execute_guest(image, payload, registers, nonce, output, rejected=False, *,
                         return path.read_bytes()
 
                     qmp_execute("qmp_capabilities")
-                    initial = qmp_execute("human-monitor-command", {"command-line": "info registers"})
+                    initial = qmp_execute("human-monitor-command", {"command-line": "info registers", "cpu-index":inspect_cpu})
                     qmp_execute("cont")
                     while True:
                         time.sleep(0.2)
                         qmp_execute("stop")
                         raw = memory(boot.FB_BASE, boot.FB_SIZE, "framebuffer.raw")
-                        final = qmp_execute("human-monitor-command", {"command-line": "info registers"})
+                        final = qmp_execute("human-monitor-command", {"command-line": "info registers", "cpu-index":inspect_cpu})
                         park_image = bytearray(loaded)
                         if placement_rejected:
                             struct.pack_into("<Q", park_image, 8, 0xaa000000)
                         if boot.park_offset(final, park_image) is not None and (placement_rejected or markers(raw, rejected, fault is not None)):
                             break
                         if time.monotonic() > deadline:
+                            diagnostics = []
+                            for cpu in range(cpu_count):
+                                diagnostics.append(qmp_execute("human-monitor-command", {"command-line":"info registers", "cpu-index":cpu}))
+                            (output / "failure-registers.txt").write_text("\n".join(diagnostics))
+                            if cpu_count > 1:
+                                (output / "failure-cpu-results.raw").write_bytes(memory(0xaa081000,256,"failure-cpus.raw"))
+                                (output / "failure-firmware.raw").write_bytes(memory(0x80030000,256,"failure-fw.raw"))
                             boot.png(raw, output / "failure.png")
                             raise RuntimeError("Missing payload terminal markers:\n" + final)
                         qmp_execute("cont")
@@ -157,6 +167,9 @@ def execute_guest(image, payload, registers, nonce, output, rejected=False, *,
                     protected = memory(fault[0], 8, "protected.raw") if fault else None
                     physical = [(address, memory(address, len(expected), f"physical-{address:x}.raw"), expected)
                                 for address, expected in physical_words]
+                    cpu_registers = []
+                    for cpu in range(cpu_count):
+                        cpu_registers.append(qmp_execute("human-monitor-command", {"command-line":"info registers", "cpu-index":cpu}))
                     qmp_execute("quit")
                 process.wait(timeout=5)
             finally:
@@ -171,6 +184,7 @@ def execute_guest(image, payload, registers, nonce, output, rejected=False, *,
         "cpu_park_verified": True, "resident_base": hex(RESIDENT_BASE),
         "framebuffer_sha256": digest(raw), "image": "framebuffer.png",
         "initial_registers": initial, "final_registers": final,
+        "cpu_count":cpu_count, "inspected_cpu":inspect_cpu, "all_cpu_registers":cpu_registers,
     }
     for address, actual, expected in physical:
         assert actual == expected, (hex(address), actual.hex(), expected.hex())

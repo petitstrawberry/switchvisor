@@ -107,8 +107,11 @@ _el2_vectors:
     stp x26, x27, [sp, #208]
     stp x28, x29, [sp, #224]
     str x30, [sp, #240]
+    mrs x11, mpidr_el1
+    and x11, x11, #0xff
     adrp x9, _exception_active
     add x9, x9, :lo12:_exception_active
+    add x9, x9, x11, lsl #3
     ldr x10, [x9]
     cbnz x10, .Lexception_park
     mov x10, #1
@@ -118,11 +121,15 @@ _el2_vectors:
     msr spsel, #1
     adrp x9, __exception_stack_top
     add x9, x9, :lo12:__exception_stack_top
+    add x9, x9, x11, lsl #14
     mov sp, x9
     bl rust_exception
     mov sp, x19
+    mrs x11, mpidr_el1
+    and x11, x11, #0xff
     adrp x9, _exception_active
     add x9, x9, :lo12:_exception_active
+    add x9, x9, x11, lsl #3
     str xzr, [x9]
     ldp x0, x1, [sp, #0]
     ldp x2, x3, [sp, #16]
@@ -147,7 +154,7 @@ _el2_vectors:
     b .Lexception_park
 
 // Raw BL33 entry. The existing bootloader establishes its own runtime after this handoff.
-// CPU0, Stage-2 identity map, physical interrupts passed directly to EL1.
+// Stage-2 identity map, physical interrupts passed directly to EL1.
 .section .text.handoff, "ax"
 .global enter_payload
 .type enter_payload, %function
@@ -193,7 +200,7 @@ enter_payload:
     movk x10, #{hcr_high}, lsl #16
     msr hcr_el2, x10
     isb
-    tlbi vmalle1is
+    tlbi vmalle1
     dsb sy
     isb
     ldp x0, x1, [x9, #0]
@@ -225,6 +232,57 @@ enter_payload:
     mov x30, xzr
     eret
 .size enter_payload, . - enter_payload
+
+// BL31 CPU_ON entry. x0 is our physical CPU ID, never the guest context.
+.global secondary_el2_entry
+.type secondary_el2_entry, %function
+secondary_el2_entry:
+    msr daifset, #15
+    mrs x9, CurrentEL
+    cmp x9, #8
+    b.ne .Lpark
+    mrs x9, mpidr_el1
+    ldr x10, =0xff00ffffff
+    and x9, x9, x10
+    cmp x9, #4
+    b.hs .Lpark
+    cmp x0, x9
+    b.ne .Lpark
+    mrs x10, sctlr_el2
+    tbnz x10, #0, .Lpark
+    tbnz x10, #2, .Lpark
+    msr spsel, #1
+    adrp x10, __boot_stack_top
+    add x10, x10, :lo12:__boot_stack_top
+    add x10, x10, x9, lsl #16
+    mov sp, x10
+    adrp x10, _el2_vectors
+    add x10, x10, :lo12:_el2_vectors
+    msr vbar_el2, x10
+    isb
+    b rust_secondary
+.size secondary_el2_entry, . - secondary_el2_entry
+
+// Virtual CPU_OFF stays in EL2 and discards the old exception frame.
+.global park_vcpu
+.type park_vcpu, %function
+park_vcpu:
+    msr daifset, #15
+    mov x10, #2
+    msr cntv_ctl_el0, x10
+    msr cntp_ctl_el0, x10
+    mrs x9, mpidr_el1
+    and x9, x9, #0xff
+    adrp x10, _exception_active
+    add x10, x10, :lo12:_exception_active
+    str xzr, [x10, x9, lsl #3]
+    msr spsel, #1
+    adrp x10, __boot_stack_top
+    add x10, x10, :lo12:__boot_stack_top
+    add x10, x10, x9, lsl #16
+    mov sp, x10
+    b rust_cpu_dispatch
+.size park_vcpu, . - park_vcpu
 
 // Native SMCCC forwarding. Rust/EL2 helpers use no FP/SIMD, so guest Q registers
 // are untouched. The SMCCC firmware must preserve x18-x30 and FP/SIMD state.
@@ -262,4 +320,4 @@ forward_smc:
 _boot_handoff:
     .zero 64
 _exception_active:
-    .quad 0
+    .zero 32

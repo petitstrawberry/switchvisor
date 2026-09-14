@@ -20,11 +20,11 @@ SECTIONS {
         *(.bss .bss.* COMMON)
         . = ALIGN(16);
         __boot_stack_bottom = .;
-        . += 64K;
-        __boot_stack_top = .;
+        __boot_stack_top = . + 64K;
+        . += 256K;
         __exception_stack_bottom = .;
-        . += 16K;
-        __exception_stack_top = .;
+        __exception_stack_top = . + 16K;
+        . += 64K;
         __bss_end = .;
     }
     ASSERT(_start == 0xAA000000 || _start == 0xFEC00000, "unsupported bootstrap placement")
