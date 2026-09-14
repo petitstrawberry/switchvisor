@@ -1,0 +1,10 @@
+{
+  "source": "Switchroot Kubuntu Noble 5.1.2, theofficialgman-kubuntu-noble-5.1.2-2026-05-13.7z",
+  "uboot_source_revision": "722e2b86be9ab1ae073335585c5997093e05f4f2",
+  "hekate_revision": "e487de8fdd6ca9c3f608d1d18c097a86355912b9",
+  "files": {
+    "bl31.bin": "dea0ecd406cd110b8d475641900ed23223d24d32dd5cef4d8a9ea2459c34e2b4",
+    "bl33.bin": "b492a4017580ca11c9cd49075a899a65f62069d3750615217fc10308954c9faa",
+    "nx-plat.dtimg": "e928da0b79efade1571dde5db855b1a6d84b1ce4ca249db4fff7c42a102420df"
+  }
+}
