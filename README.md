@@ -123,3 +123,7 @@ cargo test --workspace
 cargo check-el2
 cargo build-boot
 ```
+
+## License
+
+Switchvisor is licensed under the GNU General Public License version 2 only. See [LICENSE](LICENSE).

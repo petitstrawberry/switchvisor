@@ -7,6 +7,7 @@ resolver = "3"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
+license = "GPL-2.0-only"
 
 [workspace.dependencies]
 switchvisor-core = { path = "crates/switchvisor-core" }
