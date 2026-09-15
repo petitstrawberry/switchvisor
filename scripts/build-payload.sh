@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
-if [[ $# -lt 2 ]]; then
-    echo "Usage: scripts/build-payload.sh <payload.raw> <runtime-size> [bootstack-directory] [output-directory] [payload options...]" >&2
+if [[ $# -lt 3 ]]; then
+    echo "Usage: scripts/build-payload.sh <payload.raw> <runtime-size> <bootstack-directory> [output-directory] [payload options...]" >&2
     exit 1
 fi
 task_payload=$1
 task_runtime_size=$2
-task_bootstack=${3:-../scarlet-project-switch/projects/aarch64-switch-console/.scarlet/bootstack}
+task_bootstack=$3
 task_output=${4:-dist}
 task_options=()
 if [[ $# -gt 4 ]]; then task_options=("${@:5}"); fi

@@ -30,7 +30,7 @@ the packager uses them to verify the bootstack and extract the Hekate probe FDT.
 Supply the EL1 payload as a separate raw file.
 
 ```text
-scripts/build-payload.sh <payload.raw> <runtime-size> [bootstack-directory] [output-directory] [payload options...]
+scripts/build-payload.sh <payload.raw> <runtime-size> <bootstack-directory> [output-directory] [payload options...]
 ```
 
 For example:
@@ -49,12 +49,10 @@ The script builds Switchvisor and writes these files to `dist/`:
 | `manifest.json` | Payload entry, sizes, hashes, and bootstack pins |
 | `bootstrap.raw` | Switchvisor bootstrap for packaging another payload |
 
-The default bootstack directory is
-`../scarlet-project-switch/projects/aarch64-switch-console/.scarlet/bootstack`.
-An optional output-directory argument overrides `dist/`. The three output files
-are replaced after the build and packaging succeed. A build with `--usb-uart`
-also writes `usb-uart.dtbo`; a build without it removes a stale overlay from the
-output directory.
+The bootstack directory is required. An optional output-directory argument
+overrides `dist/`. The three output files are replaced after the build and
+packaging succeed. A build with `--usb-uart` also writes `usb-uart.dtbo`; a
+build without it removes a stale overlay from the output directory.
 
 Copy `dist/bl33.bin` to the microSD path configured for BL33 in your Hekate L4T entry. For the Scarlet Switch Console entry, replace `/switchroot/scarlet-console/bl33.bin`.
 
