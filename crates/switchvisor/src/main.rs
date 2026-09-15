@@ -130,7 +130,12 @@ fn launch_payload(payload: Payload, handoff: &[u64; 8], screen: &mut Screen) -> 
         stage2::enable();
     }
     vcpu::initialize();
-    match usb::initialize(physical_usb, payload.usb_uart, entry) {
+    match usb::initialize(
+        physical_usb,
+        payload.usb_uart,
+        payload.require_upload,
+        entry,
+    ) {
         Ok(true) => {
             let _ = writeln!(screen, "USB COMPOSITE ON - WAITING FOR HOST");
         }

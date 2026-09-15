@@ -7,7 +7,7 @@ _start:
     .quad __image_end - _start
     .quad __bss_start - _start
     .quad __bss_end - _start
-    .ascii "SVBOOT03"
+    .ascii "SVBOOT04"
 .Lentry:
     msr daifset, #15
     mrs x9, CurrentEL

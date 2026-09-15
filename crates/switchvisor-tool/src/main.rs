@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use switchvisor::{fdt::Fdt, image::UbootImage};
 
-const USAGE: &str = "Usage: switchvisor-tool <command> [arguments]\n\nCommands:\n  inspect-bootstack <directory>    Verify the pinned BL31/BL33/nx-plat.dtimg\n  prepare-dtb <input.dtb> <output.dtb>\n                                  Exclude resident EL2 RAM from a guest DTB\n  pack-payload <bootstrap.raw> <bootstack-directory> <payload.raw> <runtime-size> <output.bin>\n               [--entry-offset <number>] [--x0 <number> ... --x7 <number>] [--usb-uart] [--usb-control]\n                                  Inject an external raw EL1 payload\n  pack-script <boot.cmd> <boot.scr>  Package a legacy U-Boot boot script\n\nCommands print JSON. Packers create new files; no command installs or boots an image.";
+const USAGE: &str = "Usage: switchvisor-tool <command> [arguments]\n\nCommands:\n  inspect-bootstack <directory>    Verify the pinned BL31/BL33/nx-plat.dtimg\n  prepare-dtb <input.dtb> <output.dtb>\n                                  Exclude resident EL2 RAM from a guest DTB\n  pack-payload <bootstrap.raw> <bootstack-directory> <payload.raw> <runtime-size> <output.bin>\n               [--entry-offset <number>] [--x0 <number> ... --x7 <number>] [--usb-uart] [--usb-control] [--no-fallback]\n                                  Inject an external raw EL1 payload\n  pack-script <boot.cmd> <boot.scr>  Package a legacy U-Boot boot script\n\nCommands print JSON. Packers create new files; no command installs or boots an image.";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -43,6 +43,7 @@ pub fn pack(args: &[OsString]) -> Result<Value, String> {
     let mut used = [false; 9];
     let mut usb_uart = false;
     let mut usb_control = false;
+    let mut require_upload = false;
     let mut cursor = 5;
     while cursor < args.len() {
         if args[cursor] == "--usb-uart" {
@@ -58,6 +59,14 @@ pub fn pack(args: &[OsString]) -> Result<Value, String> {
                 return Err("duplicate payload option --usb-control".into());
             }
             usb_control = true;
+            cursor += 1;
+            continue;
+        }
+        if args[cursor] == "--no-fallback" {
+            if require_upload {
+                return Err("duplicate payload option --no-fallback".into());
+            }
+            require_upload = true;
             cursor += 1;
             continue;
         }
@@ -88,9 +97,12 @@ pub fn pack(args: &[OsString]) -> Result<Value, String> {
         }
         cursor += 2;
     }
+    if require_upload && !(usb_uart || usb_control) {
+        return Err("--no-fallback requires --usb-control or --usb-uart".into());
+    }
     let runtime_size = number(&args[3])?;
     let raw = read(Path::new(&args[0]))?;
-    if raw.get(40..48) != Some(b"SVBOOT03".as_slice())
+    if raw.get(40..48) != Some(b"SVBOOT04".as_slice())
         || field(&raw, 8)? != RESIDENT_BASE
         || field(&raw, 16)? != raw.len() as u64
         || field(&raw, 24)? < raw.len() as u64
@@ -143,6 +155,7 @@ pub fn pack(args: &[OsString]) -> Result<Value, String> {
         preserve_boot_args: !custom_registers,
         usb_uart,
         usb_control,
+        require_upload,
         crc32: crc32(&data),
     };
     let descriptor = payload.encode().map_err(|e| e.to_string())?;
@@ -193,6 +206,7 @@ pub fn pack(args: &[OsString]) -> Result<Value, String> {
             "interrupt":switchvisor::vdev::uart::INTERRUPT_ID,
             "transport":"cdc-acm","vid":switchvisor::drivers::usb::cdc::VID,
             "pid":switchvisor::drivers::usb::cdc::PID},
-        "usb_control":{"enabled":usb_control || usb_uart,"control":"cdc-acm","loader":"vendor-bulk"}
+        "usb_control":{"enabled":usb_control || usb_uart,"control":"cdc-acm","loader":"vendor-bulk",
+            "packaged_payload_fallback":!require_upload}
     }))
 }

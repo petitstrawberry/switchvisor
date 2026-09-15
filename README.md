@@ -58,7 +58,9 @@ overrides `dist/`. The three output files are replaced after the build and
 packaging succeed. A build with `--usb-uart` also writes `usb-uart.dtbo`. Pass
 `--usb-control` to enable USB control and payload loading without adding a
 virtual UART to the guest; that profile writes `usb-control.dtbo`. The build
-removes stale overlay variants from the output directory.
+removes stale overlay variants from the output directory. Add `--no-fallback`
+with either USB option to require an uploaded payload instead of starting the
+packaged payload automatically.
 
 Copy `dist/bl33.bin` to the microSD path configured for BL33 by the selected
 Hekate L4T boot entry.
@@ -170,10 +172,10 @@ Set `USB_PORT` to the actual port name printed by `ls`.
 
 USB transmits the guest's UART bytes unchanged. Handle terminal newline conversion in the guest console or TTY layer, or configure it in the host terminal.
 
-With `--usb-uart` or `--usb-control`, Switchvisor services USB for two seconds
-before starting the packaged payload and prints the port/endpoint state,
-event/setup counts, and last error on Hekate's framebuffer. Connect the host
-cable before boot to capture enumeration progress.
+With `--usb-uart` or `--usb-control`, Switchvisor normally services USB for two
+seconds before starting the packaged payload and prints the port/endpoint
+state, event/setup counts, and last error on Hekate's framebuffer. Connect the
+host cable before boot to capture enumeration progress.
 
 Baud and line-coding settings are USB metadata. Guest transmit uses THR and polls LSR.THRE/TEMT; both stay ready even when the host is absent. Host input enters the receive FIFO, updates LSR.DR, and raises the UART receive interrupt when enabled through IER. The UART buffers up to 64 KiB of guest output and 4 KiB of host input. Later output bytes are dropped if the TX queue fills; completed USB input is backpressured until the guest makes RX space. Opening the host port asserts DTR and drains queued output.
 
@@ -188,6 +190,19 @@ the guest needs the virtual console and its DT overlay.
 scripts/build-payload.sh path/to/default.raw 0x100000 path/to/bootstack dist \
   --usb-control
 ```
+
+For a required-upload boot that never starts the packaged payload automatically,
+add `--no-fallback`:
+
+```sh
+scripts/build-payload.sh path/to/default.raw 0x100000 path/to/bootstack dist \
+  --usb-control --no-fallback
+```
+
+This mode waits for an upload and `BOOT` without a deadline. If USB cannot be
+initialized, Switchvisor reports the failure on the framebuffer and remains in
+EL2. The control port stays available for `status`, `reboot`, and `reboot-rcm`
+while waiting. `status` reports `fallback=disabled`.
 
 This profile produces `dist/usb-control.dtbo` for the supported ODIN/Erista
 platform DTB. Apply it to the final working DTB immediately before boot, using
@@ -229,9 +244,9 @@ payloads. With no `--x0` through `--x7` options, the original BL31 registers are
 preserved. Once an upload begins, the packaged fallback is no longer safe to
 use because the destination may have been overwritten. `abort` discards the
 transfer and permits a new upload; use `boot` after a successful upload or
-perform a physical reset. If no upload begins in the preboot window, the
-packaged payload starts normally. Uploads are rejected after guest execution
-begins.
+perform a physical reset. Without `--no-fallback`, the packaged payload starts
+normally if no upload begins in the preboot window. Uploads are rejected after
+guest execution begins.
 
 The loader status and abort operations are also available directly:
 

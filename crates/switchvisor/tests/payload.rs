@@ -17,6 +17,7 @@ fn fixture() -> (Payload, Vec<u8>) {
         preserve_boot_args: true,
         usb_uart: false,
         usb_control: false,
+        require_upload: false,
         crc32: crc32(&package[0x4000..]),
     };
     (payload, package)
@@ -71,6 +72,19 @@ fn usb_control_is_independent_from_the_guest_console() {
     let bytes = payload.encode().unwrap();
     assert_eq!(u32::from_le_bytes(bytes[12..16].try_into().unwrap()), 7);
     assert_eq!(Payload::decode(&bytes), Ok(Some(payload)));
+}
+
+#[test]
+fn required_upload_is_encoded_and_needs_a_usb_transport() {
+    let (mut payload, _) = fixture();
+    payload.usb_control = true;
+    payload.require_upload = true;
+    let bytes = payload.encode().unwrap();
+    assert_eq!(u32::from_le_bytes(bytes[12..16].try_into().unwrap()), 13);
+    assert_eq!(Payload::decode(&bytes), Ok(Some(payload)));
+
+    payload.usb_control = false;
+    assert_eq!(payload.validate(), Err(PayloadError::Header));
 }
 
 #[test]

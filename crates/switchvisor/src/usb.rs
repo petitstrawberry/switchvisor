@@ -90,6 +90,7 @@ static USB: Mutex<Service> = Mutex::new(Service {
 });
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static AVAILABLE: AtomicBool = AtomicBool::new(false);
+static REQUIRE_UPLOAD: AtomicBool = AtomicBool::new(false);
 static GUEST_RUNNING: AtomicBool = AtomicBool::new(false);
 static LAST_SERVICE: AtomicU64 = AtomicU64::new(0);
 static PAYLOAD_ENTRY: AtomicU64 = AtomicU64::new(0);
@@ -125,9 +126,15 @@ impl Storage for PayloadMemory {
     }
 }
 
-pub fn initialize(enabled: bool, console_enabled: bool, payload_entry: u64) -> Result<bool, Error> {
+pub fn initialize(
+    enabled: bool,
+    console_enabled: bool,
+    require_upload: bool,
+    payload_entry: u64,
+) -> Result<bool, Error> {
     ENABLED.store(enabled, Ordering::Release);
     AVAILABLE.store(false, Ordering::Release);
+    REQUIRE_UPLOAD.store(require_upload, Ordering::Release);
     GUEST_RUNNING.store(false, Ordering::Release);
     PAYLOAD_ENTRY.store(payload_entry, Ordering::Release);
     RESET.store(RESET_NONE, Ordering::Release);
@@ -316,6 +323,12 @@ fn control_reply(state: &mut Service, command: Result<Command, ParseError>) {
             let _ = writeln!(state.control_output, "cpu-mask={:#x}", vcpu::cpu_mask());
             let _ = writeln!(state.control_output, "usb=up");
             let _ = writeln!(state.control_output, "loader={loader}");
+            let fallback = if REQUIRE_UPLOAD.load(Ordering::Acquire) {
+                "disabled"
+            } else {
+                "enabled"
+            };
+            let _ = writeln!(state.control_output, "fallback={fallback}");
             let _ = writeln!(
                 state.control_output,
                 "payload-entry={:#x}",
@@ -402,10 +415,22 @@ fn transmit_output<const N: usize>(
 }
 
 pub fn preboot(screen: &mut impl Write) -> Option<Descriptor> {
+    let require_upload = REQUIRE_UPLOAD.load(Ordering::Acquire);
     if !available() {
+        if require_upload {
+            let _ = writeln!(
+                screen,
+                "USB PAYLOAD REQUIRED - USB UNAVAILABLE\nCPU0 PARKED"
+            );
+            park();
+        }
         return None;
     }
-    let _ = writeln!(screen, "USB PREBOOT WINDOW (2S)");
+    if require_upload {
+        let _ = writeln!(screen, "USB PREBOOT - PAYLOAD REQUIRED");
+    } else {
+        let _ = writeln!(screen, "USB PREBOOT WINDOW (2S)");
+    }
     let start = Hardware.now_us();
     loop {
         service();
@@ -415,7 +440,8 @@ pub fn preboot(screen: &mut impl Write) -> Option<Descriptor> {
             diagnostics(screen);
             return Some(descriptor);
         }
-        if !claimed && Hardware.now_us().wrapping_sub(start) >= PREBOOT_WINDOW_US {
+        if !require_upload && !claimed && Hardware.now_us().wrapping_sub(start) >= PREBOOT_WINDOW_US
+        {
             diagnostics(screen);
             return None;
         }

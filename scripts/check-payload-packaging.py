@@ -62,6 +62,7 @@ def main():
                 copied = output.read_bytes()[manifest["payload"]["offset"]:]
                 assert copied == payload.read_bytes()
                 assert manifest["payload"]["preserve_boot_args"]
+                assert manifest["usb_control"]["packaged_payload_fallback"] == ("--no-fallback" not in options)
                 detail = manifest
             else:
                 assert digest(output) == before if exists else not output.exists(), name
@@ -78,6 +79,8 @@ def main():
         run("entry-outside-file", options=["--entry-offset", "8"])
         run("duplicate-options", options=["--x0", "1", "--x0", "2"])
         run("unknown-options", options=["--format", "elf"])
+        run("no-fallback-requires-usb", options=["--no-fallback"])
+        run("no-fallback", options=["--usb-control", "--no-fallback"], succeeds=True)
         run("wrong-bootstrap-base", raw=wrong_base)
         run("populated-descriptor", raw=populated)
         run("unaligned-bootstrap", raw=unaligned)
