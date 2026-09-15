@@ -2,12 +2,15 @@
 
 A lightweight hypervisor for Nintendo Switch.
 
-Switchvisor accepts an external raw AArch64 payload as BL33. The usual payload is U-Boot, which loads the guest OS, DTB, and initramfs through the existing boot scripts.
+Switchvisor packages an externally supplied raw AArch64 payload as BL33 and runs
+it at EL1. The payload can be a bootloader such as U-Boot or another raw image
+that follows the entry contract below.
 
-The boot path uses Hekate L4T and its existing BL31. Early boot messages use Hekate's framebuffer.
+The current platform integration boots through Hekate L4T and a compatible
+BL31. Early boot messages use Hekate's framebuffer.
 
 ```text
-Hekate -> BL31 -> Switchvisor (EL2) -> U-Boot (EL1) -> guest OS
+Hekate -> BL31 -> Switchvisor (EL2) -> payload (EL1)
 ```
 
 ## Build environment
@@ -23,8 +26,9 @@ Run the following build and development commands inside this shell.
 
 ## Building a payload
 
-Prepare a raw AArch64 binary and a bootstack directory containing `bl31.bin`,
-`bl33.bin`, and `nx-plat.dtimg`. The bootstack files must match the
+Prepare a raw AArch64 binary and a Hekate L4T bootstack directory containing
+`bl31.bin`, `bl33.bin`, and `nx-plat.dtimg`. The directory may be anywhere, but
+its files must match the
 [pinned bootstack configuration](crates/switchvisor-tool/config/bootstack.json);
 the packager uses them to verify the bootstack and extract the Hekate probe FDT.
 Supply the EL1 payload as a separate raw file.
@@ -54,11 +58,13 @@ overrides `dist/`. The three output files are replaced after the build and
 packaging succeed. A build with `--usb-uart` also writes `usb-uart.dtbo`; a
 build without it removes a stale overlay from the output directory.
 
-Copy `dist/bl33.bin` to the microSD path configured for BL33 in your Hekate L4T entry. For the Scarlet Switch Console entry, replace `/switchroot/scarlet-console/bl33.bin`.
+Copy `dist/bl33.bin` to the microSD path configured for BL33 by the selected
+Hekate L4T boot entry.
 
 ### Using U-Boot
 
-The pinned native BL33 can be used directly as the external payload:
+The BL33 from the supported bootstack can be used directly as the external
+payload:
 
 ```sh
 scripts/build-payload.sh path/to/bootstack/bl33.bin 0x68200 path/to/bootstack
@@ -66,7 +72,11 @@ scripts/build-payload.sh path/to/bootstack/bl33.bin 0x68200 path/to/bootstack
 
 The runtime size above applies to the pinned BL33 in the bootstack configuration. For another image, supply its own full runtime extent.
 
-Use the existing microSD boot files and scripts. U-Boot discovers RAM through the virtualized MC registers, keeps its relocation and allocations below `0xFEC00000`, and writes the reduced memory banks into the OS DTB. No U-Boot source patch, control-DTB preparation, or additional boot-script reservation is required for this memory policy.
+U-Boot can retain its normal microSD layout and boot script. It discovers RAM
+through the virtualized MC registers, keeps its relocation and allocations below
+`0xFEC00000`, and writes the reduced memory banks into the OS DTB. No U-Boot
+source patch, control-DTB preparation, or additional boot-script reservation is
+required for this memory policy.
 
 This path requires the Erista Hekate L4T memory layout with GSC5 disabled and usable low RAM through `0xFFC00000`. Switchvisor checks the physical MC geometry before copying itself to the resident region. Existing firmware carveouts and RAM above 4 GiB are preserved in U-Boot's memory discovery. The 2 MiB alignment leaves a 1 MiB gap before the default GPU firmware carveout, so the low memory bank loses 17 MiB in this profile.
 
@@ -109,31 +119,39 @@ Enable the EL2-owned USB 2.0 CDC ACM transport when packaging:
 scripts/build-payload.sh path/to/bootstack/bl33.bin 0x68200 path/to/bootstack dist --usb-uart
 ```
 
-Copy `dist/bl33.bin` to your BL33 path. This build also produces `dist/usb-uart.dtbo`, an overlay for the pinned Noble ODIN platform DTB. It adds a bidirectional `ns16550a` at GPA `0x700FF000` with byte-spaced registers and SPI 44, selects it in `/chosen/stdout-path`, and disables guest USB, PADCTL, its mailbox, USB-C role control, and USB power domains.
+Copy `dist/bl33.bin` to the configured BL33 path. This build also produces
+`dist/usb-uart.dtbo`, an overlay for the supported ODIN/Erista platform DTB. It
+adds a bidirectional `ns16550a` at GPA `0x700FF000` with byte-spaced registers and
+SPI 44, selects it in `/chosen/stdout-path`, and disables guest USB, PADCTL, its
+mailbox, USB-C role control, and USB power domains.
 
-For the Scarlet Switch Console entry, put the overlay at `/switchroot/scarlet-console/usb-uart.dtbo`. Copy the entry's `boot.cmd`, and insert the following immediately before `bootm`, after the OS DTB has been selected and configured:
+Place the overlay on the microSD card. Apply it to the final working DTB after
+that DTB has been selected and configured, immediately before `bootm`. A U-Boot
+command sequence has this form:
 
 ```sh
-if itest.l *70019d4c == fec00000; then
-    if load mmc ${devnum}:${distro_bootpart} 0x8c000000 ${boot_dir}/usb-uart.dtbo && fdt addr ${fdtraddr} && fdt resize 8192 && fdt apply 0x8c000000; then
-        echoe Switchvisor USB console enabled
-    else
-        echoe Failed to apply Switchvisor USB console overlay
-        sleep 3
-        reset
-    fi
-fi
+load <interface> <device[:partition]> 0x8c000000 <path>/usb-uart.dtbo
+fdt addr <working-fdt-address>
+fdt resize 8192
+fdt apply 0x8c000000
 ```
 
-The GSC5 check selects the Switchvisor path; a native boot entry using this script keeps its original console and USB settings. Package the edited script into a new file:
+Replace the placeholders with the storage and DTB values used by the boot
+script. Use a dedicated Switchvisor boot entry so a native entry retains its
+original console and USB settings. Package the edited source command file into a
+new `boot.scr`:
 
 ```sh
 cargo run -p switchvisor-tool -- pack-script path/to/boot.cmd dist/boot.scr
 ```
 
-Copy that `boot.scr` to `/switchroot/scarlet-console/boot.scr` alongside the overlay and BL33. The packer refuses to overwrite an existing output file; use a new output path when rebuilding it.
+Install the resulting `boot.scr` at the path loaded by the Hekate entry. The
+packer refuses to overwrite an existing output file; use a new output path when
+rebuilding it.
 
-The pinned native BL33 already supports `fdt apply`. For another guest DTB, declare the same UART and disable that DTB's physical USB/PHY/role nodes; the supplied overlay targets the Noble node paths.
+The supported U-Boot payload provides `fdt apply`. The supplied overlay targets
+the supported ODIN/Erista node paths. A different guest DTB must declare the same
+UART and disable its physical USB, PHY, and role-control nodes.
 
 Connect the Switch to a host with a USB data cable. On macOS, open the new CDC ACM port:
 

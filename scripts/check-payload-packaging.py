@@ -83,10 +83,10 @@ def main():
         run("unaligned-bootstrap", raw=unaligned)
         run("oversized-raw", payload=large)
         run("existing-output-preserved", exists=True)
-    assert pins == {name: digest(bootstack / name) for name in pins}, "baseline bootstack changed"
+    assert pins == {name: digest(bootstack / name) for name in pins}, "input bootstack changed"
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps({"hardware_validated": False, "cases_passed": len(cases),
-        "baseline_bootstack_unchanged": True, "bootstrap_sha256": digest(bootstrap),
+        "input_bootstack_unchanged": True, "bootstrap_sha256": digest(bootstrap),
         "bootstack_sha256": pins, "cases": cases}, indent=2) + "\n")
     print(f"Raw payload host CLI: {len(cases)} cases passed")
 

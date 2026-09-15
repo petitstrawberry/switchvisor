@@ -200,7 +200,7 @@ _el2_vectors:
     wfe
     b .Lexception_park
 
-// Raw BL33 entry. The existing bootloader establishes its own runtime after this handoff.
+// Raw BL33 entry. The supplied payload establishes its own runtime after this handoff.
 // Stage-2 identity map with the virtual GIC CPU interface at the native GPA.
 .section .text.handoff, "ax"
 .global enter_payload

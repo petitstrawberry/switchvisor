@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-// Guest console/USB policy for the pinned Noble ODIN (Erista) platform DTB.
+// Guest console/USB policy for the supported ODIN (Erista) platform DTB.
 /dts-v1/;
 /plugin/;
 
