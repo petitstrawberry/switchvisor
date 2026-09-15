@@ -23,7 +23,11 @@ Run the following build and development commands inside this shell.
 
 ## Building a payload
 
-Prepare a raw AArch64 binary and a bootstack directory containing `bl31.bin`, `bl33.bin`, and `nx-plat.dtimg`. The bootstack files must match [config/bootstack.json](config/bootstack.json); the packager uses them to verify the bootstack and extract the Hekate probe FDT. Supply the EL1 payload as a separate raw file.
+Prepare a raw AArch64 binary and a bootstack directory containing `bl31.bin`,
+`bl33.bin`, and `nx-plat.dtimg`. The bootstack files must match the
+[pinned bootstack configuration](crates/switchvisor-tool/config/bootstack.json);
+the packager uses them to verify the bootstack and extract the Hekate probe FDT.
+Supply the EL1 payload as a separate raw file.
 
 ```text
 scripts/build-payload.sh <payload.raw> <runtime-size> [bootstack-directory] [output-directory] [payload options...]
@@ -45,7 +49,12 @@ The script builds Switchvisor and writes these files to `dist/`:
 | `manifest.json` | Payload entry, sizes, hashes, and bootstack pins |
 | `bootstrap.raw` | Switchvisor bootstrap for packaging another payload |
 
-The default bootstack directory is `../scarlet-project-switch/projects/aarch64-switch-console/.scarlet/bootstack`. An optional output-directory argument overrides `dist/`. The three output files are replaced after the build and packaging succeed.
+The default bootstack directory is
+`../scarlet-project-switch/projects/aarch64-switch-console/.scarlet/bootstack`.
+An optional output-directory argument overrides `dist/`. The three output files
+are replaced after the build and packaging succeed. A build with `--usb-uart`
+also writes `usb-uart.dtbo`; a build without it removes a stale overlay from the
+output directory.
 
 Copy `dist/bl33.bin` to the microSD path configured for BL33 in your Hekate L4T entry. For the Scarlet Switch Console entry, replace `/switchroot/scarlet-console/bl33.bin`.
 
@@ -57,7 +66,7 @@ The pinned native BL33 can be used directly as the external payload:
 scripts/build-payload.sh path/to/bootstack/bl33.bin 0x68200 path/to/bootstack
 ```
 
-The runtime size above applies to the pinned BL33 in `config/bootstack.json`. For another image, supply its own full runtime extent.
+The runtime size above applies to the pinned BL33 in the bootstack configuration. For another image, supply its own full runtime extent.
 
 Use the existing microSD boot files and scripts. U-Boot discovers RAM through the virtualized MC registers, keeps its relocation and allocations below `0xFEC00000`, and writes the reduced memory banks into the OS DTB. No U-Boot source patch, control-DTB preparation, or additional boot-script reservation is required for this memory policy.
 

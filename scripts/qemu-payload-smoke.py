@@ -20,11 +20,11 @@ RESIDENT_SIZE = 0x1000000
 MC_BASE = 0x70019000
 RUNTIME_SIZE = 0x100000
 
-# Reuse the diagnostic's physical framebuffer decoder and linked WFE check.
-spec = importlib.util.spec_from_file_location("boot_smoke", ROOT / "scripts/qemu-boot-smoke.py")
-boot = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(boot)
-boot.GLYPHS.update({
+# Share the physical framebuffer decoder and linked WFE check across scenarios.
+spec = importlib.util.spec_from_file_location("qemu_support", ROOT / "scripts/qemu_support.py")
+qemu = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(qemu)
+qemu.GLYPHS.update({
     "P": [30, 17, 17, 30, 16, 16, 16],
     "R": [30, 17, 17, 30, 20, 18, 17],
 })
@@ -54,7 +54,7 @@ def markers(raw, rejected, fault=False):
         (0, 0, "P"), (0, 8, "E"), (2, 0, "E"), (2, 2, "1"),
         *[(1, column, "0") for column in range(7, 23)],
     ]
-    return all(boot.glyph_at(raw, row, col) == boot.GLYPHS[letter]
+    return all(qemu.glyph_at(raw, row, col) == qemu.GLYPHS[letter]
                for row, col, letter in checks)
 
 
@@ -143,12 +143,12 @@ def execute_guest(image, payload, registers, nonce, output, rejected=False, *,
                     while True:
                         time.sleep(0.2)
                         qmp_execute("stop")
-                        raw = memory(boot.FB_BASE, boot.FB_SIZE, "framebuffer.raw")
+                        raw = memory(qemu.FB_BASE, qemu.FB_SIZE, "framebuffer.raw")
                         final = qmp_execute("human-monitor-command", {"command-line": "info registers", "cpu-index":inspect_cpu})
                         park_image = bytearray(loaded)
                         if placement_rejected:
                             struct.pack_into("<Q", park_image, 8, 0xaa000000)
-                        if boot.park_offset(final, park_image) is not None and (placement_rejected or markers(raw, rejected, fault is not None)):
+                        if qemu.park_offset(final, park_image) is not None and (placement_rejected or markers(raw, rejected, fault is not None)):
                             break
                         if time.monotonic() > deadline:
                             diagnostics = []
@@ -158,7 +158,7 @@ def execute_guest(image, payload, registers, nonce, output, rejected=False, *,
                             if cpu_count > 1:
                                 (output / "failure-cpu-results.raw").write_bytes(memory(0xaa081000,256,"failure-cpus.raw"))
                                 (output / "failure-firmware.raw").write_bytes(memory(0x80030000,256,"failure-fw.raw"))
-                            boot.png(raw, output / "failure.png")
+                            qemu.png(raw, output / "failure.png")
                             raise RuntimeError("Missing payload terminal markers:\n" + final)
                         qmp_execute("cont")
                     result = memory(RESULT_BASE, RESULT_SIZE, "result.raw")
@@ -176,7 +176,7 @@ def execute_guest(image, payload, registers, nonce, output, rejected=False, *,
                 if process.poll() is None:
                     process.terminate()
                     process.wait(timeout=5)
-    boot.png(raw, output / "framebuffer.png")
+    qemu.png(raw, output / "framebuffer.png")
     report = {
         "hardware_validated": False, "stage2_enabled": not rejected, "qemu_cpu": "cortex-a57",
         "mode": "crc-rejection" if rejected else "el1-handoff",
@@ -215,8 +215,8 @@ def execute_guest(image, payload, registers, nonce, output, rejected=False, *,
                            "raw_copy_verified":True, "protected_sample":protected.hex() if protected else None})
         if fault:
             def hex_line(row, column):
-                reverse = {tuple(value):key for key,value in boot.GLYPHS.items() if key in "0123456789ABCDEF"}
-                return int("".join(reverse[tuple(boot.glyph_at(raw,row,column+i))] for i in range(16)),16)
+                reverse = {tuple(value):key for key,value in qemu.GLYPHS.items() if key in "0123456789ABCDEF"}
+                return int("".join(reverse[tuple(qemu.glyph_at(raw,row,column+i))] for i in range(16)),16)
             esr, far, hpfar = hex_line(1,6), hex_line(2,6), hex_line(3,8)
             assert esr >> 26 == fault[1] and esr & 0x3f == (fault[2] if len(fault)>2 else 6), hex(esr)
             assert far == fault[0] and hpfar == (fault[0] >> 8) & ~0xf, (hex(far),hex(hpfar))
@@ -249,9 +249,9 @@ def main():
         payload = output / f"{name}.raw"
         assemble(f".set SV_NONCE, {nonce}\n" + fixture, payload)
         if name == "injected":
-            # Exercise a source/destination overlap as well as the small raw payload.
+            # Exercise an overlapping source/destination copy within the runtime limit.
             data = payload.read_bytes()
-            payload.write_bytes(data + b"\xa5" * (0x20000 - len(data)))
+            payload.write_bytes(data + b"\xa5" * (0x40000 - len(data)))
         image = output / f"{name}.bin"
         result = subprocess.run([str(tool), "pack-payload", str(bootstrap), str(bootstack),
                                  str(payload), hex(RUNTIME_SIZE), str(image),

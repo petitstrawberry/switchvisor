@@ -25,7 +25,7 @@ _start:
     stp x2, x3, [x16, #16]
     stp x4, x5, [x16, #32]
     stp x6, x7, [x16, #48]
-    // The payload build links EL2 at a fixed resident base. Hekate still loads at AA000000.
+    // EL2 is linked at its fixed resident base. Hekate still loads it at AA000000.
     adr x20, _start
     ldr x21, [x20, #8]
     cmp x20, x21

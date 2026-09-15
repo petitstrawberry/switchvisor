@@ -2,7 +2,7 @@ OUTPUT_ARCH(aarch64)
 ENTRY(_start)
 
 SECTIONS {
-    . = DEFINED(SWITCHVISOR_LINK_BASE) ? SWITCHVISOR_LINK_BASE : 0xAA000000;
+    . = 0xFEC00000;
     .head : { KEEP(*(.head)) }
     ASSERT(SIZEOF(.head) <= 0x1000, "entry overlaps payload descriptor")
     . = _start + 0x1000;
@@ -27,8 +27,7 @@ SECTIONS {
         . += 64K;
         __bss_end = .;
     }
-    ASSERT(_start == 0xAA000000 || _start == 0xFEC00000, "unsupported bootstrap placement")
-    ASSERT(__bss_end - _start <= 1M, "diagnostic exceeds transient BL33 budget")
-    ASSERT(_start != 0xFEC00000 || __bss_end <= 0xFFC00000, "VMM exceeds protected region")
+    ASSERT(__bss_end - _start <= 1M, "bootstrap exceeds relocation budget")
+    ASSERT(__bss_end <= 0xFFC00000, "VMM exceeds protected region")
     /DISCARD/ : { *(.eh_frame*) *(.comment*) *(.note*) }
 }

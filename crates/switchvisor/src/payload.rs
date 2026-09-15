@@ -172,7 +172,7 @@ impl Payload {
         Ok(bytes)
     }
 
-    /// A zero descriptor selects the diagnostic-only entry path.
+    /// A zero descriptor identifies an unpackaged bootstrap.
     pub fn decode(bytes: &[u8]) -> Result<Option<Self>, PayloadError> {
         if bytes.len() != CONFIG_SIZE {
             return Err(PayloadError::Truncated);

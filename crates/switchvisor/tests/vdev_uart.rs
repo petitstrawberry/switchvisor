@@ -4,7 +4,7 @@ use switchvisor::{
 };
 
 #[test]
-fn scarlet_initialization_does_not_transmit_baud_divisors() {
+fn divisor_latch_initialization_does_not_transmit_configuration_bytes() {
     let mut uart = Uart::new();
     let device: &mut dyn VirtualDevice = &mut uart;
     for (register, value) in [(1, 0), (3, 0x80), (0, 3), (1, 0), (3, 3), (2, 7)] {
@@ -13,12 +13,12 @@ fn scarlet_initialization_does_not_transmit_baud_divisors() {
     assert_eq!(device.read(5, 1), Ok(0x60));
     assert_eq!(device.read(2, 1), Ok(0xc1));
     assert!(uart.tx().is_empty());
-    for &byte in b"Scarlet SMP\n\r\n\0\xff" {
+    for &byte in b"guest SMP\n\r\n\0\xff" {
         uart.write(0, 1, u64::from(byte)).unwrap();
     }
     let mut bytes = [0; 20];
     let length = uart.tx().peek(&mut bytes);
-    assert_eq!(&bytes[..length], b"Scarlet SMP\n\r\n\0\xff");
+    assert_eq!(&bytes[..length], b"guest SMP\n\r\n\0\xff");
     uart.write(2, 1, 7).unwrap();
     assert_eq!(uart.tx().len(), length); // Already accepted wire bytes survive FIFO clears.
 }

@@ -1,6 +1,6 @@
 use switchvisor::{
     fdt::{Fdt, FdtError},
-    image::{ImageError, ScarletImage, UbootImage},
+    image::{ImageError, UbootImage},
 };
 
 fn word(bytes: &mut Vec<u8>, value: u32) {
@@ -89,49 +89,6 @@ fn uboot(status_shift: usize) -> Vec<u8> {
     put_quad(&mut bytes, 24, 128);
     put_quad(&mut bytes, 32, runtime_size);
     bytes
-}
-
-fn scarlet() -> Vec<u8> {
-    let mut bytes = vec![0; 4096];
-    put_quad(&mut bytes, 8, 0x20_0000);
-    put_quad(&mut bytes, 16, 0x110_0000);
-    bytes[56..60].copy_from_slice(b"ARM\x64");
-    bytes
-}
-
-#[test]
-fn raw_image_reports_runtime_including_bss_instead_of_file_size() {
-    let bytes = scarlet();
-    let image = ScarletImage::parse(&bytes).unwrap();
-    assert_eq!(image.runtime.start(), 0x8020_0000);
-    assert_eq!(image.runtime.end(), 0x8130_0000);
-    assert!(image.image_size > bytes.len() as u64);
-}
-
-#[test]
-fn raw_image_rejects_wrong_abi_zero_size_and_dtb_overlap() {
-    let mut bytes = scarlet();
-    put_quad(&mut bytes, 8, 0x80_0000);
-    assert_eq!(ScarletImage::parse(&bytes).unwrap_err(), ImageError::Header);
-    put_quad(&mut bytes, 8, 0x20_0000);
-    put_quad(&mut bytes, 16, 0);
-    assert_eq!(
-        ScarletImage::parse(&bytes).unwrap_err(),
-        ImageError::RuntimeExtent
-    );
-    put_quad(&mut bytes, 16, u64::MAX);
-    assert_eq!(
-        ScarletImage::parse(&bytes).unwrap_err(),
-        ImageError::RuntimeExtent
-    );
-    put_quad(&mut bytes, 16, 0xd00_0001);
-    assert_eq!(
-        ScarletImage::parse(&bytes).unwrap_err(),
-        ImageError::RuntimeExtent
-    );
-    put_quad(&mut bytes, 16, 0x110_0000);
-    put_quad(&mut bytes, 24, 1);
-    assert_eq!(ScarletImage::parse(&bytes).unwrap_err(), ImageError::Header);
 }
 
 #[test]

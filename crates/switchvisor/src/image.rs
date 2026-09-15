@@ -1,6 +1,6 @@
 use core::fmt;
 
-use crate::{BL33_LOAD_BASE, IPA_LIMIT, SCARLET_LOAD_BASE, fdt::Fdt, memory::AddressRange};
+use crate::{BL33_LOAD_BASE, IPA_LIMIT, fdt::Fdt, memory::AddressRange};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImageError {
@@ -126,43 +126,5 @@ impl UbootImage {
         let target = offset + 0x1c94 + usize::from(port - 1) * 0x12c;
         bytes[target..target + 5].copy_from_slice(b"okay\0");
         Ok(())
-    }
-}
-
-#[derive(Debug)]
-pub struct ScarletImage {
-    pub text_offset: u64,
-    pub image_size: u64,
-    pub runtime: AddressRange,
-}
-
-impl ScarletImage {
-    /// Inspect a raw, uncompressed Linux Image. U-Boot remains responsible for uImage/gzip.
-    pub fn parse(bytes: &[u8]) -> Result<Self, ImageError> {
-        if bytes.len() < 64 {
-            return Err(ImageError::Truncated);
-        }
-        if &bytes[56..60] != b"ARM\x64" {
-            return Err(ImageError::Header);
-        }
-        let text_offset = le64(bytes, 8)?;
-        let image_size = le64(bytes, 16)?;
-        let flags = le64(bytes, 24)?;
-        if text_offset != 0x20_0000 || flags & 1 != 0 {
-            return Err(ImageError::Header);
-        }
-        if image_size < bytes.len() as u64 {
-            return Err(ImageError::RuntimeExtent);
-        }
-        let runtime = AddressRange::new(SCARLET_LOAD_BASE, image_size)
-            .map_err(|_| ImageError::RuntimeExtent)?;
-        if runtime.end() > 0x8d00_0000 {
-            return Err(ImageError::RuntimeExtent);
-        }
-        Ok(Self {
-            text_offset,
-            image_size,
-            runtime,
-        })
     }
 }

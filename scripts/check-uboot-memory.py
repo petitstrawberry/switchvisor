@@ -32,7 +32,8 @@ def main():
     parser.add_argument("bootstack", type=Path, help="Pinned native bootstack")
     args = parser.parse_args()
     source = args.source.resolve(strict=True)
-    revision = json.loads((ROOT / "config/bootstack.json").read_text())["uboot_source_revision"]
+    pins = ROOT / "crates/switchvisor-tool/config/bootstack.json"
+    revision = json.loads(pins.read_text())["uboot_source_revision"]
     def pinned(path):
         return subprocess.check_output(["git", "-C", str(source), "show", f"{revision}:{path}"])
     subprocess.run([str(ROOT / "target/debug/switchvisor-tool"), "inspect-bootstack", str(args.bootstack)],

@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location("payload_smoke", ROOT / "scripts/qemu-payload-smoke.py")
 payload = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(payload)
-payload.boot.GLYPHS.update({
+payload.qemu.GLYPHS.update({
     "3":[30,1,1,14,1,1,30], "4":[2,6,10,18,31,2,2], "5":[31,16,16,30,1,1,30],
     "6":[14,16,16,30,17,17,14], "8":[14,17,17,14,17,17,14], "9":[14,17,17,15,1,1,14],
     "B":[30,17,17,30,17,17,30], "C":[14,17,16,16,16,17,14], "D":[30,17,17,17,17,17,30],
@@ -64,9 +64,18 @@ def main():
     reports=[]
     cases=[]
     for mmu in [0,1]:
-        for address in [0xfec00000,0xfec80000,0xffbffff8]:
+        for address in [
+            payload.RESIDENT_BASE,
+            payload.RESIDENT_BASE + payload.RESIDENT_SIZE // 2,
+            payload.RESIDENT_BASE + payload.RESIDENT_SIZE - 8,
+        ]:
             for action in [1,2]: cases.append((f"mmu{mmu}-{'read' if action==1 else 'write'}-{address:x}",mmu,action,address))
-        cases.append((f"mmu{mmu}-execute",mmu,3,0xfec80000))
+        cases.append((
+            f"mmu{mmu}-execute",
+            mmu,
+            3,
+            payload.RESIDENT_BASE + payload.RESIDENT_SIZE // 2,
+        ))
         for address in [0xfebffff8,0xffc00000]: cases.append((f"mmu{mmu}-identity-{address:x}",mmu,0,address))
         cases.append((f"mmu{mmu}-physical-irq",mmu,4,0))
         cases.append((f"mmu{mmu}-psci-guard",mmu,5,0))

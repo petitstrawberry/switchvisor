@@ -240,7 +240,7 @@ wait_irq:
     ldr x10, =0x700ff000
 .endif
     mov x9, #0xaa080000
-    // Scarlet's initialization writes DLAB/divisors before enabling 8N1/FIFO.
+    // A normal NS16550 initialization writes DLAB/divisors before enabling 8N1/FIFO.
     mov w11, #0x80
     strb w11, [x10, #3]
     mov w11, #1

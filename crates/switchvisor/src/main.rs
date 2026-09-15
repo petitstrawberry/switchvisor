@@ -62,10 +62,7 @@ extern "C" fn rust_boot() -> ! {
             park()
         }
     }
-    let _ = writeln!(
-        screen,
-        "\nENTRY COMPLETE - CPU0 PARKED\nGUEST NOT STARTED - HV PROFILE PENDING"
-    );
+    let _ = writeln!(screen, "\nPAYLOAD DESCRIPTOR MISSING\nCPU0 PARKED");
     unsafe {
         asm!("dsb sy", options(nostack));
     }

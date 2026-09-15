@@ -1,6 +1,7 @@
 /target/
 /dist/
 /.cache/
+/proj/
 /.direnv/
 __pycache__/
 .DS_Store
