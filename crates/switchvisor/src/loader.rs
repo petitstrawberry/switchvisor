@@ -1,39 +1,55 @@
-//! Binary protocol and state machine for pre-guest raw payload uploads.
+//! Binary protocol and state machine for pre-guest guest-RAM bundle uploads.
 
-use crate::payload::{Crc32, LOAD_BASE, MAX_RUNTIME_SIZE, RESIDENT_BASE, RESIDENT_SIZE};
+use crate::{
+    memory::AddressRange,
+    payload::{Crc32, RESIDENT_BASE, STACK_TOP},
+};
 
 pub const MAGIC: [u8; 4] = *b"SWVL";
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 pub const HEADER_SIZE: usize = 32;
 pub const MAX_MESSAGE_SIZE: usize = 4096;
 pub const MAX_BODY_SIZE: usize = MAX_MESSAGE_SIZE - HEADER_SIZE;
-pub const DESCRIPTOR_SIZE: usize = 96;
+pub const BUNDLE_DESCRIPTOR_SIZE: usize = 80;
+pub const IMAGE_DESCRIPTOR_SIZE: usize = 32;
+pub const MAX_IMAGES: usize = 16;
 pub const MAX_RESPONSE_SIZE: usize = HEADER_SIZE + 48;
 pub const REPLY_FLAG: u16 = 0x8000;
 pub const PRESERVE_BOOT_ARGS: u32 = 1;
+
+/// The loader accepts arbitrary non-overlapping ranges in low guest RAM.
+pub const GUEST_RAM_BASE: u64 = 0x8000_0000;
+pub const GUEST_RAM_END: u64 = RESIDENT_BASE;
+const BOOT_STACK_SIZE: u64 = 64 * 1024;
+const FRAMEBUFFER_BASE: u64 = 0xf5a0_0000;
+const FRAMEBUFFER_SIZE: u64 = 4 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u16)]
 pub enum Opcode {
     Hello = 1,
-    Begin = 2,
-    Data = 3,
-    Commit = 4,
-    Abort = 5,
-    Boot = 6,
-    Status = 7,
+    BeginBundle = 2,
+    BeginImage = 3,
+    Data = 4,
+    EndImage = 5,
+    CommitBundle = 6,
+    Abort = 7,
+    Boot = 8,
+    Status = 9,
 }
 
 impl Opcode {
     fn decode(value: u16) -> Option<Self> {
         Some(match value {
             1 => Self::Hello,
-            2 => Self::Begin,
-            3 => Self::Data,
-            4 => Self::Commit,
-            5 => Self::Abort,
-            6 => Self::Boot,
-            7 => Self::Status,
+            2 => Self::BeginBundle,
+            3 => Self::BeginImage,
+            4 => Self::Data,
+            5 => Self::EndImage,
+            6 => Self::CommitBundle,
+            7 => Self::Abort,
+            8 => Self::Boot,
+            9 => Self::Status,
             _ => return None,
         })
     }
@@ -43,9 +59,10 @@ impl Opcode {
 #[repr(u32)]
 pub enum State {
     Idle = 0,
-    Receiving = 1,
-    Ready = 2,
-    Disabled = 3,
+    Bundle = 1,
+    Receiving = 2,
+    Ready = 3,
+    Disabled = 4,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,6 +77,9 @@ pub enum StatusCode {
     Checksum = 6,
     Storage = 7,
     GuestRunning = 8,
+    ImageCount = 9,
+    Overlap = 10,
+    Entry = 11,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,9 +131,8 @@ impl Header {
         if u16_at(bytes, 4)? != VERSION {
             return Err(ProtocolError::Version);
         }
-        let opcode = u16_at(bytes, 6)?;
         let header = Self {
-            opcode,
+            opcode: u16_at(bytes, 6)?,
             request_id: u32_at(bytes, 8)?,
             length: u32_at(bytes, 12)?,
             arg0: u64_at(bytes, 16)?,
@@ -128,86 +147,141 @@ impl Header {
     }
 }
 
+/// Entry state for a committed bundle. Image meaning remains guest-specific.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Descriptor {
-    pub file_size: u64,
-    pub runtime_size: u64,
-    pub entry_offset: u64,
+pub struct BundleDescriptor {
+    pub entry: u64,
+    pub image_count: u32,
     pub flags: u32,
-    pub crc32: u32,
     pub registers: [u64; 8],
 }
 
-impl Descriptor {
+impl BundleDescriptor {
     pub fn preserve_boot_args(self) -> bool {
         self.flags & PRESERVE_BOOT_ARGS != 0
     }
 
-    pub fn entry(self) -> u64 {
-        LOAD_BASE + self.entry_offset
-    }
-
     pub fn validate(self) -> bool {
-        let Some(end) = LOAD_BASE.checked_add(self.runtime_size) else {
-            return false;
-        };
-        let resident_end = RESIDENT_BASE + RESIDENT_SIZE;
-        self.file_size != 0
-            && self.runtime_size >= self.file_size
-            && self.runtime_size <= MAX_RUNTIME_SIZE
-            && self.entry_offset % 4 == 0
-            && self
-                .entry_offset
-                .checked_add(4)
-                .is_some_and(|entry_end| entry_end <= self.file_size)
+        self.image_count != 0
+            && self.image_count as usize <= MAX_IMAGES
+            && self.entry % 4 == 0
+            && guest_range(self.entry, 4)
             && self.flags & !PRESERVE_BOOT_ARGS == 0
             && (!self.preserve_boot_args() || self.registers.iter().all(|value| *value == 0))
-            && !(LOAD_BASE < resident_end && RESIDENT_BASE < end)
     }
 
-    pub fn encode(self, output: &mut [u8; DESCRIPTOR_SIZE]) {
-        output[..8].copy_from_slice(&self.file_size.to_le_bytes());
-        output[8..16].copy_from_slice(&self.runtime_size.to_le_bytes());
-        output[16..24].copy_from_slice(&self.entry_offset.to_le_bytes());
-        output[24..28].copy_from_slice(&self.flags.to_le_bytes());
-        output[28..32].copy_from_slice(&self.crc32.to_le_bytes());
+    pub fn encode(self, output: &mut [u8; BUNDLE_DESCRIPTOR_SIZE]) {
+        output[..8].copy_from_slice(&self.entry.to_le_bytes());
+        output[8..12].copy_from_slice(&self.image_count.to_le_bytes());
+        output[12..16].copy_from_slice(&self.flags.to_le_bytes());
         for (index, value) in self.registers.iter().enumerate() {
-            output[32 + index * 8..40 + index * 8].copy_from_slice(&value.to_le_bytes());
+            output[16 + index * 8..24 + index * 8].copy_from_slice(&value.to_le_bytes());
         }
     }
 
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != DESCRIPTOR_SIZE {
+        if bytes.len() != BUNDLE_DESCRIPTOR_SIZE {
             return None;
         }
         let mut registers = [0; 8];
         for (index, value) in registers.iter_mut().enumerate() {
-            *value = u64_at(bytes, 32 + index * 8).ok()?;
+            *value = u64_at(bytes, 16 + index * 8).ok()?;
         }
         let descriptor = Self {
-            file_size: u64_at(bytes, 0).ok()?,
-            runtime_size: u64_at(bytes, 8).ok()?,
-            entry_offset: u64_at(bytes, 16).ok()?,
-            flags: u32_at(bytes, 24).ok()?,
-            crc32: u32_at(bytes, 28).ok()?,
+            entry: u64_at(bytes, 0).ok()?,
+            image_count: u32_at(bytes, 8).ok()?,
+            flags: u32_at(bytes, 12).ok()?,
             registers,
         };
         descriptor.validate().then_some(descriptor)
     }
 }
 
+/// One opaque file and its zero-filled runtime extent in guest RAM.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageDescriptor {
+    pub address: u64,
+    pub file_size: u64,
+    pub runtime_size: u64,
+    pub crc32: u32,
+    pub flags: u32,
+}
+
+impl ImageDescriptor {
+    pub fn validate(self) -> bool {
+        self.file_size != 0
+            && self.runtime_size >= self.file_size
+            && self.flags == 0
+            && guest_range(self.address, self.runtime_size)
+    }
+
+    pub fn contains_entry(self, entry: u64) -> bool {
+        entry % 4 == 0
+            && self.address.checked_add(self.file_size).is_some_and(|end| {
+                entry >= self.address && entry.checked_add(4).is_some_and(|value| value <= end)
+            })
+    }
+
+    fn overlaps(self, other: Self) -> bool {
+        let left = AddressRange::new(self.address, self.runtime_size).expect("validated image");
+        let right = AddressRange::new(other.address, other.runtime_size).expect("validated image");
+        left.overlaps(right)
+    }
+
+    pub fn encode(self, output: &mut [u8; IMAGE_DESCRIPTOR_SIZE]) {
+        output[..8].copy_from_slice(&self.address.to_le_bytes());
+        output[8..16].copy_from_slice(&self.file_size.to_le_bytes());
+        output[16..24].copy_from_slice(&self.runtime_size.to_le_bytes());
+        output[24..28].copy_from_slice(&self.crc32.to_le_bytes());
+        output[28..32].copy_from_slice(&self.flags.to_le_bytes());
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != IMAGE_DESCRIPTOR_SIZE {
+            return None;
+        }
+        let descriptor = Self {
+            address: u64_at(bytes, 0).ok()?,
+            file_size: u64_at(bytes, 8).ok()?,
+            runtime_size: u64_at(bytes, 16).ok()?,
+            crc32: u32_at(bytes, 24).ok()?,
+            flags: u32_at(bytes, 28).ok()?,
+        };
+        descriptor.validate().then_some(descriptor)
+    }
+}
+
+/// Reject ranges that could overwrite EL2's active boot stack or framebuffer.
+pub fn guest_range(address: u64, size: u64) -> bool {
+    let Ok(range) = AddressRange::new(address, size) else {
+        return false;
+    };
+    if range.start() < GUEST_RAM_BASE || range.end() > GUEST_RAM_END {
+        return false;
+    }
+    for protected in [
+        AddressRange::new(STACK_TOP - BOOT_STACK_SIZE, BOOT_STACK_SIZE).unwrap(),
+        AddressRange::new(FRAMEBUFFER_BASE, FRAMEBUFFER_SIZE).unwrap(),
+    ] {
+        if range.overlaps(protected) {
+            return false;
+        }
+    }
+    true
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StorageError;
 
 pub trait Storage {
-    fn write(&mut self, offset: u64, bytes: &[u8]) -> Result<(), StorageError>;
-    fn zero(&mut self, offset: u64, length: u64) -> Result<(), StorageError>;
+    fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), StorageError>;
+    fn zero(&mut self, address: u64, length: u64) -> Result<(), StorageError>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
     None,
-    Boot(Descriptor),
+    Boot(BundleDescriptor),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -252,7 +326,10 @@ impl Response {
 
 pub struct Loader {
     state: State,
-    descriptor: Option<Descriptor>,
+    bundle: Option<BundleDescriptor>,
+    images: [Option<ImageDescriptor>; MAX_IMAGES],
+    completed: usize,
+    current: Option<ImageDescriptor>,
     received: u64,
     crc32: Crc32,
     claimed: bool,
@@ -268,7 +345,10 @@ impl Loader {
     pub const fn new() -> Self {
         Self {
             state: State::Idle,
-            descriptor: None,
+            bundle: None,
+            images: [None; MAX_IMAGES],
+            completed: 0,
+            current: None,
             received: 0,
             crc32: Crc32::new(),
             claimed: false,
@@ -288,10 +368,21 @@ impl Loader {
     }
 
     pub fn disable(&mut self) {
-        self.state = State::Disabled;
-        self.descriptor = None;
+        self.clear(State::Disabled);
+    }
+
+    fn clear(&mut self, state: State) {
+        self.state = state;
+        self.bundle = None;
+        self.images.fill(None);
+        self.completed = 0;
+        self.current = None;
         self.received = 0;
         self.crc32 = Crc32::new();
+    }
+
+    fn reply(&self, request: Header, code: StatusCode) -> (Response, Action) {
+        (Response::new(request, code, self.state, &[]), Action::None)
     }
 
     pub fn handle<S: Storage>(
@@ -305,19 +396,18 @@ impl Loader {
         }
         let body = &message[HEADER_SIZE..];
         let Some(opcode) = Opcode::decode(header.opcode) else {
-            return Ok((
-                Response::new(header, StatusCode::UnknownOpcode, self.state, &[]),
-                Action::None,
-            ));
+            return Ok(self.reply(header, StatusCode::UnknownOpcode));
         };
         let empty = body.is_empty() && header.arg0 == 0 && header.arg1 == 0;
         match opcode {
             Opcode::Hello if empty => {
-                let mut data = [0; 24];
-                data[..8].copy_from_slice(&MAX_RUNTIME_SIZE.to_le_bytes());
-                data[8..16].copy_from_slice(&LOAD_BASE.to_le_bytes());
+                let mut data = [0; 32];
+                data[..8].copy_from_slice(&GUEST_RAM_BASE.to_le_bytes());
+                data[8..16].copy_from_slice(&GUEST_RAM_END.to_le_bytes());
                 data[16..20].copy_from_slice(&(MAX_BODY_SIZE as u32).to_le_bytes());
-                data[20..24].copy_from_slice(&(DESCRIPTOR_SIZE as u32).to_le_bytes());
+                data[20..24].copy_from_slice(&(BUNDLE_DESCRIPTOR_SIZE as u32).to_le_bytes());
+                data[24..28].copy_from_slice(&(IMAGE_DESCRIPTOR_SIZE as u32).to_le_bytes());
+                data[28..32].copy_from_slice(&(MAX_IMAGES as u32).to_le_bytes());
                 Ok((
                     Response::new(header, StatusCode::Ok, self.state, &data),
                     Action::None,
@@ -328,90 +418,93 @@ impl Loader {
                 data[..4].copy_from_slice(&(self.state as u32).to_le_bytes());
                 data[4..8].copy_from_slice(&u32::from(self.claimed).to_le_bytes());
                 data[8..16].copy_from_slice(&self.received.to_le_bytes());
-                if let Some(descriptor) = self.descriptor {
-                    data[16..24].copy_from_slice(&descriptor.file_size.to_le_bytes());
-                    data[24..32].copy_from_slice(&descriptor.runtime_size.to_le_bytes());
-                    data[32..40].copy_from_slice(&descriptor.entry_offset.to_le_bytes());
-                    data[40..44].copy_from_slice(&descriptor.crc32.to_le_bytes());
-                    data[44..48].copy_from_slice(&descriptor.flags.to_le_bytes());
+                if let Some(bundle) = self.bundle {
+                    data[16..20].copy_from_slice(&bundle.image_count.to_le_bytes());
+                }
+                data[20..24].copy_from_slice(&(self.completed as u32).to_le_bytes());
+                if let Some(image) = self.current {
+                    data[24..32].copy_from_slice(&image.address.to_le_bytes());
+                    data[32..40].copy_from_slice(&image.file_size.to_le_bytes());
+                    data[40..48].copy_from_slice(&image.runtime_size.to_le_bytes());
                 }
                 Ok((
                     Response::new(header, StatusCode::Ok, self.state, &data),
                     Action::None,
                 ))
             }
-            Opcode::Begin => {
+            Opcode::BeginBundle => {
                 if self.state == State::Disabled {
-                    return Ok((
-                        Response::new(header, StatusCode::GuestRunning, self.state, &[]),
-                        Action::None,
-                    ));
+                    return Ok(self.reply(header, StatusCode::GuestRunning));
                 }
                 if self.state != State::Idle {
-                    return Ok((
-                        Response::new(header, StatusCode::BadState, self.state, &[]),
-                        Action::None,
-                    ));
+                    return Ok(self.reply(header, StatusCode::BadState));
                 }
                 if header.arg0 != 0 || header.arg1 != 0 {
-                    return Ok((
-                        Response::new(header, StatusCode::BadLength, self.state, &[]),
-                        Action::None,
-                    ));
+                    return Ok(self.reply(header, StatusCode::BadLength));
                 }
-                let Some(descriptor) = Descriptor::decode(body) else {
-                    return Ok((
-                        Response::new(header, StatusCode::InvalidDescriptor, self.state, &[]),
-                        Action::None,
-                    ));
+                let Some(bundle) = BundleDescriptor::decode(body) else {
+                    return Ok(self.reply(header, StatusCode::InvalidDescriptor));
                 };
-                self.state = State::Receiving;
-                self.descriptor = Some(descriptor);
+                self.bundle = Some(bundle);
+                self.state = State::Bundle;
+                self.claimed = true;
+                Ok(self.reply(header, StatusCode::Ok))
+            }
+            Opcode::BeginImage => {
+                if self.state != State::Bundle {
+                    return Ok(self.reply(header, StatusCode::BadState));
+                }
+                if header.arg0 != 0 || header.arg1 != 0 {
+                    return Ok(self.reply(header, StatusCode::BadLength));
+                }
+                let Some(bundle) = self.bundle else {
+                    self.clear(State::Idle);
+                    return Ok(self.reply(header, StatusCode::BadState));
+                };
+                if self.completed >= bundle.image_count as usize {
+                    return Ok(self.reply(header, StatusCode::ImageCount));
+                }
+                let Some(image) = ImageDescriptor::decode(body) else {
+                    return Ok(self.reply(header, StatusCode::InvalidDescriptor));
+                };
+                if self.images[..self.completed]
+                    .iter()
+                    .flatten()
+                    .any(|other| image.overlaps(*other))
+                {
+                    return Ok(self.reply(header, StatusCode::Overlap));
+                }
+                self.current = Some(image);
                 self.received = 0;
                 self.crc32 = Crc32::new();
-                self.claimed = true;
-                Ok((
-                    Response::new(header, StatusCode::Ok, self.state, &[]),
-                    Action::None,
-                ))
+                self.state = State::Receiving;
+                Ok(self.reply(header, StatusCode::Ok))
             }
             Opcode::Data => {
                 if self.state != State::Receiving {
-                    return Ok((
-                        Response::new(header, StatusCode::BadState, self.state, &[]),
-                        Action::None,
-                    ));
+                    return Ok(self.reply(header, StatusCode::BadState));
                 }
-                let Some(descriptor) = self.descriptor else {
-                    self.state = State::Idle;
-                    return Ok((
-                        Response::new(header, StatusCode::BadState, self.state, &[]),
-                        Action::None,
-                    ));
+                let Some(image) = self.current else {
+                    self.clear(State::Idle);
+                    return Ok(self.reply(header, StatusCode::BadState));
                 };
                 if body.is_empty() {
-                    return Ok((
-                        Response::new(header, StatusCode::BadLength, self.state, &[]),
-                        Action::None,
-                    ));
+                    return Ok(self.reply(header, StatusCode::BadLength));
                 }
                 if header.arg0 != self.received
                     || header.arg1 != 0
                     || self
                         .received
                         .checked_add(body.len() as u64)
-                        .is_none_or(|end| end > descriptor.file_size)
+                        .is_none_or(|end| end > image.file_size)
                 {
-                    return Ok((
-                        Response::new(header, StatusCode::BadOffset, self.state, &[]),
-                        Action::None,
-                    ));
+                    return Ok(self.reply(header, StatusCode::BadOffset));
                 }
-                if storage.write(self.received, body).is_err() {
-                    return Ok((
-                        Response::new(header, StatusCode::Storage, self.state, &[]),
-                        Action::None,
-                    ));
+                let Some(address) = image.address.checked_add(self.received) else {
+                    return Ok(self.reply(header, StatusCode::BadOffset));
+                };
+                if storage.write(address, body).is_err() {
+                    return Ok(self.reply(header, StatusCode::Storage));
                 }
                 self.crc32.update(body);
                 self.received += body.len() as u64;
@@ -419,91 +512,79 @@ impl Loader {
                 response.header.arg1 = self.received;
                 Ok((response, Action::None))
             }
-            Opcode::Commit if empty => {
+            Opcode::EndImage if empty => {
                 if self.state != State::Receiving {
-                    return Ok((
-                        Response::new(header, StatusCode::BadState, self.state, &[]),
-                        Action::None,
-                    ));
+                    return Ok(self.reply(header, StatusCode::BadState));
                 }
-                let Some(descriptor) = self.descriptor else {
-                    self.state = State::Idle;
-                    return Ok((
-                        Response::new(header, StatusCode::BadState, self.state, &[]),
-                        Action::None,
-                    ));
+                let Some(image) = self.current else {
+                    self.clear(State::Idle);
+                    return Ok(self.reply(header, StatusCode::BadState));
                 };
-                if self.received != descriptor.file_size {
-                    return Ok((
-                        Response::new(header, StatusCode::BadLength, self.state, &[]),
-                        Action::None,
-                    ));
+                if self.received != image.file_size {
+                    return Ok(self.reply(header, StatusCode::BadLength));
                 }
-                if self.crc32.finish() != descriptor.crc32 {
-                    return Ok((
-                        Response::new(header, StatusCode::Checksum, self.state, &[]),
-                        Action::None,
-                    ));
+                if self.crc32.finish() != image.crc32 {
+                    return Ok(self.reply(header, StatusCode::Checksum));
                 }
-                if storage
-                    .zero(
-                        descriptor.file_size,
-                        descriptor.runtime_size - descriptor.file_size,
-                    )
-                    .is_err()
+                let zero_size = image.runtime_size - image.file_size;
+                if zero_size != 0
+                    && storage
+                        .zero(image.address + image.file_size, zero_size)
+                        .is_err()
                 {
-                    return Ok((
-                        Response::new(header, StatusCode::Storage, self.state, &[]),
-                        Action::None,
-                    ));
+                    return Ok(self.reply(header, StatusCode::Storage));
                 }
-                self.state = State::Ready;
-                Ok((
-                    Response::new(header, StatusCode::Ok, self.state, &[]),
-                    Action::None,
-                ))
-            }
-            Opcode::Abort if empty => {
-                if !matches!(self.state, State::Receiving | State::Ready) {
-                    return Ok((
-                        Response::new(header, StatusCode::BadState, self.state, &[]),
-                        Action::None,
-                    ));
-                }
-                self.state = State::Idle;
-                self.descriptor = None;
+                self.images[self.completed] = Some(image);
+                self.completed += 1;
+                self.current = None;
                 self.received = 0;
                 self.crc32 = Crc32::new();
-                Ok((
-                    Response::new(header, StatusCode::Ok, self.state, &[]),
-                    Action::None,
-                ))
+                self.state = State::Bundle;
+                Ok(self.reply(header, StatusCode::Ok))
+            }
+            Opcode::CommitBundle if empty => {
+                if self.state != State::Bundle {
+                    return Ok(self.reply(header, StatusCode::BadState));
+                }
+                let Some(bundle) = self.bundle else {
+                    self.clear(State::Idle);
+                    return Ok(self.reply(header, StatusCode::BadState));
+                };
+                if self.completed != bundle.image_count as usize {
+                    return Ok(self.reply(header, StatusCode::ImageCount));
+                }
+                if !self.images[..self.completed]
+                    .iter()
+                    .flatten()
+                    .any(|image| image.contains_entry(bundle.entry))
+                {
+                    return Ok(self.reply(header, StatusCode::Entry));
+                }
+                self.state = State::Ready;
+                Ok(self.reply(header, StatusCode::Ok))
+            }
+            Opcode::Abort if empty => {
+                if !matches!(self.state, State::Bundle | State::Receiving | State::Ready) {
+                    return Ok(self.reply(header, StatusCode::BadState));
+                }
+                self.clear(State::Idle);
+                Ok(self.reply(header, StatusCode::Ok))
             }
             Opcode::Boot if empty => {
                 if self.state != State::Ready {
-                    return Ok((
-                        Response::new(header, StatusCode::BadState, self.state, &[]),
-                        Action::None,
-                    ));
+                    return Ok(self.reply(header, StatusCode::BadState));
                 }
-                let Some(descriptor) = self.descriptor else {
-                    self.state = State::Idle;
-                    return Ok((
-                        Response::new(header, StatusCode::BadState, self.state, &[]),
-                        Action::None,
-                    ));
+                let Some(bundle) = self.bundle else {
+                    self.clear(State::Idle);
+                    return Ok(self.reply(header, StatusCode::BadState));
                 };
-                self.state = State::Disabled;
-                self.descriptor = None;
+                self.clear(State::Disabled);
                 Ok((
                     Response::new(header, StatusCode::Ok, self.state, &[]),
-                    Action::Boot(descriptor),
+                    Action::Boot(bundle),
                 ))
             }
-            _ => Ok((
-                Response::new(header, StatusCode::BadLength, self.state, &[]),
-                Action::None,
-            )),
+            _ => Ok(self.reply(header, StatusCode::BadLength)),
         }
     }
 }

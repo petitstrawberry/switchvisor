@@ -1,10 +1,14 @@
+mod bundle;
+
+use bundle::PreparedBundle;
 use nusb::{
     Endpoint, MaybeFuture,
     transfer::{Buffer, Bulk, In, Out},
 };
 use serialport::SerialPortType;
 use std::{
-    env, fs,
+    env,
+    fs::File,
     io::{Read, Write},
     path::{Path, PathBuf},
     process::ExitCode,
@@ -14,10 +18,11 @@ use std::{
 use switchvisor::{
     drivers::usb::cdc::{PID, VID},
     loader::{
-        DESCRIPTOR_SIZE, Descriptor, HEADER_SIZE, Header, MAX_BODY_SIZE, MAX_RESPONSE_SIZE, Opcode,
-        PRESERVE_BOOT_ARGS, REPLY_FLAG, StatusCode,
+        BUNDLE_DESCRIPTOR_SIZE, GUEST_RAM_BASE, GUEST_RAM_END, HEADER_SIZE, Header,
+        IMAGE_DESCRIPTOR_SIZE, MAX_BODY_SIZE, MAX_IMAGES, MAX_RESPONSE_SIZE, Opcode,
+        PRESERVE_BOOT_ARGS, REPLY_FLAG, StatusCode, VERSION,
     },
-    payload::{LOAD_BASE, MAX_RUNTIME_SIZE, crc32},
+    payload::{LOAD_BASE, MAX_RUNTIME_SIZE},
 };
 
 const TIMEOUT: Duration = Duration::from_secs(3);
@@ -25,7 +30,7 @@ const DEVICE_WAIT: Duration = Duration::from_secs(15);
 const LOADER_INTERFACE: u8 = 4;
 const LOADER_OUT: u8 = 0x05;
 const LOADER_IN: u8 = 0x85;
-const USAGE: &str = "Usage:\n  switchvisorctl [--port <serial-device>] <ping|status|reboot|reboot-rcm>\n  switchvisorctl upload-bl33 <payload.raw> --runtime-size <size> [--entry-offset <size>] [--x0 <value> ... --x7 <value>]\n  switchvisorctl <hello|loader-status|boot|abort>\n\nNumbers accept decimal or 0x-prefixed hexadecimal notation. SWITCHVISOR_CONTROL_PORT may supply the control serial device.";
+const USAGE: &str = "Usage:\n  switchvisorctl [--port <serial-device>] <ping|status|reboot|reboot-rcm>\n  switchvisorctl deploy <bundle-directory|bundle.json>\n  switchvisorctl upload-bl33 <payload.raw> --runtime-size <size> [--entry-offset <size>] [--x0 <value> ... --x7 <value>]\n  switchvisorctl <hello|loader-status|boot|abort>\n\nNumbers accept decimal or 0x-prefixed hexadecimal notation. SWITCHVISOR_CONTROL_PORT may supply the control serial device.";
 
 fn number(value: &str) -> Result<u64, String> {
     match value
@@ -135,10 +140,12 @@ struct LoaderTransport {
 }
 
 struct Capabilities {
-    max_payload_size: u64,
-    load_address: u64,
+    guest_ram_base: u64,
+    guest_ram_end: u64,
     max_chunk_size: usize,
-    descriptor_size: usize,
+    bundle_descriptor_size: usize,
+    image_descriptor_size: usize,
+    max_images: usize,
 }
 
 fn body_u32(body: &[u8], offset: usize) -> Result<u32, String> {
@@ -160,14 +167,16 @@ fn body_u64(body: &[u8], offset: usize) -> Result<u64, String> {
 }
 
 fn capabilities(body: &[u8]) -> Result<Capabilities, String> {
-    if body.len() != 24 {
+    if body.len() != 32 {
         return Err(format!("invalid HELLO response body size {}", body.len()));
     }
     Ok(Capabilities {
-        max_payload_size: body_u64(body, 0)?,
-        load_address: body_u64(body, 8)?,
+        guest_ram_base: body_u64(body, 0)?,
+        guest_ram_end: body_u64(body, 8)?,
         max_chunk_size: body_u32(body, 16)? as usize,
-        descriptor_size: body_u32(body, 20)? as usize,
+        bundle_descriptor_size: body_u32(body, 20)? as usize,
+        image_descriptor_size: body_u32(body, 24)? as usize,
+        max_images: body_u32(body, 28)? as usize,
     })
 }
 
@@ -282,8 +291,97 @@ impl LoaderTransport {
     }
 }
 
-fn upload(path: &Path, args: &[String]) -> Result<(), String> {
-    let data = fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+fn validate_capabilities(
+    capabilities: &Capabilities,
+    bundle: &PreparedBundle,
+) -> Result<(), String> {
+    if capabilities.guest_ram_base != GUEST_RAM_BASE
+        || capabilities.guest_ram_end != GUEST_RAM_END
+        || capabilities.bundle_descriptor_size != BUNDLE_DESCRIPTOR_SIZE
+        || capabilities.image_descriptor_size != IMAGE_DESCRIPTOR_SIZE
+        || capabilities.max_chunk_size == 0
+        || capabilities.max_chunk_size > MAX_BODY_SIZE
+        || capabilities.max_images > MAX_IMAGES
+        || bundle.images.len() > capabilities.max_images
+    {
+        return Err("loader capabilities do not match the bundle contract".into());
+    }
+    Ok(())
+}
+
+fn transfer_bundle(bundle: &PreparedBundle, boot: bool) -> Result<(), String> {
+    let mut transport = LoaderTransport::open()?;
+    let (_, hello) = transport.request(Opcode::Hello, 0, &[])?;
+    let capabilities = capabilities(&hello)?;
+    validate_capabilities(&capabilities, bundle)?;
+
+    let mut descriptor = [0; BUNDLE_DESCRIPTOR_SIZE];
+    bundle.descriptor.encode(&mut descriptor);
+    transport.request(Opcode::BeginBundle, 0, &descriptor)?;
+    let transfer = (|| {
+        for (index, image) in bundle.images.iter().enumerate() {
+            let mut descriptor = [0; IMAGE_DESCRIPTOR_SIZE];
+            image.descriptor.encode(&mut descriptor);
+            transport.request(Opcode::BeginImage, 0, &descriptor)?;
+
+            let mut file = File::open(&image.path)
+                .map_err(|error| format!("{}: {error}", image.path.display()))?;
+            let mut buffer = vec![0; capabilities.max_chunk_size];
+            let mut offset = 0u64;
+            let mut last_progress = Instant::now();
+            loop {
+                let count = file
+                    .read(&mut buffer)
+                    .map_err(|error| format!("{}: {error}", image.path.display()))?;
+                if count == 0 {
+                    break;
+                }
+                let (reply, _) = transport.request(Opcode::Data, offset, &buffer[..count])?;
+                offset += count as u64;
+                if reply.arg1 != offset {
+                    return Err(format!(
+                        "loader acknowledged {} bytes after sending {offset}",
+                        reply.arg1
+                    ));
+                }
+                if last_progress.elapsed() >= Duration::from_secs(1)
+                    || offset == image.descriptor.file_size
+                {
+                    eprintln!(
+                        "image {}/{} {}: {offset}/{} bytes",
+                        index + 1,
+                        bundle.images.len(),
+                        image.path.display(),
+                        image.descriptor.file_size
+                    );
+                    last_progress = Instant::now();
+                }
+            }
+            if offset != image.descriptor.file_size {
+                return Err(format!("{} changed while uploading", image.path.display()));
+            }
+            transport.request(Opcode::EndImage, 0, &[])?;
+        }
+        transport.request(Opcode::CommitBundle, 0, &[])?;
+        if boot {
+            transport.request(Opcode::Boot, 0, &[])?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = transfer {
+        let _ = transport.request(Opcode::Abort, 0, &[]);
+        return Err(error);
+    }
+    println!(
+        "{}: images={} entry={:#x}",
+        if boot { "booted" } else { "ready" },
+        bundle.images.len(),
+        bundle.descriptor.entry
+    );
+    Ok(())
+}
+
+fn upload_bl33(path: &Path, args: &[String]) -> Result<(), String> {
     let mut runtime_size = None;
     let mut entry_offset = 0;
     let mut registers = [0; 8];
@@ -322,61 +420,30 @@ fn upload(path: &Path, args: &[String]) -> Result<(), String> {
         cursor += 2;
     }
     let runtime_size = runtime_size.ok_or("--runtime-size is required")?;
-    if data.len() as u64 > MAX_RUNTIME_SIZE {
-        return Err("payload exceeds the 64 MiB size limit".into());
+    if runtime_size > MAX_RUNTIME_SIZE {
+        return Err("payload runtime exceeds the 64 MiB BL33 limit".into());
     }
-    let descriptor = Descriptor {
-        file_size: data.len() as u64,
+    let entry = LOAD_BASE
+        .checked_add(entry_offset)
+        .ok_or("payload entry overflows u64")?;
+    let bundle = PreparedBundle::single(
+        path,
+        LOAD_BASE,
         runtime_size,
-        entry_offset,
-        flags: if explicit_registers {
+        entry,
+        if explicit_registers {
             0
         } else {
             PRESERVE_BOOT_ARGS
         },
-        crc32: crc32(&data),
         registers,
-    };
-    if !descriptor.validate() {
-        return Err("invalid payload size, runtime size, entry, or register policy".into());
-    }
-    let mut descriptor_bytes = [0; DESCRIPTOR_SIZE];
-    descriptor.encode(&mut descriptor_bytes);
-    let mut transport = LoaderTransport::open()?;
-    let (_, hello) = transport.request(Opcode::Hello, 0, &[])?;
-    let capabilities = capabilities(&hello)?;
-    if descriptor.runtime_size > capabilities.max_payload_size
-        || capabilities.load_address != LOAD_BASE
-        || capabilities.descriptor_size != DESCRIPTOR_SIZE
-        || capabilities.max_chunk_size == 0
-        || capabilities.max_chunk_size > MAX_BODY_SIZE
-    {
-        return Err("loader capabilities do not match the payload contract".into());
-    }
-    transport.request(Opcode::Begin, 0, &descriptor_bytes)?;
-    let mut offset = 0;
-    while offset < data.len() {
-        let end = (offset + capabilities.max_chunk_size).min(data.len());
-        let (reply, _) = transport.request(Opcode::Data, offset as u64, &data[offset..end])?;
-        if reply.arg1 != end as u64 {
-            return Err(format!(
-                "loader acknowledged {} bytes after sending {end}",
-                reply.arg1
-            ));
-        }
-        offset = end;
-        eprint!("\ruploaded {offset}/{} bytes", data.len());
-    }
-    eprintln!();
-    transport.request(Opcode::Commit, 0, &[])?;
-    println!(
-        "ready: file={} runtime={} entry={:#x} crc32={:08x}",
-        descriptor.file_size,
-        descriptor.runtime_size,
-        descriptor.entry(),
-        descriptor.crc32
-    );
-    Ok(())
+    )?;
+    transfer_bundle(&bundle, false)
+}
+
+fn deploy(path: &Path) -> Result<(), String> {
+    let bundle = PreparedBundle::from_manifest(path)?;
+    transfer_bundle(&bundle, true)
 }
 
 fn loader_command(opcode: Opcode) -> Result<(), String> {
@@ -386,21 +453,25 @@ fn loader_command(opcode: Opcode) -> Result<(), String> {
         Opcode::Hello => {
             let capabilities = capabilities(&body)?;
             println!(
-                "protocol=1 max-payload={} load-address={:#x} max-chunk={}",
-                capabilities.max_payload_size,
-                capabilities.load_address,
-                capabilities.max_chunk_size
+                "protocol={} guest-ram={:#x}..{:#x} max-chunk={} max-images={}",
+                VERSION,
+                capabilities.guest_ram_base,
+                capabilities.guest_ram_end,
+                capabilities.max_chunk_size,
+                capabilities.max_images
             );
         }
         Opcode::Status if body.len() == 48 => {
             println!(
-                "state={} claimed={} received={} file-size={} runtime-size={} entry-offset={:#x}",
+                "state={} claimed={} received={} images={}/{} current={:#x} file-size={} runtime-size={}",
                 body_u32(&body, 0)?,
                 body_u32(&body, 4)?,
                 body_u64(&body, 8)?,
-                body_u64(&body, 16)?,
+                body_u32(&body, 20)?,
+                body_u32(&body, 16)?,
                 body_u64(&body, 24)?,
-                body_u64(&body, 32)?
+                body_u64(&body, 32)?,
+                body_u64(&body, 40)?
             );
         }
         Opcode::Status => {
@@ -430,8 +501,9 @@ fn run() -> Result<(), String> {
         command @ ("ping" | "status" | "reboot" | "reboot-rcm") if args.len() == 1 => {
             control(command, port)
         }
+        "deploy" if args.len() == 2 && port.is_none() => deploy(Path::new(&args[1])),
         "upload-bl33" if args.len() >= 2 && port.is_none() => {
-            upload(Path::new(&args[1]), &args[2..])
+            upload_bl33(Path::new(&args[1]), &args[2..])
         }
         "hello" if args.len() == 1 && port.is_none() => loader_command(Opcode::Hello),
         "loader-status" if args.len() == 1 && port.is_none() => loader_command(Opcode::Status),

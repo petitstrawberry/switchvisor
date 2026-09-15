@@ -2,22 +2,43 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-if [[ $# -lt 3 ]]; then
-    echo "Usage: scripts/run-payload.sh <hekate.bin> <payload.raw> <runtime-size> [upload options...]" >&2
+if [[ $# -lt 2 ]]; then
+    echo "Usage:" >&2
+    echo "  scripts/run-payload.sh <hekate.bin> <payload.raw> <runtime-size> [upload options...]" >&2
+    echo "  scripts/run-payload.sh <hekate.bin> --bundle <bundle-directory|bundle.json>" >&2
     exit 1
 fi
 
 task_hekate=$1
-task_payload=$2
-task_runtime_size=$3
-shift 3
+shift
+task_mode=payload
+if [[ $1 == --bundle ]]; then
+    if [[ $# -ne 2 ]]; then
+        echo "--bundle requires exactly one bundle path" >&2
+        exit 1
+    fi
+    task_mode=bundle
+    task_bundle=$2
+else
+    if [[ $# -lt 2 ]]; then
+        echo "payload mode requires a raw file and runtime size" >&2
+        exit 1
+    fi
+    task_payload=$1
+    task_runtime_size=$2
+    shift 2
+fi
 
 if [[ ! -f $task_hekate ]]; then
     echo "Hekate payload not found: $task_hekate" >&2
     exit 1
 fi
-if [[ ! -f $task_payload ]]; then
+if [[ $task_mode == payload && ! -f $task_payload ]]; then
     echo "EL1 payload not found: $task_payload" >&2
+    exit 1
+fi
+if [[ $task_mode == bundle && ! -e $task_bundle ]]; then
+    echo "Guest bundle not found: $task_bundle" >&2
     exit 1
 fi
 
@@ -33,9 +54,15 @@ if ! command -v "$task_nxboot" >/dev/null 2>&1; then
     exit 1
 fi
 
-task_control=${SWITCHVISORCTL:-target/release/switchvisorctl}
-if [[ ! -x $task_control ]]; then
+if [[ -n ${SWITCHVISORCTL:-} ]]; then
+    task_control=$SWITCHVISORCTL
+else
     cargo build -p switchvisorctl --release
+    task_control=target/release/switchvisorctl
+fi
+if [[ ! -x $task_control ]]; then
+    echo "switchvisorctl is not executable: $task_control" >&2
+    exit 1
 fi
 
 "$task_control" reboot-rcm
@@ -56,5 +83,9 @@ fi
 sleep 1
 
 "$task_nxboot" --hekate id "$task_hekate_id" "$task_hekate"
-"$task_control" upload-bl33 "$task_payload" --runtime-size "$task_runtime_size" "$@"
-"$task_control" boot
+if [[ $task_mode == bundle ]]; then
+    "$task_control" deploy "$task_bundle"
+else
+    "$task_control" upload-bl33 "$task_payload" --runtime-size "$task_runtime_size" "$@"
+    "$task_control" boot
+fi

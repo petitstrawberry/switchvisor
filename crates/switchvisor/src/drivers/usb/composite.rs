@@ -344,7 +344,7 @@ fn string(output: &mut [u8; CONTROL_SIZE], index: u8) -> usize {
         3 => "SWV0001",
         4 => "Guest console",
         5 => "Switchvisor control",
-        6 => "Payload loader",
+        6 => "Guest bundle loader",
         _ => return 0,
     };
     let size = 2 + text.len() * 2;

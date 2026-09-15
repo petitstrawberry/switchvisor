@@ -17,10 +17,9 @@ use switchvisor::{
         usb::tegra210::{Channel, Error, PMC, Xudc},
     },
     loader::{
-        Action, Descriptor, Loader, MAX_MESSAGE_SIZE, MAX_RESPONSE_SIZE, State as LoaderState,
-        Storage, StorageError,
+        Action, BundleDescriptor, Loader, MAX_MESSAGE_SIZE, MAX_RESPONSE_SIZE,
+        State as LoaderState, Storage, StorageError, guest_range,
     },
-    payload::{LOAD_BASE, MAX_RUNTIME_SIZE},
 };
 
 const POLL_INTERVAL_US: u64 = 250;
@@ -74,7 +73,7 @@ struct Service {
     loader: Loader,
     loader_input: [u8; MAX_MESSAGE_SIZE],
     loader_output: Output<MAX_RESPONSE_SIZE>,
-    boot: Option<Descriptor>,
+    boot: Option<BundleDescriptor>,
     error: Option<Error>,
 }
 
@@ -93,34 +92,28 @@ static AVAILABLE: AtomicBool = AtomicBool::new(false);
 static REQUIRE_UPLOAD: AtomicBool = AtomicBool::new(false);
 static GUEST_RUNNING: AtomicBool = AtomicBool::new(false);
 static LAST_SERVICE: AtomicU64 = AtomicU64::new(0);
-static PAYLOAD_ENTRY: AtomicU64 = AtomicU64::new(0);
+static GUEST_ENTRY: AtomicU64 = AtomicU64::new(0);
 static RESET: AtomicU8 = AtomicU8::new(RESET_NONE);
 
-struct PayloadMemory;
+struct GuestMemory;
 
-impl Storage for PayloadMemory {
-    fn write(&mut self, offset: u64, bytes: &[u8]) -> Result<(), StorageError> {
-        let end = offset.checked_add(bytes.len() as u64).ok_or(StorageError)?;
-        if end > MAX_RUNTIME_SIZE {
+impl Storage for GuestMemory {
+    fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), StorageError> {
+        if !guest_range(address, bytes.len() as u64) {
             return Err(StorageError);
         }
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                (LOAD_BASE + offset) as *mut u8,
-                bytes.len(),
-            );
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, bytes.len());
         }
         Ok(())
     }
 
-    fn zero(&mut self, offset: u64, length: u64) -> Result<(), StorageError> {
-        let end = offset.checked_add(length).ok_or(StorageError)?;
-        if end > MAX_RUNTIME_SIZE {
+    fn zero(&mut self, address: u64, length: u64) -> Result<(), StorageError> {
+        if !guest_range(address, length) {
             return Err(StorageError);
         }
         unsafe {
-            core::ptr::write_bytes((LOAD_BASE + offset) as *mut u8, 0, length as usize);
+            core::ptr::write_bytes(address as *mut u8, 0, length as usize);
         }
         Ok(())
     }
@@ -130,13 +123,13 @@ pub fn initialize(
     enabled: bool,
     console_enabled: bool,
     require_upload: bool,
-    payload_entry: u64,
+    guest_entry: u64,
 ) -> Result<bool, Error> {
     ENABLED.store(enabled, Ordering::Release);
     AVAILABLE.store(false, Ordering::Release);
     REQUIRE_UPLOAD.store(require_upload, Ordering::Release);
     GUEST_RUNNING.store(false, Ordering::Release);
-    PAYLOAD_ENTRY.store(payload_entry, Ordering::Release);
+    GUEST_ENTRY.store(guest_entry, Ordering::Release);
     RESET.store(RESET_NONE, Ordering::Release);
     guest_console::configure(console_enabled);
     if !enabled {
@@ -171,7 +164,7 @@ pub fn available() -> bool {
 }
 
 pub fn enter_guest(entry: u64) {
-    PAYLOAD_ENTRY.store(entry, Ordering::Release);
+    GUEST_ENTRY.store(entry, Ordering::Release);
     GUEST_RUNNING.store(true, Ordering::Release);
     if available() {
         unsafe { USB.with(|state| state.loader.disable()) }
@@ -315,6 +308,7 @@ fn control_reply(state: &mut Service, command: Result<Command, ParseError>) {
             };
             let loader = match state.loader.state() {
                 LoaderState::Idle => "idle",
+                LoaderState::Bundle => "bundle",
                 LoaderState::Receiving => "receiving",
                 LoaderState::Ready => "ready",
                 LoaderState::Disabled => "disabled",
@@ -331,8 +325,8 @@ fn control_reply(state: &mut Service, command: Result<Command, ParseError>) {
             let _ = writeln!(state.control_output, "fallback={fallback}");
             let _ = writeln!(
                 state.control_output,
-                "payload-entry={:#x}",
-                PAYLOAD_ENTRY.load(Ordering::Acquire)
+                "guest-entry={:#x}",
+                GUEST_ENTRY.load(Ordering::Acquire)
             );
             let _ = writeln!(state.control_output, "OK");
         }
@@ -381,13 +375,13 @@ fn service_loader(state: &mut Service) {
     }
     if let Ok((response, action)) = state
         .loader
-        .handle(&state.loader_input[..received], &mut PayloadMemory)
+        .handle(&state.loader_input[..received], &mut GuestMemory)
     {
         let mut encoded = [0; MAX_RESPONSE_SIZE];
         let length = response.encode(&mut encoded);
         assert!(state.loader_output.append(&encoded[..length]).is_ok());
         if let Action::Boot(descriptor) = action {
-            PAYLOAD_ENTRY.store(descriptor.entry(), Ordering::Release);
+            GUEST_ENTRY.store(descriptor.entry, Ordering::Release);
             state.boot = Some(descriptor);
         }
         transmit_output(
@@ -414,20 +408,17 @@ fn transmit_output<const N: usize>(
     }
 }
 
-pub fn preboot(screen: &mut impl Write) -> Option<Descriptor> {
+pub fn preboot(screen: &mut impl Write) -> Option<BundleDescriptor> {
     let require_upload = REQUIRE_UPLOAD.load(Ordering::Acquire);
     if !available() {
         if require_upload {
-            let _ = writeln!(
-                screen,
-                "USB PAYLOAD REQUIRED - USB UNAVAILABLE\nCPU0 PARKED"
-            );
+            let _ = writeln!(screen, "USB BUNDLE REQUIRED - USB UNAVAILABLE\nCPU0 PARKED");
             park();
         }
         return None;
     }
     if require_upload {
-        let _ = writeln!(screen, "USB PREBOOT - PAYLOAD REQUIRED");
+        let _ = writeln!(screen, "USB PREBOOT - BUNDLE REQUIRED");
     } else {
         let _ = writeln!(screen, "USB PREBOOT WINDOW (2S)");
     }

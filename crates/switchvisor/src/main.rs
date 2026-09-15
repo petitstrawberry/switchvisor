@@ -161,7 +161,7 @@ fn launch_payload(payload: Payload, handoff: &[u64; 8], screen: &mut Screen) -> 
         core::sync::atomic::Ordering::Release,
     );
     if let Some(uploaded) = usb::preboot(screen) {
-        entry = uploaded.entry();
+        entry = uploaded.entry;
         registers = if uploaded.preserve_boot_args() {
             *handoff
         } else {
@@ -169,8 +169,8 @@ fn launch_payload(payload: Payload, handoff: &[u64; 8], screen: &mut Screen) -> 
         };
         let _ = writeln!(
             screen,
-            "USB RAW PAYLOAD READY\nENTRY = {entry:016x}\nFILE = {:x} RUNTIME = {:x}",
-            uploaded.file_size, uploaded.runtime_size
+            "USB GUEST BUNDLE READY\nENTRY = {entry:016x}\nIMAGES = {}",
+            uploaded.image_count
         );
     }
     usb::enter_guest(entry);

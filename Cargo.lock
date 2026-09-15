@@ -388,6 +388,8 @@ name = "switchvisorctl"
 version = "0.1.0"
 dependencies = [
  "nusb",
+ "serde",
+ "serde_json",
  "serialport",
  "switchvisor",
 ]
