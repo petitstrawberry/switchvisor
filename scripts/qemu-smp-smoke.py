@@ -17,7 +17,7 @@ def main():
     parser.add_argument('bootstrap',type=Path)
     parser.add_argument('bootstack',type=Path)
     parser.add_argument('--output',type=Path,default=Path('.cache/qemu-smp'))
-    parser.add_argument('--usb-uart',action='store_true',help='Also exercise the USB WFI/ownership profile')
+    parser.add_argument('--usb-uart',action='store_true',help='Also exercise USB MMIO ownership with native guest WFI')
     args=parser.parse_args()
     output=args.output.resolve();output.mkdir(parents=True,exist_ok=False)
     reports=[]

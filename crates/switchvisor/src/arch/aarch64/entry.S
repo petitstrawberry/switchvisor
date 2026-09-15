@@ -242,7 +242,7 @@ enter_payload:
     msr vpidr_el2, x10
     mrs x10, mpidr_el1
     msr vmpidr_el2, x10
-    // RW | VM | TSC | IMO, plus TWI only for the polling USB console profile.
+    // RW | VM | TSC | IMO. XUDC events wake EL2 through its owned physical IRQ.
     // Physical IRQs enter the short EL2 forwarding path; FIQ/SError remain EL1.
     adrp x10, _guest_hcr
     add x10, x10, :lo12:_guest_hcr
@@ -298,8 +298,12 @@ secondary_el2_entry:
     cmp x0, x9
     b.ne .Lpark
     mrs x10, sctlr_el2
-    tbnz x10, #0, .Lpark
-    tbnz x10, #2, .Lpark
+    tbz x10, #0, .Lsecondary_mmu_off
+    b .Lpark
+.Lsecondary_mmu_off:
+    tbz x10, #2, .Lsecondary_caches_off
+    b .Lpark
+.Lsecondary_caches_off:
     msr spsel, #1
     adrp x10, __boot_stack_top
     add x10, x10, :lo12:__boot_stack_top

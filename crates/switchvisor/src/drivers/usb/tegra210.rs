@@ -1,4 +1,4 @@
-//! Tegra210 XUDC, USB 2.0 CDC ACM with polling and resident DRAM DMA buffers.
+//! Tegra210 XUDC, USB 2.0 CDC ACM with event IRQs and resident DRAM DMA buffers.
 //!
 //! Adapted from Hekate bdk/usb/xusbd.c and bdk/soc/clock.c at
 //! e487de8fdd6ca9c3f608d1d18c097a86355912b9.
@@ -8,7 +8,7 @@
 
 use super::cdc::{Acm, CONTROL_SIZE, Reply, Setup};
 use crate::{
-    drivers::{Clock, DmaBuffer, Driver, Mmio, TxTransport},
+    drivers::{Clock, DmaBuffer, Driver, Mmio, RxTransport, TxTransport},
     payload::{RESIDENT_BASE, RESIDENT_SIZE},
 };
 
@@ -29,6 +29,8 @@ const NOTIFY_BUFFER: usize = 0x1000;
 const RING_BASES: [usize; 4] = [0x200, 0x400, 0x300, 0x500];
 const ENDPOINTS: [u8; 4] = [0, 2, 3, 5];
 const PORT_CHANGES: u32 = (1 << 17) | (1 << 19) | (1 << 21) | (1 << 22) | (1 << 23);
+const XHCI_CTRL_IE: u32 = 1 << 4;
+const XHCI_ST_IP: u32 = 1 << 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -47,6 +49,7 @@ pub struct Statistics {
     pub resets: u64,
     pub errors: u64,
     pub dropped: u64,
+    pub received: u64,
     pub transmitted: u64,
 }
 
@@ -88,6 +91,12 @@ enum ControlPhase {
     Zlp,
 }
 
+#[derive(Clone, Copy)]
+struct Receive {
+    cursor: usize,
+    length: usize,
+}
+
 /// Hardware access, DMA storage and console transport are independent contracts.
 pub struct Xudc<H, D> {
     hardware: H,
@@ -100,13 +109,13 @@ pub struct Xudc<H, D> {
     control: Option<(u64, ControlPhase)>,
     tx: Option<(u64, usize)>,
     out: Option<u64>,
+    rx: Option<Receive>,
     notify: Option<u64>,
     notification_needed: bool,
     zlp_needed: bool,
     high_speed: bool,
     initialized: bool,
     failed: bool,
-    last_send: u64,
     pub statistics: Statistics,
 }
 
@@ -123,13 +132,13 @@ impl<H, D> Xudc<H, D> {
             control: None,
             tx: None,
             out: None,
+            rx: None,
             notify: None,
             notification_needed: false,
             zlp_needed: false,
             high_speed: false,
             initialized: false,
             failed: false,
-            last_send: 0,
             statistics: Statistics {
                 events: 0,
                 setups: 0,
@@ -137,6 +146,7 @@ impl<H, D> Xudc<H, D> {
                 resets: 0,
                 errors: 0,
                 dropped: 0,
+                received: 0,
                 transmitted: 0,
             },
         }
@@ -182,6 +192,13 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
             word[..chunk.len()].copy_from_slice(chunk);
             self.dma
                 .write32(offset + index * 4, u32::from_le_bytes(word));
+        }
+    }
+    fn get_bytes(&mut self, offset: usize, output: &mut [u8]) {
+        for (index, byte) in output.iter_mut().enumerate() {
+            let address = offset + index;
+            let word = self.dma.read32(address & !3).to_le_bytes();
+            *byte = word[address & 3];
         }
     }
     fn endpoint(&mut self, ring: usize) -> Result<(), Error> {
@@ -335,6 +352,7 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
             self.statistics.dropped = self.statistics.dropped.saturating_add(length as u64);
         }
         self.out = None;
+        self.rx = None;
         self.notify = None;
         self.zlp_needed = false;
         self.acm.configuration = 0;
@@ -393,6 +411,7 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
                     }
                     if ring == 1 {
                         self.out = None;
+                        self.rx = None;
                     }
                     if ring == 3 {
                         self.notify = None;
@@ -455,9 +474,16 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
                 }
             }
             1 => {
-                if self.out == Some(pointer) {
-                    self.out = None;
+                if self.out != Some(pointer) {
+                    return Ok(());
                 }
+                self.out = None;
+                if remaining > 512 {
+                    return Err(Error::Transfer);
+                }
+                let length = 512 - remaining;
+                self.statistics.received += length as u64;
+                self.rx = (length != 0).then_some(Receive { cursor: 0, length });
                 Ok(())
             }
             2 => {
@@ -513,7 +539,10 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
         if self.acm.configuration == 0 || self.failed {
             return Ok(());
         }
-        if self.out.is_none() && self.hardware.read32(DEV + 0x50) & (1 << 2) == 0 {
+        if self.out.is_none()
+            && self.rx.is_none()
+            && self.hardware.read32(DEV + 0x50) & (1 << 2) == 0
+        {
             self.out = Some(self.queue(
                 1,
                 [
@@ -592,6 +621,7 @@ impl<H: Mmio + Clock, D: DmaBuffer> Driver for Xudc<H, D> {
         self.control = None;
         self.tx = None;
         self.out = None;
+        self.rx = None;
         self.notify = None;
         self.zlp_needed = false;
         self.notification_needed = false;
@@ -703,8 +733,10 @@ impl<H: Mmio + Clock, D: DmaBuffer> Driver for Xudc<H, D> {
         self.hardware.write32(PAD + 0x24, 0);
         self.update(PAD + 0xc60, (3 << 12) | (3 << 16), (1 << 12) | (1 << 16));
         self.update(DEV + 0x6c, 1, 0);
+        self.hardware.write32(DEV + 0x34, XHCI_ST_IP);
         self.hardware.barrier();
-        self.hardware.write32(DEV + 0x30, (1 << 31) | 2); // Link events enabled; physical IRQ disabled.
+        self.hardware
+            .write32(DEV + 0x30, (1 << 31) | XHCI_CTRL_IE | 2);
         self.update(DEV + 0x85c, 3, 2);
         self.update(DEV + 0x3c, 15 << 5, (1 << 16) | (5 << 5));
         self.update(DEV + 0x85c, 3, 0);
@@ -718,6 +750,9 @@ impl<H: Mmio + Clock, D: DmaBuffer> Driver for Xudc<H, D> {
     fn poll(&mut self) -> Result<(), Error> {
         if !self.initialized {
             return Ok(());
+        }
+        if self.hardware.read32(DEV + 0x34) & XHCI_ST_IP != 0 {
+            self.hardware.write32(DEV + 0x34, XHCI_ST_IP);
         }
         for _ in 0..32 {
             let offset = self.event * 16;
@@ -763,6 +798,24 @@ impl<H: Mmio + Clock, D: DmaBuffer> Driver for Xudc<H, D> {
     }
 }
 
+impl<H: Mmio + Clock, D: DmaBuffer> RxTransport for Xudc<H, D> {
+    fn receive(&mut self, output: &mut [u8]) -> Result<usize, Error> {
+        let Some(mut receive) = self.rx else {
+            return Ok(0);
+        };
+        let count = output.len().min(receive.length - receive.cursor);
+        self.get_bytes(RX_BUFFER + receive.cursor, &mut output[..count]);
+        receive.cursor += count;
+        if receive.cursor == receive.length {
+            self.rx = None;
+            self.arm_data()?;
+        } else {
+            self.rx = Some(receive);
+        }
+        Ok(count)
+    }
+}
+
 impl<H: Mmio + Clock, D: DmaBuffer> TxTransport for Xudc<H, D> {
     fn connected(&self) -> bool {
         self.initialized && !self.failed && self.acm.configuration == 1 && self.acm.dtr
@@ -780,13 +833,6 @@ impl<H: Mmio + Clock, D: DmaBuffer> TxTransport for Xudc<H, D> {
             return Ok(0);
         }
         let length = bytes.len().min(capacity);
-        let now = self.hardware.now_us();
-        if length < self.packet_size() as usize
-            && bytes[length - 1] != b'\n'
-            && now.wrapping_sub(self.last_send) < 1000
-        {
-            return Ok(0);
-        }
         self.put_bytes(TX_BUFFER, &bytes[..length]);
         let pointer = self.queue(
             2,
@@ -799,7 +845,6 @@ impl<H: Mmio + Clock, D: DmaBuffer> TxTransport for Xudc<H, D> {
         )?;
         self.tx = Some((pointer, length));
         self.zlp_needed = length % self.packet_size() as usize == 0;
-        self.last_send = now;
         Ok(length)
     }
 }

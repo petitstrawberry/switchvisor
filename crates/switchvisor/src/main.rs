@@ -133,14 +133,6 @@ fn launch_payload(payload: Payload, handoff: &[u64; 8], screen: &mut Screen) -> 
     }
     vm::interrupt::initialize(gic);
     vcpu::initialize();
-    if let Err(error) = cpu::interrupt::initialize() {
-        let _ = writeln!(screen, "VGIC INIT FAILED: {error:?}");
-        park()
-    }
-    _guest_hcr.store(
-        switchvisor::stage2::HCR | if payload.usb_uart { 1 << 13 } else { 0 },
-        core::sync::atomic::Ordering::Release,
-    );
     match guest_console::initialize(payload.usb_uart) {
         Ok(true) => {
             let _ = writeln!(screen, "USB CDC ACM ON - WAITING FOR HOST");
@@ -153,6 +145,15 @@ fn launch_payload(payload: Payload, handoff: &[u64; 8], screen: &mut Screen) -> 
         }
         _ => (),
     }
+    cpu::interrupt::select_console_interrupt(guest_console::available());
+    if let Err(error) = cpu::interrupt::initialize() {
+        let _ = writeln!(screen, "VGIC INIT FAILED: {error:?}");
+        park()
+    }
+    _guest_hcr.store(
+        switchvisor::stage2::HCR,
+        core::sync::atomic::Ordering::Release,
+    );
     guest_console::probe(screen);
     let _ = writeln!(screen, "STAGE2 ON - VMM RAM EXCLUDED");
     vcpu::record(vcpu::Stage::Guest);
@@ -217,8 +218,7 @@ extern "C" fn rust_exception(registers: &mut [u64; 31]) {
         return;
     }
     if spsr & 0xf == 5
-        && ((guest_console::enabled() && esr >> 26 == 1 && esr & 1 == 0 && esr & (1 << 25) != 0)
-            || vm::mmio::emulate(esr, far, hpfar, registers)
+        && (vm::mmio::emulate(esr, far, hpfar, registers)
             || guest_instruction(elr).is_some_and(|instruction| {
                 vm::interrupt::emulate_store_post_index(esr, far, hpfar, instruction, registers)
             }))

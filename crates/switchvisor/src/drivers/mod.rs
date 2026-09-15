@@ -27,6 +27,12 @@ pub trait TxTransport: Driver {
     fn send(&mut self, bytes: &[u8]) -> Result<usize, Self::Error>;
 }
 
+pub trait RxTransport: Driver {
+    /// Nonblocking. Copies bytes already owned by the driver into `output`.
+    /// Returning zero means that no complete receive data is available.
+    fn receive(&mut self, output: &mut [u8]) -> Result<usize, Self::Error>;
+}
+
 pub trait Mmio {
     fn read32(&mut self, address: u64) -> u32;
     fn write32(&mut self, address: u64, value: u32);

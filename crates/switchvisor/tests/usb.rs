@@ -3,7 +3,7 @@ use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 use switchvisor::vdev::usb_ownership::{self as ownership, CAR, PMC};
 use switchvisor::{
     drivers::{
-        Clock, DmaBuffer, Driver, Mmio, TxTransport,
+        Clock, DmaBuffer, Driver, Mmio, RxTransport, TxTransport,
         usb::tegra210::{DEV, DMA_SIZE, Error, Xudc},
     },
     payload::RESIDENT_BASE,
@@ -43,6 +43,8 @@ impl Mock {
     }
     fn event(&self, mut words: [u32; 4]) {
         let mut state = self.0.borrow_mut();
+        let status = state.registers.get(&(DEV + 0x34)).copied().unwrap_or(0);
+        state.registers.insert(DEV + 0x34, status | (1 << 4));
         let index = state.event * 4;
         words[3] |= state.cycle;
         state.dma[index..index + 4].copy_from_slice(&words);
@@ -83,6 +85,15 @@ impl Mock {
             .take(length)
             .collect()
     }
+    fn put_bytes(&self, offset: usize, bytes: &[u8]) {
+        let mut state = self.0.borrow_mut();
+        for (index, &byte) in bytes.iter().enumerate() {
+            let address = offset + index;
+            let shift = (address & 3) * 8;
+            let word = &mut state.dma[address / 4];
+            *word = (*word & !(0xff << shift)) | (u32::from(byte) << shift);
+        }
+    }
     fn port(&self, status: u32) {
         self.0.borrow_mut().registers.insert(DEV + 0x3c, status);
         self.event([0, 0, 1 << 24, 34 << 10]);
@@ -120,6 +131,10 @@ impl Mmio for Mock {
             state.registers.insert(DEV + 0x5c, old | changed);
         }
         if address == DEV + 0x5c {
+            let old = state.registers.get(&address).copied().unwrap_or(0);
+            value = old & !value;
+        }
+        if address == DEV + 0x34 {
             let old = state.registers.get(&address).copied().unwrap_or(0);
             value = old & !value;
         }
@@ -197,11 +212,11 @@ fn configured(usb: &mut Usb, mock: &Mock, high: bool) {
 }
 
 #[test]
-fn initialization_uses_resident_dram_and_never_enables_physical_usb_irq() {
+fn initialization_uses_resident_dram_and_enables_physical_usb_irq() {
     let (usb, mock) = new();
     let state = mock.0.borrow();
     assert!(!usb.connected());
-    assert_eq!(state.registers[&(DEV + 0x30)] & (1 << 4), 0);
+    assert_ne!(state.registers[&(DEV + 0x30)] & (1 << 4), 0);
     assert_eq!(state.registers[&(DEV + 0x9188)] & (1 << 16), 0);
     assert_eq!(state.registers[&(DEV + 0x40)], (BASE + 0x800) as u32);
     assert_eq!(state.registers[&ownership::DEV_ASID], 0);
@@ -347,7 +362,7 @@ fn closing_and_reopening_the_host_port_preserves_pending_tx_storage() {
 }
 
 #[test]
-fn line_coding_is_metadata_and_host_input_is_consumed_without_guest_rx() {
+fn line_coding_is_metadata_and_host_input_waits_for_transport_rx() {
     let (mut usb, mock) = new();
     configured(&mut usb, &mock, true);
     mock.setup(0x21, 0x20, 0, 0, 7);
@@ -367,11 +382,25 @@ fn line_coding_is_metadata_and_host_input_is_consumed_without_guest_rx() {
     mock.setup(0xa1, 0x21, 0, 0, 7);
     usb.poll().unwrap();
     assert_eq!(mock.bytes(0xa00, 7), coding);
+    let input = b"host input\n";
+    mock.put_bytes(0xe00, input);
     let previous = mock.0.borrow().latest[1];
-    mock.complete(2, 500, 13);
+    mock.complete(2, 512 - input.len() as u32, 13);
     usb.poll().unwrap();
+    assert_eq!(mock.0.borrow().latest[1], previous);
+    assert_eq!(usb.statistics.received, input.len() as u64);
+
+    let mut first = [0; 4];
+    assert_eq!(usb.receive(&mut first), Ok(first.len()));
+    assert_eq!(&first, &input[..first.len()]);
+    assert_eq!(mock.0.borrow().latest[1], previous);
+
+    let mut rest = [0; 32];
+    let count = usb.receive(&mut rest).unwrap();
+    assert_eq!(&rest[..count], &input[first.len()..]);
     assert_ne!(mock.0.borrow().latest[1], previous);
     assert_eq!(mock.trb(2)[2], 512);
+    assert_eq!(usb.receive(&mut rest), Ok(0));
 }
 
 #[test]

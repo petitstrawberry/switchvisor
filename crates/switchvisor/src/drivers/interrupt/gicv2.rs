@@ -11,6 +11,7 @@ pub const SPURIOUS_IRQ: u32 = 1023;
 const GICD_CTLR: u64 = 0x000;
 const GICD_IGROUPR0: u64 = 0x080;
 const GICD_ISENABLER0: u64 = 0x100;
+const GICD_ISPENDR0: u64 = 0x200;
 const GICD_ICPENDR0: u64 = 0x280;
 const GICD_ICACTIVER0: u64 = 0x380;
 const GICD_IPRIORITYR6: u64 = 0x418;
@@ -96,10 +97,19 @@ pub enum Error {
 pub enum Event {
     None,
     Guest,
+    Owned(OwnedInterrupt),
     Maintenance,
 }
 
-#[derive(Clone, Copy)]
+/// A physical interrupt acknowledged by EL2 but not yet deactivated or injected.
+///
+/// The fields remain private so the token can only be completed by `GicV2`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OwnedInterrupt {
+    pending: Pending,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Pending {
     iar: u32,
     priority: u8,
@@ -123,6 +133,7 @@ pub struct GicV2<M> {
     distributor_enabled: bool,
     pending: [Pending; PENDING_SLOTS],
     pending_count: u16,
+    owned_interrupt: u32,
     // Original physical IAR values for software SGI LRs awaiting guest EOI.
     lr_iar: [u32; 64],
 }
@@ -136,6 +147,7 @@ impl<M: Mmio> GicV2<M> {
             distributor_enabled: true,
             pending: [Pending::EMPTY; PENDING_SLOTS],
             pending_count: 0,
+            owned_interrupt: SPURIOUS_IRQ,
             lr_iar: [SPURIOUS_IRQ; 64],
         }
     }
@@ -353,6 +365,43 @@ impl<M: Mmio> GicV2<M> {
         }
     }
 
+    /// Select one physical PPI/SPI for explicit EL2 service before guest delivery.
+    pub fn set_owned_interrupt(&mut self, interrupt: Option<u32>) {
+        self.owned_interrupt = interrupt
+            .filter(|id| (16..1020).contains(id))
+            .unwrap_or(SPURIOUS_IRQ);
+    }
+
+    /// Assert the physical pending bit backing the owned virtual level interrupt.
+    pub fn pend_owned_interrupt(&mut self) {
+        let id = self.owned_interrupt;
+        if id >= 1020 {
+            return;
+        }
+        self.write_dist(GICD_ISPENDR0 + u64::from(id / 32) * 4, 1 << (id % 32));
+        self.mmio.barrier();
+    }
+
+    /// Complete EL2 service, either deactivating the source or forwarding it.
+    pub fn finish_owned_interrupt(&mut self, interrupt: OwnedInterrupt, deliver: bool) {
+        let id = interrupt.pending.iar & IRQ_ID_MASK;
+        debug_assert_eq!(id, self.owned_interrupt);
+        if deliver {
+            // Leave another instance pending while the current hardware LR is
+            // active. Guest EOI deactivates the LR's physical interrupt; if the
+            // virtual UART is still asserted, the pending instance returns to
+            // EL2 and is injected again.
+            self.write_dist(GICD_ISPENDR0 + u64::from(id / 32) * 4, 1 << (id % 32));
+            if self.pending_count != 0 || !self.try_inject(interrupt.pending) {
+                self.enqueue(interrupt.pending);
+                self.refill();
+            }
+        } else {
+            self.write_cpu(GICC_DIR, interrupt.pending.iar);
+        }
+        self.mmio.barrier();
+    }
+
     fn complete_owned_interrupt(&mut self, iar: u32) {
         self.write_cpu(GICC_EOIR, iar);
         self.write_cpu(GICC_DIR, iar);
@@ -433,6 +482,10 @@ impl<M: Mmio> InterruptController for GicV2<M> {
         // EOImodeNS=1 drops only physical priority. A HW LR lets guest EOI
         // deactivate the PPI/SPI later; software SGIs are handled by EISR.
         self.write_cpu(GICC_EOIR, iar);
+        if id == self.owned_interrupt {
+            self.mmio.barrier();
+            return Event::Owned(OwnedInterrupt { pending });
+        }
         if self.pending_count != 0 || !self.try_inject(pending) {
             self.enqueue(pending);
             self.refill();
@@ -496,12 +549,76 @@ mod tests {
         assert_eq!(gic.pending_count, 0);
     }
 
+    #[test]
+    fn owned_spi_is_serviced_before_hardware_lr_delivery() {
+        const OWNED: u32 = 76;
+        const TEST_LAYOUT: Layout = Layout {
+            distributor: 0,
+            distributor_size: 0x1000,
+            cpu: 0x2000,
+            cpu_size: 0x2000,
+            hypervisor: 0x4000,
+            hypervisor_size: 0x2000,
+            virtual_cpu: 0x6000,
+            virtual_cpu_size: 0x2000,
+        };
+        let mut gic = GicV2::new(Memory::new(), TEST_LAYOUT);
+        gic.list_registers = 1;
+        gic.set_owned_interrupt(Some(OWNED));
+        gic.mmio.words[(TEST_LAYOUT.cpu + GICC_IAR) as usize / 4] = OWNED;
+        gic.mmio.words[(TEST_LAYOUT.cpu + GICC_RPR) as usize / 4] = 0x58;
+        gic.mmio.words[(TEST_LAYOUT.hypervisor + GICH_ELRSR0) as usize / 4] = 1;
+
+        let Event::Owned(interrupt) = gic.take_interrupt() else {
+            panic!("owned interrupt was forwarded before service");
+        };
+        assert_eq!(
+            gic.mmio.words[(TEST_LAYOUT.cpu + GICC_EOIR) as usize / 4],
+            OWNED
+        );
+        assert_eq!(
+            gic.mmio.words[(TEST_LAYOUT.hypervisor + GICH_LR0) as usize / 4],
+            0
+        );
+
+        gic.finish_owned_interrupt(interrupt, true);
+        assert_eq!(
+            gic.mmio.words[(TEST_LAYOUT.distributor + GICD_ISPENDR0 + 8) as usize / 4],
+            1 << (OWNED % 32)
+        );
+        let lr = gic.mmio.words[(TEST_LAYOUT.hypervisor + GICH_LR0) as usize / 4];
+        assert_eq!(lr & IRQ_ID_MASK, OWNED);
+        assert_eq!((lr >> 10) & IRQ_ID_MASK, OWNED);
+        assert_ne!(lr & LR_HARDWARE, 0);
+        assert_eq!(gic.mmio.words[(TEST_LAYOUT.cpu + GICC_DIR) as usize / 4], 0);
+    }
+
     struct Dummy;
     impl Mmio for Dummy {
         fn read32(&mut self, _: u64) -> u32 {
             0
         }
         fn write32(&mut self, _: u64, _: u32) {}
+        fn barrier(&mut self) {}
+    }
+
+    struct Memory {
+        words: [u32; 8192],
+    }
+
+    impl Memory {
+        const fn new() -> Self {
+            Self { words: [0; 8192] }
+        }
+    }
+
+    impl Mmio for Memory {
+        fn read32(&mut self, address: u64) -> u32 {
+            self.words[address as usize / 4]
+        }
+        fn write32(&mut self, address: u64, value: u32) {
+            self.words[address as usize / 4] = value;
+        }
         fn barrier(&mut self) {}
     }
 }

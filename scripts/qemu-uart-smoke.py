@@ -38,7 +38,7 @@ def main():
         physical = []
         fault = None
         if action in [12, 13]:
-            expected[2:11] = [1, 0x60, 0xc1, 0, 0xffffffa5, 0xffffffffffffffa5, 0xa5, 0, 0]
+            expected[2:11] = [1, 0x60, 0xc1, 5, 0xffffffa5, 0xffffffffffffffa5, 0xa5, 0, 0]
         elif action == 4:
             expected[2:4] = [4, 30]
         elif action == 15:

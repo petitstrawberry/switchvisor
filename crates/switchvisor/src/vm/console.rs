@@ -1,4 +1,4 @@
-//! Own the virtual UART and its physical transport, including lock order and polling.
+//! Own the virtual UART and its physical transport, including lock and IRQ policy.
 use crate::{
     arch::aarch64::sync::Mutex,
     platform::tegra210::io::{Hardware, UsbDma},
@@ -6,7 +6,7 @@ use crate::{
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use switchvisor::{
     drivers::{
-        Clock, Driver, Mmio, TxTransport,
+        Clock, Driver, Mmio, RxTransport, TxTransport,
         usb::tegra210::{Error, Xudc},
     },
     vdev::{self, uart::Uart},
@@ -24,11 +24,14 @@ static USB: Mutex<Transport> = Mutex::new(Transport {
 });
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static AVAILABLE: AtomicBool = AtomicBool::new(false);
+static IRQ_ASSERTED: AtomicBool = AtomicBool::new(false);
 const POLL_INTERVAL_US: u64 = 250;
 static LAST_SERVICE: AtomicU64 = AtomicU64::new(0);
 
 pub fn initialize(enabled: bool) -> Result<bool, Error> {
     ENABLED.store(enabled, Ordering::Release);
+    AVAILABLE.store(false, Ordering::Release);
+    IRQ_ASSERTED.store(false, Ordering::Release);
     if !enabled {
         return Ok(false);
     }
@@ -47,28 +50,44 @@ pub fn service() {
     if !AVAILABLE.load(Ordering::Acquire) {
         return;
     }
-    // UART register accesses and trapped WFI can exit much faster than USB
-    // progresses. Skip both driver polling and its mutex between service slots.
+    // UART register accesses and other trapped guest exits can happen much
+    // faster than USB progresses. Skip polling and its mutex between slots.
     let last = LAST_SERVICE.load(Ordering::Acquire);
     if Hardware.now_us().wrapping_sub(last) < POLL_INTERVAL_US {
         return;
     }
-    unsafe {
+    let asserted = unsafe {
         USB.with(|state| {
             // Another vCPU may have serviced USB while this one waited for it.
             let now = Hardware.now_us();
             if now.wrapping_sub(LAST_SERVICE.load(Ordering::Acquire)) < POLL_INTERVAL_US {
-                return;
+                return IRQ_ASSERTED.load(Ordering::Acquire);
             }
             LAST_SERVICE.store(now, Ordering::Release);
-            if let Err(error) = state
-                .driver
-                .poll()
-                .and_then(|()| transmit(&mut state.driver))
-            {
+            if let Err(error) = service_transport(&mut state.driver) {
                 state.error = Some(error);
             }
-        });
+            observe_interrupt()
+        })
+    };
+    if asserted {
+        crate::arch::aarch64::interrupt::pend_console_interrupt();
+    }
+}
+
+/// Service a physical XUDC event immediately and return the virtual UART line.
+pub fn service_interrupt() -> bool {
+    if !AVAILABLE.load(Ordering::Acquire) {
+        return false;
+    }
+    unsafe {
+        USB.with(|state| {
+            LAST_SERVICE.store(Hardware.now_us(), Ordering::Release);
+            if let Err(error) = service_transport(&mut state.driver) {
+                state.error = Some(error);
+            }
+            observe_interrupt()
+        })
     }
 }
 
@@ -125,6 +144,10 @@ pub fn enabled() -> bool {
     ENABLED.load(Ordering::Acquire)
 }
 
+pub fn available() -> bool {
+    AVAILABLE.load(Ordering::Acquire)
+}
+
 /// Serialize shared USB clock/power MMIO with driver polling and other vCPUs.
 /// Callers must satisfy the masked, non-reentrant EL2 mutex preconditions.
 pub(super) unsafe fn with_io<R>(operation: impl FnOnce(&mut Hardware) -> R) -> R {
@@ -133,7 +156,54 @@ pub(super) unsafe fn with_io<R>(operation: impl FnOnce(&mut Hardware) -> R) -> R
 
 pub fn emulate_uart(esr: u64, far: u64, hpfar: u64, registers: &mut [u64; 31]) -> bool {
     // Only masked EL2 entry/exception paths access the virtual device.
-    unsafe { UART.with(|uart| vdev::emulate(uart, esr, far, hpfar, registers)) }
+    let (handled, asserted) = unsafe {
+        UART.with(|uart| {
+            let handled = vdev::emulate(uart, esr, far, hpfar, registers);
+            let asserted = uart.interrupt_pending();
+            IRQ_ASSERTED.store(asserted, Ordering::Release);
+            (handled, asserted)
+        })
+    };
+    if handled && asserted {
+        crate::arch::aarch64::interrupt::pend_console_interrupt();
+    }
+    handled
+}
+
+fn service_transport<T: RxTransport + TxTransport>(transport: &mut T) -> Result<(), T::Error> {
+    transport.poll()?;
+    receive(transport)?;
+    transmit(transport)
+}
+
+fn observe_interrupt() -> bool {
+    unsafe {
+        UART.with(|uart| {
+            let asserted = uart.interrupt_pending();
+            IRQ_ASSERTED.store(asserted, Ordering::Release);
+            asserted
+        })
+    }
+}
+
+/// Transport -> UART lock order. Completed OUT data stays in driver DMA until copied.
+fn receive<T: RxTransport>(transport: &mut T) -> Result<(), T::Error> {
+    unsafe {
+        UART.with(|uart| {
+            let mut bytes = [0; 512];
+            let capacity = uart.receive_capacity().min(bytes.len());
+            if capacity == 0 {
+                return Ok(());
+            }
+            let received = transport.receive(&mut bytes[..capacity])?;
+            assert!(
+                received <= capacity,
+                "transport returned more bytes than requested"
+            );
+            assert_eq!(uart.receive(&bytes[..received]), received);
+            Ok(())
+        })
+    }
 }
 
 /// Transport -> UART lock order. MMIO releases UART before servicing transport.

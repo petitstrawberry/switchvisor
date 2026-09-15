@@ -102,7 +102,7 @@ Enable the EL2-owned USB 2.0 CDC ACM transport when packaging:
 scripts/build-payload.sh path/to/bootstack/bl33.bin 0x68200 path/to/bootstack dist --usb-uart
 ```
 
-Copy `dist/bl33.bin` to your BL33 path. This build also produces `dist/usb-uart.dtbo`, an overlay for the pinned Noble ODIN platform DTB. It adds a transmit-only `ns16550a` at GPA `0x700FF000` with byte-spaced registers and no `interrupts` property, selects it in `/chosen/stdout-path`, and disables guest USB, PADCTL, its mailbox, USB-C role control, and USB power domains.
+Copy `dist/bl33.bin` to your BL33 path. This build also produces `dist/usb-uart.dtbo`, an overlay for the pinned Noble ODIN platform DTB. It adds a bidirectional `ns16550a` at GPA `0x700FF000` with byte-spaced registers and SPI 44, selects it in `/chosen/stdout-path`, and disables guest USB, PADCTL, its mailbox, USB-C role control, and USB power domains.
 
 For the Scarlet Switch Console entry, put the overlay at `/switchroot/scarlet-console/usb-uart.dtbo`. Copy the entry's `boot.cmd`, and insert the following immediately before `bootm`, after the OS DTB has been selected and configured:
 
@@ -142,9 +142,9 @@ USB transmits the guest's UART bytes unchanged. Handle terminal newline conversi
 
 With `--usb-uart`, Switchvisor polls USB for two seconds before starting the payload and prints the port/endpoint state, event/setup counts, and last error on Hekate's framebuffer. Connect the host cable before boot to capture enumeration progress. Boot continues when this probe finishes even if no host is present.
 
-Baud and line-coding settings are USB metadata. Guest transmit uses THR and polls LSR.THRE/TEMT; both stay ready even when the host is absent. RX is empty, IER reads zero, IIR reports no interrupt, and host input is discarded. The UART buffers up to 64 KiB; later bytes are dropped if that queue fills. Opening the host port asserts DTR and drains the queued logs.
+Baud and line-coding settings are USB metadata. Guest transmit uses THR and polls LSR.THRE/TEMT; both stay ready even when the host is absent. Host input enters the receive FIFO, updates LSR.DR, and raises the UART receive interrupt when enabled through IER. The UART buffers up to 64 KiB of guest output and 4 KiB of host input. Later output bytes are dropped if the TX queue fills; completed USB input is backpressured until the guest makes RX space. Opening the host port asserts DTR and drains queued output.
 
-The polling USB profile services UART/owned-MMIO/SMC exits and traps guest WFI. USB polling is limited to once per 250 µs across all cores; queued bytes are copied only when the transport has staging space. Guest idle loops still keep the physical CPU awake, and a busy guest that makes no exits can delay USB service. Ordinary IRQ forwarding does not poll USB. Guest USB controller accesses return an absent bus, while shared clock/reset/PMC writes preserve USB-owned resources and the XUDC SMMU client stays in bypass.
+XUDC events use physical SPI 44 (architectural INTID 76), which EL2 services before delivering the same hardware-backed interrupt as the virtual UART RX line. Guest WFI remains native and USB traffic wakes EL2 through the physical interrupt. The boot probe and trapped guest exits retain bounded polling as a fallback. Guest USB controller accesses return an absent bus, while shared clock/reset/PMC writes preserve USB-owned resources and the XUDC SMMU client stays in bypass.
 
 ## Payload entry contract
 

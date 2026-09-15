@@ -1,17 +1,23 @@
-//! Guest-visible transmit-only NS16550A, byte-spaced registers and no interrupt line.
+//! Guest-visible NS16550A with byte-spaced registers and bounded RX/TX queues.
 use super::{DeviceError, MmioRegion, VirtualDevice};
 
 pub const BASE: u64 = 0x700f_f000;
 pub const SIZE: u64 = 4096;
 pub const PATH: &str = "/serial@700ff000";
+/// Tegra210 XUSB device SPI 44, reused after physical USB is hidden from EL1.
+pub const INTERRUPT_ID: u32 = 32 + 44;
 pub const TX_CAPACITY: usize = 65536;
+pub const RX_CAPACITY: usize = 4096;
 
 pub struct Uart {
     divisor: [u8; 2],
+    ier: u8,
     lcr: u8,
     mcr: u8,
     fifo: bool,
     scratch: u8,
+    overrun: bool,
+    rx: RxQueue<RX_CAPACITY>,
     tx: TxQueue<TX_CAPACITY>,
 }
 
@@ -25,10 +31,13 @@ impl Uart {
     pub const fn new() -> Self {
         Self {
             divisor: [0; 2],
+            ier: 0,
             lcr: 0,
             mcr: 0,
             fifo: false,
             scratch: 0,
+            overrun: false,
+            rx: RxQueue::new(),
             tx: TxQueue::new(),
         }
     }
@@ -37,22 +46,48 @@ impl Uart {
         &mut self.tx
     }
 
-    /// The UART has no receive data and no pending interrupt, even if IER is written.
-    fn read_register(&self, offset: u64) -> Option<u8> {
+    pub fn receive(&mut self, bytes: &[u8]) -> usize {
+        let count = bytes.len().min(self.rx.capacity());
+        for &byte in &bytes[..count] {
+            assert!(self.rx.push(byte));
+        }
+        if count != bytes.len() {
+            self.overrun = true;
+        }
+        count
+    }
+
+    pub fn receive_capacity(&self) -> usize {
+        self.rx.capacity()
+    }
+
+    pub fn interrupt_pending(&self) -> bool {
+        (self.ier & 1 != 0 && !self.rx.is_empty()) || (self.ier & 4 != 0 && self.overrun)
+    }
+
+    fn read_register(&mut self, offset: u64) -> Option<u8> {
         Some(match offset {
             0 if self.lcr & 0x80 != 0 => self.divisor[0],
             1 if self.lcr & 0x80 != 0 => self.divisor[1],
-            0 | 1 => 0,
+            0 => self.rx.pop().unwrap_or(0),
+            1 => self.ier,
             2 => {
-                if self.fifo {
-                    0xc1
+                let fifo = if self.fifo { 0xc0 } else { 0 };
+                if self.ier & 4 != 0 && self.overrun {
+                    fifo | 0x06
+                } else if self.ier & 1 != 0 && !self.rx.is_empty() {
+                    fifo | 0x04
                 } else {
-                    1
+                    fifo | 1
                 }
             }
             3 => self.lcr,
             4 => self.mcr,
-            5 => 0x60, // THRE | TEMT; the transport never backpressures the guest.
+            5 => {
+                let status = 0x60 | u8::from(!self.rx.is_empty()) | (u8::from(self.overrun) << 1);
+                self.overrun = false;
+                status
+            }
             6 if self.mcr & 0x10 != 0 => {
                 ((self.mcr & 2) << 3)
                     | ((self.mcr & 1) << 5)
@@ -65,15 +100,23 @@ impl Uart {
         })
     }
 
-    /// FIFO reset has no wire-side effect: THR is accepted immediately.
+    /// THR is accepted immediately; receive interrupt and FIFO state are modeled.
     fn write_register(&mut self, offset: u64, value: u8) -> Result<(), DeviceError> {
         match offset {
             0 | 1 if self.lcr & 0x80 != 0 => self.divisor[offset as usize] = value,
             0 => self.tx.push(value),
-            1 | 5 | 6 => (),
-            2 => self.fifo = value & 1 != 0,
+            // RDA and receiver-line-status are supported. THRE remains polling-only.
+            1 => self.ier = value & 0x05,
+            2 => {
+                self.fifo = value & 1 != 0;
+                if value & 2 != 0 {
+                    self.rx.clear();
+                    self.overrun = false;
+                }
+            }
             3 => self.lcr = value,
             4 => self.mcr = value & 0x1f,
+            5 | 6 => (),
             7 => self.scratch = value,
             _ => return Err(DeviceError::Register),
         }
@@ -101,6 +144,56 @@ impl VirtualDevice for Uart {
             return Err(DeviceError::AccessSize);
         }
         self.write_register(offset, value as u8)
+    }
+}
+
+struct RxQueue<const N: usize> {
+    bytes: [u8; N],
+    head: usize,
+    len: usize,
+}
+
+impl<const N: usize> RxQueue<N> {
+    const fn new() -> Self {
+        Self {
+            bytes: [0; N],
+            head: 0,
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, byte: u8) -> bool {
+        if self.len == N {
+            return false;
+        }
+        self.bytes[(self.head + self.len) % N] = byte;
+        self.len += 1;
+        true
+    }
+
+    fn pop(&mut self) -> Option<u8> {
+        if self.len == 0 {
+            return None;
+        }
+        let byte = self.bytes[self.head];
+        if N != 0 {
+            self.head = (self.head + 1) % N;
+        }
+        self.len -= 1;
+        Some(byte)
+    }
+
+    fn clear(&mut self) {
+        self.head = 0;
+        self.len = 0;
+    }
+
+    const fn capacity(&self) -> usize {
+        N - self.len
+    }
+
+    const fn is_empty(&self) -> bool {
+        self.len == 0
     }
 }
 

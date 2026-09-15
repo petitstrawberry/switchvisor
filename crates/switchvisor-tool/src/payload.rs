@@ -179,7 +179,8 @@ pub fn pack(args: &[OsString]) -> Result<Value, String> {
             "stack_top":format!("{STACK_TOP:#x}"), "preserve_boot_args":payload.preserve_boot_args, "registers":registers},
         "probe_fdt_offset":raw.len(), "probe_fdt_sha256":digest(probe), "bootstack":bootstack
         ,"usb_uart":{"enabled":usb_uart,"compatible":"ns16550a",
-            "gpa":format!("{:#x}",switchvisor::vdev::uart::BASE),"interrupts":false,
+            "gpa":format!("{:#x}",switchvisor::vdev::uart::BASE),
+            "interrupt":switchvisor::vdev::uart::INTERRUPT_ID,
             "transport":"cdc-acm","vid":switchvisor::drivers::usb::cdc::VID,
             "pid":switchvisor::drivers::usb::cdc::PID}
     }))

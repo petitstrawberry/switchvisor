@@ -15,6 +15,8 @@
                 clock-frequency = <1843200>;
                 reg-shift = <0>;
                 reg-io-width = <1>;
+                interrupt-parent = <&lic>;
+                interrupts = <0 44 4>;
                 status = "okay";
             };
         };

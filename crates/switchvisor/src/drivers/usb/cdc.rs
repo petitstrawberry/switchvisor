@@ -1,4 +1,4 @@
-//! USB 2.0 CDC ACM control protocol. Host output is discarded; guest RX is absent.
+//! USB 2.0 CDC ACM control protocol used by the bidirectional virtual UART transport.
 
 pub const VID: u16 = 0x1209;
 pub const PID: u16 = 0x0001; // pid.codes test PID, for development builds.

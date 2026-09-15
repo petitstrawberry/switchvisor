@@ -24,19 +24,49 @@ fn scarlet_initialization_does_not_transmit_baud_divisors() {
 }
 
 #[test]
-fn transmit_only_means_no_receive_data_or_interrupts() {
+fn receive_fifo_reports_data_and_level_interrupt_state() {
     let mut uart = Uart::new();
     uart.write(1, 1, 15).unwrap();
-    assert_eq!(uart.read(1, 1), Ok(0));
+    assert_eq!(uart.read(1, 1), Ok(0x05));
     assert_eq!(uart.read(0, 1), Ok(0));
     assert_eq!(uart.read(2, 1), Ok(1));
     assert_eq!(uart.read(5, 1), Ok(0x60));
+    uart.write(2, 1, 1).unwrap();
+    assert_eq!(uart.receive(b"abc"), 3);
+    assert!(uart.interrupt_pending());
+    assert_eq!(uart.read(2, 1), Ok(0xc4));
+    assert_eq!(uart.read(5, 1), Ok(0x61));
+    assert_eq!(uart.read(0, 1), Ok(u64::from(b'a')));
+    assert_eq!(uart.read(0, 1), Ok(u64::from(b'b')));
+    assert!(uart.interrupt_pending());
+    assert_eq!(uart.read(0, 1), Ok(u64::from(b'c')));
+    assert!(!uart.interrupt_pending());
+    assert_eq!(uart.read(2, 1), Ok(0xc1));
+
+    assert_eq!(uart.receive(b"discard"), 7);
+    uart.write(2, 1, 3).unwrap();
+    assert_eq!(uart.read(5, 1), Ok(0x60));
+    assert!(!uart.interrupt_pending());
+
     uart.write(7, 1, 0xa5).unwrap();
     assert_eq!(uart.read(7, 1), Ok(0xa5));
     uart.write(4, 1, 0x1f).unwrap();
     assert_eq!(uart.read(6, 1), Ok(0xf0));
     uart.write(0, 1, 0x42).unwrap();
     assert_eq!(uart.read(0, 1), Ok(0));
+}
+
+#[test]
+fn receive_overflow_sets_and_clears_line_status() {
+    let mut uart = Uart::new();
+    uart.write(1, 1, 4).unwrap();
+    let bytes = [0x5a; switchvisor::vdev::uart::RX_CAPACITY + 1];
+    assert_eq!(uart.receive(&bytes), bytes.len() - 1);
+    assert!(uart.interrupt_pending());
+    assert_eq!(uart.read(2, 1), Ok(0x06));
+    assert_eq!(uart.read(5, 1), Ok(0x63));
+    assert!(!uart.interrupt_pending());
+    assert_eq!(uart.read(5, 1), Ok(0x61));
 }
 
 fn syndrome(register: u64, write: bool) -> u64 {

@@ -252,7 +252,7 @@ wait_irq:
     strb w11, [x10, #3]
     mov w11, #7
     strb w11, [x10, #2]
-    strb w11, [x10, #1] // Interrupts remain disabled.
+    strb w11, [x10, #1] // RDA and receiver-line-status interrupts are retained.
     ldrb w12, [x10, #5]
     str x12, [x9, #24]
     ldrb w12, [x10, #2]
