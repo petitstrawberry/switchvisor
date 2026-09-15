@@ -141,6 +141,12 @@ impl Machine {
         let machine: &Self = self;
         core::array::from_fn(|caller| Participant { machine, caller })
     }
+
+    pub fn online_mask(&self) -> u8 {
+        self.cpus.iter().enumerate().fold(0, |mask, (index, cpu)| {
+            mask | (u8::from(cpu.state.load(Ordering::Acquire) == ON) << index)
+        })
+    }
 }
 
 /// Exclusive ownership of one caller slot and that CPU's launch consumer.
@@ -151,6 +157,10 @@ pub struct Participant<'a> {
 }
 
 impl Participant<'_> {
+    pub fn online_mask(&self) -> u8 {
+        self.machine.online_mask()
+    }
+
     pub fn affinity(&self, target: usize) -> i64 {
         let Some(cpu) = self.machine.cpus.get(target) else {
             return INVALID_PARAMS;

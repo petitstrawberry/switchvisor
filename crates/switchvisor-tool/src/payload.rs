@@ -42,6 +42,7 @@ pub fn pack(args: &[OsString]) -> Result<Value, String> {
     let mut custom_registers = false;
     let mut used = [false; 9];
     let mut usb_uart = false;
+    let mut usb_control = false;
     let mut cursor = 5;
     while cursor < args.len() {
         if args[cursor] == "--usb-uart" {
@@ -49,6 +50,14 @@ pub fn pack(args: &[OsString]) -> Result<Value, String> {
                 return Err("duplicate payload option --usb-uart".into());
             }
             usb_uart = true;
+            cursor += 1;
+            continue;
+        }
+        if args[cursor] == "--usb-control" {
+            if usb_control {
+                return Err("duplicate payload option --usb-control".into());
+            }
+            usb_control = true;
             cursor += 1;
             continue;
         }
@@ -133,6 +142,7 @@ pub fn pack(args: &[OsString]) -> Result<Value, String> {
         registers,
         preserve_boot_args: !custom_registers,
         usb_uart,
+        usb_control,
         crc32: crc32(&data),
     };
     let descriptor = payload.encode().map_err(|e| e.to_string())?;
@@ -177,11 +187,12 @@ pub fn pack(args: &[OsString]) -> Result<Value, String> {
             "file_size_bytes":data.len(), "runtime_size_bytes":runtime_size,
             "load_base":format!("{LOAD_BASE:#x}"), "entry":format!("{:#x}",payload.entry().map_err(|e|e.to_string())?),
             "stack_top":format!("{STACK_TOP:#x}"), "preserve_boot_args":payload.preserve_boot_args, "registers":registers},
-        "probe_fdt_offset":raw.len(), "probe_fdt_sha256":digest(probe), "bootstack":bootstack
-        ,"usb_uart":{"enabled":usb_uart,"compatible":"ns16550a",
+        "probe_fdt_offset":raw.len(), "probe_fdt_sha256":digest(probe), "bootstack":bootstack,
+        "usb_uart":{"enabled":usb_uart,"compatible":"ns16550a",
             "gpa":format!("{:#x}",switchvisor::vdev::uart::BASE),
             "interrupt":switchvisor::vdev::uart::INTERRUPT_ID,
             "transport":"cdc-acm","vid":switchvisor::drivers::usb::cdc::VID,
-            "pid":switchvisor::drivers::usb::cdc::PID}
+            "pid":switchvisor::drivers::usb::cdc::PID},
+        "usb_control":{"enabled":usb_control || usb_uart,"control":"cdc-acm","loader":"vendor-bulk"}
     }))
 }

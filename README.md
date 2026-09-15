@@ -55,8 +55,10 @@ The script builds Switchvisor and writes these files to `dist/`:
 
 The bootstack directory is required. An optional output-directory argument
 overrides `dist/`. The three output files are replaced after the build and
-packaging succeed. A build with `--usb-uart` also writes `usb-uart.dtbo`; a
-build without it removes a stale overlay from the output directory.
+packaging succeed. A build with `--usb-uart` also writes `usb-uart.dtbo`. Pass
+`--usb-control` to enable USB control and payload loading without adding a
+virtual UART to the guest; that profile writes `usb-control.dtbo`. The build
+removes stale overlay variants from the output directory.
 
 Copy `dist/bl33.bin` to the microSD path configured for BL33 by the selected
 Hekate L4T boot entry.
@@ -113,7 +115,8 @@ The same entry and register options can be appended to this command. The output 
 
 ## USB console
 
-Enable the EL2-owned USB 2.0 CDC ACM transport when packaging:
+Enable the EL2-owned USB composite device and its guest CDC ACM transport when
+packaging:
 
 ```sh
 scripts/build-payload.sh path/to/bootstack/bl33.bin 0x68200 path/to/bootstack dist --usb-uart
@@ -153,7 +156,9 @@ The supported U-Boot payload provides `fdt apply`. The supplied overlay targets
 the supported ODIN/Erista node paths. A different guest DTB must declare the same
 UART and disable its physical USB, PHY, and role-control nodes.
 
-Connect the Switch to a host with a USB data cable. On macOS, open the new CDC ACM port:
+Connect the Switch to a host with a USB data cable. The composite device exposes
+separate guest-console and Switchvisor-control CDC ports. On macOS, open the
+guest-console port with minicom:
 
 ```sh
 ls /dev/cu.usbmodem*
@@ -165,11 +170,76 @@ Set `USB_PORT` to the actual port name printed by `ls`.
 
 USB transmits the guest's UART bytes unchanged. Handle terminal newline conversion in the guest console or TTY layer, or configure it in the host terminal.
 
-With `--usb-uart`, Switchvisor polls USB for two seconds before starting the payload and prints the port/endpoint state, event/setup counts, and last error on Hekate's framebuffer. Connect the host cable before boot to capture enumeration progress. Boot continues when this probe finishes even if no host is present.
+With `--usb-uart` or `--usb-control`, Switchvisor services USB for two seconds
+before starting the packaged payload and prints the port/endpoint state,
+event/setup counts, and last error on Hekate's framebuffer. Connect the host
+cable before boot to capture enumeration progress.
 
 Baud and line-coding settings are USB metadata. Guest transmit uses THR and polls LSR.THRE/TEMT; both stay ready even when the host is absent. Host input enters the receive FIFO, updates LSR.DR, and raises the UART receive interrupt when enabled through IER. The UART buffers up to 64 KiB of guest output and 4 KiB of host input. Later output bytes are dropped if the TX queue fills; completed USB input is backpressured until the guest makes RX space. Opening the host port asserts DTR and drains queued output.
 
 XUDC events use physical SPI 44 (architectural INTID 76), which EL2 services before delivering the same hardware-backed interrupt as the virtual UART RX line. Guest WFI remains native and USB traffic wakes EL2 through the physical interrupt. The boot probe and trapped guest exits retain bounded polling as a fallback. Guest USB controller accesses return an absent bus, while shared clock/reset/PMC writes preserve USB-owned resources and the XUDC SMMU client stays in bypass.
+
+## USB control and payload loading
+
+Enable the management interfaces while packaging. Add `--usb-uart` as well if
+the guest needs the virtual console and its DT overlay.
+
+```sh
+scripts/build-payload.sh path/to/default.raw 0x100000 path/to/bootstack dist \
+  --usb-control
+```
+
+This profile produces `dist/usb-control.dtbo` for the supported ODIN/Erista
+platform DTB. Apply it to the final working DTB immediately before boot, using
+the same `fdt addr`, `fdt resize`, and `fdt apply` sequence shown for the console
+overlay. It disables the guest's physical USB, PHY, role-control, mailbox, and
+power-domain nodes without adding a virtual UART.
+
+Build the host utility inside the Nix development shell:
+
+```sh
+cargo build -p switchvisorctl --release
+```
+
+The control port remains available after the guest starts. `switchvisorctl`
+selects the CDC function by its USB interface number. If automatic selection is
+unavailable, pass `--port /dev/cu.usbmodem...` before the command or set
+`SWITCHVISOR_CONTROL_PORT`.
+
+```sh
+target/release/switchvisorctl ping
+target/release/switchvisorctl status
+target/release/switchvisorctl reboot
+target/release/switchvisorctl reboot-rcm
+```
+
+To replace the packaged payload for one boot, start an upload while Switchvisor
+is about to start. The utility waits up to 15 seconds for the USB device, begins
+the transfer during Switchvisor's two-second preboot window, verifies the CRC32,
+and leaves the uploaded image ready:
+
+```sh
+target/release/switchvisorctl upload-bl33 path/to/payload.raw \
+  --runtime-size 0x100000 --entry-offset 0
+target/release/switchvisorctl boot
+```
+
+`runtime-size`, entry, and x0-x7 follow the same raw EL1 contract as packaged
+payloads. With no `--x0` through `--x7` options, the original BL31 registers are
+preserved. Once an upload begins, the packaged fallback is no longer safe to
+use because the destination may have been overwritten. `abort` discards the
+transfer and permits a new upload; use `boot` after a successful upload or
+perform a physical reset. If no upload begins in the preboot window, the
+packaged payload starts normally. Uploads are rejected after guest execution
+begins.
+
+The loader status and abort operations are also available directly:
+
+```sh
+target/release/switchvisorctl hello
+target/release/switchvisorctl loader-status
+target/release/switchvisorctl abort
+```
 
 ## Payload entry contract
 

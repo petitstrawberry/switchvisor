@@ -33,18 +33,45 @@ impl fmt::Display for PayloadError {
 }
 
 pub fn crc32(bytes: &[u8]) -> u32 {
-    checksum(bytes.iter().copied())
+    let mut crc = Crc32::new();
+    crc.update(bytes);
+    crc.finish()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Crc32(u32);
+
+impl Default for Crc32 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Crc32 {
+    pub const fn new() -> Self {
+        Self(!0)
+    }
+
+    pub fn update(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 ^= u32::from(byte);
+            for _ in 0..8 {
+                self.0 = (self.0 >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(self.0 & 1));
+            }
+        }
+    }
+
+    pub const fn finish(self) -> u32 {
+        !self.0
+    }
 }
 
 fn checksum(bytes: impl Iterator<Item = u8>) -> u32 {
-    let mut crc = !0u32;
+    let mut crc = Crc32::new();
     for byte in bytes {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(crc & 1));
-        }
+        crc.update(core::slice::from_ref(&byte));
     }
-    !crc
+    crc.finish()
 }
 
 fn config_crc(bytes: &[u8]) -> u32 {
@@ -87,6 +114,7 @@ pub struct Payload {
     pub registers: [u64; 8],
     pub preserve_boot_args: bool,
     pub usb_uart: bool,
+    pub usb_control: bool,
     pub crc32: u32,
 }
 
@@ -148,7 +176,10 @@ impl Payload {
         bytes[..8].copy_from_slice(MAGIC);
         bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
         bytes[12..16].copy_from_slice(
-            &(u32::from(self.preserve_boot_args) | (u32::from(self.usb_uart) << 1)).to_le_bytes(),
+            &(u32::from(self.preserve_boot_args)
+                | (u32::from(self.usb_uart) << 1)
+                | (u32::from(self.usb_control) << 2))
+                .to_le_bytes(),
         );
         for (i, value) in [
             self.package_size,
@@ -182,7 +213,7 @@ impl Payload {
         }
         if bytes.get(..8) != Some(MAGIC.as_slice())
             || u32_at(bytes, 8)? != 1
-            || u32_at(bytes, 12)? & !3 != 0
+            || u32_at(bytes, 12)? & !7 != 0
         {
             return Err(PayloadError::Header);
         }
@@ -203,6 +234,7 @@ impl Payload {
             registers,
             preserve_boot_args: u32_at(bytes, 12)? & 1 != 0,
             usb_uart: u32_at(bytes, 12)? & 2 != 0,
+            usb_control: u32_at(bytes, 12)? & 4 != 0,
             crc32: u32_at(bytes, 128)?,
         };
         payload.validate()?;

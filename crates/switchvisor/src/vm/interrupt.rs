@@ -9,11 +9,14 @@ use switchvisor::{
 
 static DISTRIBUTOR: Mutex<Option<Distributor<Hardware>>> = Mutex::new(None);
 static ENABLED: AtomicBool = AtomicBool::new(true);
+static OWNED_INTERRUPT_ENABLED: AtomicBool = AtomicBool::new(false);
 
-pub fn initialize(layout: Layout) {
+pub fn initialize(layout: Layout, owned_interrupt: Option<u32>) {
     let mut distributor = Distributor::new(Hardware, layout);
+    distributor.set_owned_interrupt(owned_interrupt);
     distributor.initialize();
     ENABLED.store(distributor.enabled(), Ordering::Release);
+    OWNED_INTERRUPT_ENABLED.store(distributor.owned_interrupt_enabled(), Ordering::Release);
     unsafe {
         DISTRIBUTOR.with(|state| *state = Some(distributor));
     }
@@ -21,6 +24,10 @@ pub fn initialize(layout: Layout) {
 
 pub fn enabled() -> bool {
     ENABLED.load(Ordering::Acquire)
+}
+
+pub fn owned_interrupt_enabled() -> bool {
+    OWNED_INTERRUPT_ENABLED.load(Ordering::Acquire)
 }
 
 pub fn emulate(esr: u64, far: u64, hpfar: u64, registers: &mut [u64; 31]) -> bool {
@@ -32,6 +39,8 @@ pub fn emulate(esr: u64, far: u64, hpfar: u64, registers: &mut [u64; 31]) -> boo
             let handled = vdev::emulate(distributor, esr, far, hpfar, registers);
             if handled {
                 ENABLED.store(distributor.enabled(), Ordering::Release);
+                OWNED_INTERRUPT_ENABLED
+                    .store(distributor.owned_interrupt_enabled(), Ordering::Release);
             }
             handled
         })
@@ -71,6 +80,7 @@ pub fn emulate_store_post_index(
             }
             registers[writeback.register] = writeback.value;
             ENABLED.store(distributor.enabled(), Ordering::Release);
+            OWNED_INTERRUPT_ENABLED.store(distributor.owned_interrupt_enabled(), Ordering::Release);
             true
         })
     }

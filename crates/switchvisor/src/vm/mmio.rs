@@ -1,5 +1,6 @@
 //! Guest MMIO dispatch and access policy for EL2-owned physical resources.
 use super::console;
+use crate::usb;
 use core::arch::asm;
 use switchvisor::{drivers::Mmio, mc, mmio::Access, vdev::usb_ownership as ownership};
 
@@ -11,7 +12,7 @@ pub fn emulate(esr: u64, far: u64, hpfar: u64, registers: &mut [u64; 31]) -> boo
 }
 
 fn usb(esr: u64, far: u64, hpfar: u64, registers: &mut [u64; 31]) -> bool {
-    if !console::enabled() {
+    if !usb::enabled() {
         return false;
     }
     for (base, size) in ownership::CONTROLLERS {
@@ -35,7 +36,7 @@ fn usb(esr: u64, far: u64, hpfar: u64, registers: &mut [u64; 31]) -> bool {
         }
         // Serialize shared-register RMWs across the four pinned guest CPUs.
         unsafe {
-            console::with_io(|hardware| {
+            usb::with_io(|hardware| {
                 if access.write {
                     let current = if ownership::reads_current(address) {
                         hardware.read32(address)

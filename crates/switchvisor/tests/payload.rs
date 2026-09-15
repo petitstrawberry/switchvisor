@@ -16,6 +16,7 @@ fn fixture() -> (Payload, Vec<u8>) {
         registers: [0; 8],
         preserve_boot_args: true,
         usb_uart: false,
+        usb_control: false,
         crc32: crc32(&package[0x4000..]),
     };
     (payload, package)
@@ -57,6 +58,19 @@ fn usb_console_is_opt_in_and_preserves_the_original_register_contract() {
         Payload::decode(&payload.encode().unwrap()),
         Ok(Some(payload))
     );
+}
+
+#[test]
+fn usb_control_is_independent_from_the_guest_console() {
+    let (mut payload, _) = fixture();
+    payload.usb_control = true;
+    let bytes = payload.encode().unwrap();
+    assert_eq!(u32::from_le_bytes(bytes[12..16].try_into().unwrap()), 5);
+    assert_eq!(Payload::decode(&bytes), Ok(Some(payload)));
+    payload.usb_uart = true;
+    let bytes = payload.encode().unwrap();
+    assert_eq!(u32::from_le_bytes(bytes[12..16].try_into().unwrap()), 7);
+    assert_eq!(Payload::decode(&bytes), Ok(Some(payload)));
 }
 
 #[test]

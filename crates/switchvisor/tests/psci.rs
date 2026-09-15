@@ -194,12 +194,16 @@ fn a_launch_can_only_be_consumed_by_its_pinned_cpu() {
 #[test]
 fn boot_cpu_is_online_without_another_firmware_request() {
     let mut machine = Machine::new();
+    assert_eq!(machine.online_mask(), 1);
     let [mut boot, mut other, ..] = machine.split();
     assert_eq!(boot.affinity(0), 0);
     assert_eq!(boot.request(0, LAUNCH, || panic!()), psci::ALREADY_ON);
     boot.power_off();
+    assert_eq!(boot.online_mask(), 0);
     assert_eq!(other.request(0, LAUNCH, || panic!()), 0);
+    assert_eq!(boot.online_mask(), 0);
     assert_eq!(boot.take_launch(), Some(LAUNCH));
+    assert_eq!(boot.online_mask(), 1);
 }
 
 #[test]

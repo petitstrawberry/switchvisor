@@ -59,6 +59,10 @@ pub fn initialize() {
     record(Stage::Stage2);
 }
 
+pub fn cpu_mask() -> u8 {
+    unsafe { (&*MACHINE.0.get()).online_mask() }
+}
+
 fn index() -> usize {
     let mpidr: u64;
     unsafe {

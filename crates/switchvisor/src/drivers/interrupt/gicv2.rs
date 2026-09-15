@@ -11,10 +11,14 @@ pub const SPURIOUS_IRQ: u32 = 1023;
 const GICD_CTLR: u64 = 0x000;
 const GICD_IGROUPR0: u64 = 0x080;
 const GICD_ISENABLER0: u64 = 0x100;
+const GICD_ICENABLER0: u64 = 0x180;
 const GICD_ISPENDR0: u64 = 0x200;
 const GICD_ICPENDR0: u64 = 0x280;
 const GICD_ICACTIVER0: u64 = 0x380;
+const GICD_IPRIORITYR0: u64 = 0x400;
 const GICD_IPRIORITYR6: u64 = 0x418;
+const GICD_ITARGETSR0: u64 = 0x800;
+const GICD_ICFGR0: u64 = 0xc00;
 const GICD_ICFGR1: u64 = 0xc04;
 const GICC_CTLR: u64 = 0x000;
 const GICC_PMR: u64 = 0x004;
@@ -372,6 +376,43 @@ impl<M: Mmio> GicV2<M> {
             .unwrap_or(SPURIOUS_IRQ);
     }
 
+    /// Configure the physical PPI/SPI so EL2 can service it independently from
+    /// the guest distributor state. Call once on the boot CPU.
+    pub fn configure_owned_interrupt(&mut self, target_mask: u8) {
+        let id = self.owned_interrupt;
+        if id >= 1020 {
+            return;
+        }
+        let register = u64::from(id / 32) * 4;
+        let bit = 1 << (id % 32);
+        self.write_dist(GICD_ICENABLER0 + register, bit);
+
+        let group = self.read_dist(GICD_IGROUPR0 + register) | bit;
+        self.write_dist(GICD_IGROUPR0 + register, group);
+
+        let byte_register = u64::from(id / 4) * 4;
+        let byte_shift = (id % 4) * 8;
+        let priority = self.read_dist(GICD_IPRIORITYR0 + byte_register) & !(0xff << byte_shift);
+        self.write_dist(GICD_IPRIORITYR0 + byte_register, priority);
+        if id >= 32 {
+            let targets = self.read_dist(GICD_ITARGETSR0 + byte_register);
+            let targets =
+                (targets & !(0xff << byte_shift)) | (u32::from(target_mask) << byte_shift);
+            self.write_dist(GICD_ITARGETSR0 + byte_register, targets);
+        }
+
+        let config_register = u64::from(id / 16) * 4;
+        let config_shift = (id % 16) * 2;
+        let configuration = self.read_dist(GICD_ICFGR0 + config_register) & !(3 << config_shift);
+        self.write_dist(GICD_ICFGR0 + config_register, configuration);
+        self.write_dist(GICD_ICPENDR0 + register, bit);
+        self.write_dist(GICD_ICACTIVER0 + register, bit);
+        self.write_dist(GICD_ISENABLER0 + register, bit);
+        let control = self.read_dist(GICD_CTLR);
+        self.write_dist(GICD_CTLR, control | 1);
+        self.mmio.barrier();
+    }
+
     /// Assert the physical pending bit backing the owned virtual level interrupt.
     pub fn pend_owned_interrupt(&mut self) {
         let id = self.owned_interrupt;
@@ -591,6 +632,51 @@ mod tests {
         assert_eq!((lr >> 10) & IRQ_ID_MASK, OWNED);
         assert_ne!(lr & LR_HARDWARE, 0);
         assert_eq!(gic.mmio.words[(TEST_LAYOUT.cpu + GICC_DIR) as usize / 4], 0);
+    }
+
+    #[test]
+    fn owned_spi_is_configured_for_el2_independently_of_the_guest() {
+        const OWNED: u32 = 76;
+        const TEST_LAYOUT: Layout = Layout {
+            distributor: 0,
+            distributor_size: 0x1000,
+            cpu: 0x2000,
+            cpu_size: 0x2000,
+            hypervisor: 0x4000,
+            hypervisor_size: 0x2000,
+            virtual_cpu: 0x6000,
+            virtual_cpu_size: 0x2000,
+        };
+        let mut gic = GicV2::new(Memory::new(), TEST_LAYOUT);
+        gic.set_owned_interrupt(Some(OWNED));
+        gic.mmio.words[(GICD_IPRIORITYR0 + 76) as usize / 4] = u32::MAX;
+        gic.mmio.words[(GICD_ITARGETSR0 + 76) as usize / 4] = u32::MAX;
+        gic.mmio.words[(GICD_ICFGR0 + 16) as usize / 4] = u32::MAX;
+
+        gic.configure_owned_interrupt(1);
+
+        let register = u64::from(OWNED / 32) * 4;
+        let bit = 1 << (OWNED % 32);
+        assert_ne!(
+            gic.mmio.words[(GICD_IGROUPR0 + register) as usize / 4] & bit,
+            0
+        );
+        assert_eq!(
+            gic.mmio.words[(GICD_ISENABLER0 + register) as usize / 4],
+            bit
+        );
+        assert_eq!(
+            gic.mmio.words[(GICD_IPRIORITYR0 + 76) as usize / 4] & 0xff,
+            0
+        );
+        assert_eq!(
+            gic.mmio.words[(GICD_ITARGETSR0 + 76) as usize / 4] & 0xff,
+            1
+        );
+        assert_eq!(
+            (gic.mmio.words[(GICD_ICFGR0 + 16) as usize / 4] >> 24) & 3,
+            0
+        );
     }
 
     struct Dummy;
