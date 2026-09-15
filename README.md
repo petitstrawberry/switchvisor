@@ -133,7 +133,7 @@ Connect the Switch to a host with a USB data cable. On macOS, open the new CDC A
 ```sh
 ls /dev/cu.usbmodem*
 USB_PORT=/dev/cu.usbmodemSWV00011
-screen "$USB_PORT" 115200
+minicom -D "$USB_PORT" -b 115200
 ```
 
 Set `USB_PORT` to the actual port name printed by `ls`.
