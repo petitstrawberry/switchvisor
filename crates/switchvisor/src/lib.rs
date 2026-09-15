@@ -2,12 +2,14 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+pub mod control;
 pub mod drivers;
 pub mod el2_mmu;
 pub mod fdt;
 pub mod fdt_memory;
 pub mod framebuffer;
 pub mod image;
+pub mod loader;
 pub mod mc;
 pub mod memory;
 pub mod mmio;

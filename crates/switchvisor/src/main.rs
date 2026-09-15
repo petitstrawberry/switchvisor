@@ -8,10 +8,11 @@ use platform::tegra210::framebuffer::{self, Screen};
 use switchvisor::payload::{
     CONFIG_SIZE, EXIT_HVC, LOAD_BASE, Payload, RESIDENT_BASE, RESIDENT_SIZE, STACK_TOP,
 };
-use vm::{console as guest_console, vcpu};
+use vm::vcpu;
 
 mod arch;
 mod platform;
+mod usb;
 mod vm;
 
 #[used]
@@ -93,11 +94,11 @@ fn launch_payload(payload: Payload, handoff: &[u64; 8], screen: &mut Screen) -> 
             }
         }
     };
-    let entry = match payload.entry() {
+    let mut entry = match payload.entry() {
         Ok(entry) => entry,
         Err(_) => park(),
     };
-    let registers = if payload.preserve_boot_args {
+    let mut registers = if payload.preserve_boot_args {
         *handoff
     } else {
         payload.registers
@@ -116,11 +117,11 @@ fn launch_payload(payload: Payload, handoff: &[u64; 8], screen: &mut Screen) -> 
             (payload.runtime_size - payload.file_size) as usize,
         );
         core::ptr::write_bytes((STACK_TOP - 64 * 1024) as *mut u8, 0, 64 * 1024);
-        asm!("dsb sy", "ic iallu", "dsb sy", "isb", options(nostack));
     }
     let gic = cpu::interrupt::detect_layout();
     cpu::interrupt::select_layout(gic);
-    if stage2::prepare(payload.usb_uart, gic).is_err() || mmu::prepare().is_err() {
+    let physical_usb = payload.usb_uart || payload.usb_control;
+    if stage2::prepare(physical_usb, gic).is_err() || mmu::prepare().is_err() {
         let _ = writeln!(screen, "STAGE2 REJECTED: TABLE PLACEMENT");
         park()
     }
@@ -128,13 +129,17 @@ fn launch_payload(payload: Payload, handoff: &[u64; 8], screen: &mut Screen) -> 
         mmu::enable();
         stage2::enable();
     }
-    vm::interrupt::initialize(gic);
     vcpu::initialize();
-    match guest_console::initialize(payload.usb_uart) {
+    match usb::initialize(
+        physical_usb,
+        payload.usb_uart,
+        payload.require_upload,
+        entry,
+    ) {
         Ok(true) => {
-            let _ = writeln!(screen, "USB CDC ACM ON - WAITING FOR HOST");
+            let _ = writeln!(screen, "USB COMPOSITE ON - WAITING FOR HOST");
         }
-        Ok(false) if payload.usb_uart => {
+        Ok(false) if physical_usb => {
             let _ = writeln!(screen, "USB UNAVAILABLE - NO TEGRA210 IP");
         }
         Err(error) => {
@@ -142,7 +147,11 @@ fn launch_payload(payload: Payload, handoff: &[u64; 8], screen: &mut Screen) -> 
         }
         _ => (),
     }
-    cpu::interrupt::select_console_interrupt(guest_console::available());
+    vm::interrupt::initialize(
+        gic,
+        usb::available().then_some(switchvisor::drivers::usb::tegra210::INTERRUPT_ID),
+    );
+    cpu::interrupt::select_usb_interrupt(usb::available());
     if let Err(error) = cpu::interrupt::initialize() {
         let _ = writeln!(screen, "VGIC INIT FAILED: {error:?}");
         park()
@@ -151,7 +160,23 @@ fn launch_payload(payload: Payload, handoff: &[u64; 8], screen: &mut Screen) -> 
         switchvisor::stage2::HCR,
         core::sync::atomic::Ordering::Release,
     );
-    guest_console::probe(screen);
+    if let Some(uploaded) = usb::preboot(screen) {
+        entry = uploaded.entry;
+        registers = if uploaded.preserve_boot_args() {
+            *handoff
+        } else {
+            uploaded.registers
+        };
+        let _ = writeln!(
+            screen,
+            "USB GUEST BUNDLE READY\nENTRY = {entry:016x}\nIMAGES = {}",
+            uploaded.image_count
+        );
+    }
+    usb::enter_guest(entry);
+    unsafe {
+        asm!("dsb sy", "ic iallu", "dsb sy", "isb", options(nostack));
+    }
     let _ = writeln!(screen, "STAGE2 ON - VMM RAM EXCLUDED");
     vcpu::record(vcpu::Stage::Guest);
     unsafe { cpu::enter_payload(registers.as_ptr(), entry, STACK_TOP) }
@@ -206,7 +231,7 @@ extern "C" fn rust_exception(registers: &mut [u64; 31]) {
             // Other SMCCC calls retain the native EL3 firmware service.
             unsafe { cpu::forward_smc(registers.as_mut_ptr()) };
         }
-        guest_console::service();
+        usb::service();
         vcpu::record(vcpu::Stage::Guest);
         unsafe {
             asm!("msr elr_el2, {value}", "msr spsr_el2, {spsr}",
@@ -221,7 +246,7 @@ extern "C" fn rust_exception(registers: &mut [u64; 31]) {
             }))
     {
         cpu::interrupt::synchronize_distributor();
-        guest_console::service();
+        usb::service();
         unsafe {
             asm!("msr elr_el2, {value}", "msr spsr_el2, {spsr}",
                 value = in(reg) (elr + 4), spsr = in(reg) spsr, options(nostack));

@@ -9,8 +9,8 @@ use core::{
 use switchvisor::drivers::{
     Driver, InterruptController, Mmio,
     interrupt::gicv2::{Error, Event, GicV2, Layout},
+    usb::tegra210::INTERRUPT_ID as USB_INTERRUPT_ID,
 };
-use switchvisor::vdev::uart::INTERRUPT_ID;
 
 const HIDREV: u64 = 0x7000_0804;
 const TEGRA210_CHIP_ID: u32 = 0x21;
@@ -22,7 +22,7 @@ unsafe impl Sync for PerCpu {}
 static GICS: [PerCpu; switchvisor::CPU_COUNT] =
     [const { PerCpu(UnsafeCell::new(None)) }; switchvisor::CPU_COUNT];
 static LAYOUT: AtomicU64 = AtomicU64::new(0);
-static CONSOLE_INTERRUPT_OWNED: AtomicBool = AtomicBool::new(false);
+static USB_INTERRUPT_OWNED: AtomicBool = AtomicBool::new(false);
 
 fn index() -> usize {
     let mpidr: u64;
@@ -45,8 +45,8 @@ pub fn select_layout(layout: Layout) {
 }
 
 /// Configure ownership before any per-CPU GIC instance is initialized.
-pub fn select_console_interrupt(owned: bool) {
-    CONSOLE_INTERRUPT_OWNED.store(owned, Ordering::Release);
+pub fn select_usb_interrupt(owned: bool) {
+    USB_INTERRUPT_OWNED.store(owned, Ordering::Release);
 }
 
 fn selected_layout() -> Layout {
@@ -70,11 +70,14 @@ pub fn initialize() -> Result<(), Error> {
     }
     let mut gic = GicV2::new(Hardware, selected_layout());
     gic.set_owned_interrupt(
-        CONSOLE_INTERRUPT_OWNED
+        USB_INTERRUPT_OWNED
             .load(Ordering::Acquire)
-            .then_some(INTERRUPT_ID),
+            .then_some(USB_INTERRUPT_ID),
     );
     gic.initialize()?;
+    if cpu == 0 && USB_INTERRUPT_OWNED.load(Ordering::Acquire) {
+        gic.configure_owned_interrupt(1);
+    }
     gic.set_distributor_enabled(vm::interrupt::enabled());
     *state = Some(gic);
     Ok(())
@@ -82,7 +85,7 @@ pub fn initialize() -> Result<(), Error> {
 
 /// Assert the physical SPI used to back the virtual UART's level interrupt.
 pub fn pend_console_interrupt() {
-    if !CONSOLE_INTERRUPT_OWNED.load(Ordering::Acquire) {
+    if !USB_INTERRUPT_OWNED.load(Ordering::Acquire) {
         return;
     }
     let cpu = index();
@@ -101,6 +104,9 @@ pub fn synchronize_distributor() {
     };
     if let Some(gic) = unsafe { &mut *slot.0.get() } {
         gic.set_distributor_enabled(vm::interrupt::enabled());
+        if vm::interrupt::owned_interrupt_enabled() && vm::console::interrupt_pending() {
+            gic.pend_owned_interrupt();
+        }
     }
 }
 
@@ -115,7 +121,9 @@ extern "C" fn rust_irq() {
     };
     gic.set_distributor_enabled(vm::interrupt::enabled());
     if let Event::Owned(interrupt) = gic.take_interrupt() {
-        let deliver = vm::console::service_interrupt();
+        let deliver = crate::usb::service_interrupt()
+            && vm::interrupt::enabled()
+            && vm::interrupt::owned_interrupt_enabled();
         gic.finish_owned_interrupt(interrupt, deliver);
     }
 }

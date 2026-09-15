@@ -3,7 +3,7 @@
 use crate::{
     drivers::{
         Mmio,
-        interrupt::gicv2::{Layout, MAINTENANCE_IRQ},
+        interrupt::gicv2::{Layout, MAINTENANCE_IRQ, SPURIOUS_IRQ},
     },
     vdev::{DeviceError, MmioRegion, VirtualDevice},
 };
@@ -16,17 +16,22 @@ const GICD_ISPENDR0: u64 = 0x200;
 const GICD_ICPENDR0: u64 = 0x280;
 const GICD_ISACTIVER0: u64 = 0x300;
 const GICD_ICACTIVER0: u64 = 0x380;
+const GICD_IPRIORITYR0: u64 = 0x400;
 const GICD_IPRIORITYR6: u64 = 0x418;
+const GICD_ITARGETSR0: u64 = 0x800;
+const GICD_ICFGR0: u64 = 0xc00;
 const GICD_ICFGR1: u64 = 0xc04;
 
-const OWNED_BIT: u32 = 1 << MAINTENANCE_IRQ;
-const OWNED_PRIORITY: u32 = 0xff << 8;
-const OWNED_CONFIG: u32 = 3 << 18;
+const MAINTENANCE_BIT: u32 = 1 << MAINTENANCE_IRQ;
+const MAINTENANCE_PRIORITY: u32 = 0xff << 8;
+const MAINTENANCE_CONFIG: u32 = 3 << 18;
 
 pub struct Distributor<M> {
     mmio: M,
     layout: Layout,
     guest_control: u32,
+    owned_interrupt: u32,
+    owned_interrupt_enabled: bool,
 }
 
 impl<M: Mmio> Distributor<M> {
@@ -35,7 +40,16 @@ impl<M: Mmio> Distributor<M> {
             mmio,
             layout,
             guest_control: 0,
+            owned_interrupt: SPURIOUS_IRQ,
+            owned_interrupt_enabled: false,
         }
+    }
+
+    pub fn set_owned_interrupt(&mut self, interrupt: Option<u32>) {
+        self.owned_interrupt = interrupt
+            .filter(|id| (32..1020).contains(id))
+            .unwrap_or(SPURIOUS_IRQ);
+        self.owned_interrupt_enabled = false;
     }
 
     /// Keep the physical Non-secure group enabled for the maintenance PPI,
@@ -51,14 +65,68 @@ impl<M: Mmio> Distributor<M> {
         self.guest_control & 1 != 0
     }
 
-    fn protected_mask(offset: u64) -> u32 {
-        match offset {
-            GICD_IGROUPR0 | GICD_ISENABLER0 | GICD_ICENABLER0 | GICD_ISPENDR0 | GICD_ICPENDR0
-            | GICD_ISACTIVER0 | GICD_ICACTIVER0 => OWNED_BIT,
-            GICD_IPRIORITYR6 => OWNED_PRIORITY,
-            GICD_ICFGR1 => OWNED_CONFIG,
-            _ => 0,
+    pub const fn owned_interrupt_enabled(&self) -> bool {
+        self.owned_interrupt_enabled
+    }
+
+    fn owned_word_mask(&self, offset: u64, base: u64) -> u32 {
+        let id = self.owned_interrupt;
+        if id < 1020 && offset == base + u64::from(id / 32) * 4 {
+            1 << (id % 32)
+        } else {
+            0
         }
+    }
+
+    fn owned_byte_mask(&self, offset: u64, base: u64) -> u32 {
+        let id = self.owned_interrupt;
+        if id < 1020 && offset == base + u64::from(id / 4) * 4 {
+            0xff << ((id % 4) * 8)
+        } else {
+            0
+        }
+    }
+
+    fn owned_config_mask(&self, offset: u64) -> u32 {
+        let id = self.owned_interrupt;
+        if id < 1020 && offset == GICD_ICFGR0 + u64::from(id / 16) * 4 {
+            3 << ((id % 16) * 2)
+        } else {
+            0
+        }
+    }
+
+    fn owned_action_mask(&self, offset: u64) -> u32 {
+        for base in [
+            GICD_IGROUPR0,
+            GICD_ISENABLER0,
+            GICD_ICENABLER0,
+            GICD_ISPENDR0,
+            GICD_ICPENDR0,
+            GICD_ISACTIVER0,
+            GICD_ICACTIVER0,
+        ] {
+            let mask = self.owned_word_mask(offset, base);
+            if mask != 0 {
+                return mask;
+            }
+        }
+        0
+    }
+
+    fn protected_mask(&self, offset: u64) -> u32 {
+        let maintenance = match offset {
+            GICD_IGROUPR0 | GICD_ISENABLER0 | GICD_ICENABLER0 | GICD_ISPENDR0 | GICD_ICPENDR0
+            | GICD_ISACTIVER0 | GICD_ICACTIVER0 => MAINTENANCE_BIT,
+            GICD_IPRIORITYR6 => MAINTENANCE_PRIORITY,
+            GICD_ICFGR1 => MAINTENANCE_CONFIG,
+            _ => 0,
+        };
+        maintenance
+            | self.owned_action_mask(offset)
+            | self.owned_byte_mask(offset, GICD_IPRIORITYR0)
+            | self.owned_byte_mask(offset, GICD_ITARGETSR0)
+            | self.owned_config_mask(offset)
     }
 
     fn is_write_one(offset: u64) -> bool {
@@ -92,7 +160,17 @@ impl<M: Mmio> Distributor<M> {
                 | GICD_ISACTIVER0
                 | GICD_ICACTIVER0
         ) {
-            value &= !OWNED_BIT;
+            value &= !MAINTENANCE_BIT;
+        }
+        let owned = self.owned_action_mask(offset);
+        if owned != 0 {
+            value &= !owned;
+            if self.owned_interrupt_enabled
+                && (self.owned_word_mask(offset, GICD_ISENABLER0) != 0
+                    || self.owned_word_mask(offset, GICD_ICENABLER0) != 0)
+            {
+                value |= owned;
+            }
         }
         value
     }
@@ -116,16 +194,23 @@ impl<M: Mmio> VirtualDevice for Distributor<M> {
         let value = ((value as u32) << shift) & mask;
         let address = self.layout.distributor + word;
 
+        if value & self.owned_word_mask(word, GICD_ISENABLER0) != 0 {
+            self.owned_interrupt_enabled = true;
+        }
+        if value & self.owned_word_mask(word, GICD_ICENABLER0) != 0 {
+            self.owned_interrupt_enabled = false;
+        }
+
         if word == GICD_CTLR {
             self.guest_control = ((self.guest_control & !mask) | value) & 1;
             self.mmio.write32(address, self.guest_control | 1);
         } else if Self::is_write_one(word) {
             self.mmio
-                .write32(address, value & !Self::protected_mask(word));
+                .write32(address, value & !self.protected_mask(word));
         } else {
             let current = self.mmio.read32(address);
             let merged = (current & !mask) | value;
-            let protected = Self::protected_mask(word);
+            let protected = self.protected_mask(word);
             self.mmio
                 .write32(address, (merged & !protected) | (current & protected));
         }
@@ -191,7 +276,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             distributor.mmio.words[GICD_ICENABLER0 as usize / 4],
-            !OWNED_BIT
+            !MAINTENANCE_BIT
         );
     }
 
@@ -205,11 +290,68 @@ mod tests {
             0xaabb_33dd
         );
 
-        distributor.mmio.words[GICD_ICFGR1 as usize / 4] = OWNED_CONFIG;
+        distributor.mmio.words[GICD_ICFGR1 as usize / 4] = MAINTENANCE_CONFIG;
         distributor.write(GICD_ICFGR1, 4, 0).unwrap();
         assert_eq!(
-            distributor.mmio.words[GICD_ICFGR1 as usize / 4] & OWNED_CONFIG,
-            OWNED_CONFIG
+            distributor.mmio.words[GICD_ICFGR1 as usize / 4] & MAINTENANCE_CONFIG,
+            MAINTENANCE_CONFIG
+        );
+    }
+
+    #[test]
+    fn guest_enable_state_is_virtualized_for_an_el2_owned_spi() {
+        const OWNED: u32 = 76;
+        let mut distributor = distributor();
+        distributor.set_owned_interrupt(Some(OWNED));
+        distributor.initialize();
+        let register = u64::from(OWNED / 32) * 4;
+        let bit = 1u32 << (OWNED % 32);
+
+        distributor
+            .write(GICD_ISENABLER0 + register, 4, u64::from(bit))
+            .unwrap();
+        assert!(distributor.owned_interrupt_enabled());
+        assert_eq!(
+            distributor.mmio.words[(GICD_ISENABLER0 + register) as usize / 4],
+            0
+        );
+        assert_eq!(
+            distributor.read(GICD_ISENABLER0 + register, 4),
+            Ok(u64::from(bit))
+        );
+        assert_eq!(
+            distributor.read(GICD_ICENABLER0 + register, 4),
+            Ok(u64::from(bit))
+        );
+
+        distributor
+            .write(GICD_ICENABLER0 + register, 4, u64::from(bit))
+            .unwrap();
+        assert!(!distributor.owned_interrupt_enabled());
+        assert_eq!(distributor.read(GICD_ISENABLER0 + register, 4), Ok(0));
+    }
+
+    #[test]
+    fn guest_cannot_reconfigure_an_el2_owned_spi() {
+        const OWNED: u32 = 76;
+        let mut distributor = distributor();
+        distributor.set_owned_interrupt(Some(OWNED));
+        let priority = GICD_IPRIORITYR0 + u64::from(OWNED / 4) * 4;
+        let target = GICD_ITARGETSR0 + u64::from(OWNED / 4) * 4;
+        let config = GICD_ICFGR0 + u64::from(OWNED / 16) * 4;
+        distributor.mmio.words[priority as usize / 4] = 0x4433_2211;
+        distributor.mmio.words[target as usize / 4] = 0x8877_6655;
+        distributor.mmio.words[config as usize / 4] = 0xaaaa_aaaa;
+
+        distributor.write(priority, 4, u64::from(u32::MAX)).unwrap();
+        distributor.write(target, 4, 0).unwrap();
+        distributor.write(config, 4, 0).unwrap();
+
+        assert_eq!(distributor.mmio.words[priority as usize / 4], 0xffff_ff11);
+        assert_eq!(distributor.mmio.words[target as usize / 4], 0x0000_0055);
+        assert_eq!(
+            distributor.mmio.words[config as usize / 4] & (3 << 24),
+            2 << 24
         );
     }
 }

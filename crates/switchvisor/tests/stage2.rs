@@ -71,6 +71,7 @@ fn usb_profile_traps_controllers_car_and_pmc_without_hiding_other_devices() {
             let trapped = address == mc::BASE
                 || address == uart::BASE
                 || address == ownership::CAR
+                || address == ownership::LIC
                 || address == ownership::PMC_PAGE
                 || ownership::controller(address);
             assert_eq!(

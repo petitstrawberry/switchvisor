@@ -13,7 +13,7 @@ static CAR: SharedTable = SharedTable(UnsafeCell::new(Table::zeroed()));
 static GIC_L2: SharedTable = SharedTable(UnsafeCell::new(Table::zeroed()));
 static GIC_PAGES: SharedTable = SharedTable(UnsafeCell::new(Table::zeroed()));
 
-pub fn prepare(usb_uart: bool, gic: GicLayout) -> Result<(), stage2::MapError> {
+pub fn prepare(physical_usb: bool, gic: GicLayout) -> Result<(), stage2::MapError> {
     let root = ROOT.0.get();
     let split = SPLIT.0.get();
     let mmio = MMIO.0.get();
@@ -36,7 +36,7 @@ pub fn prepare(usb_uart: bool, gic: GicLayout) -> Result<(), stage2::MapError> {
             &[root as u64, split as u64, mmio as u64, pages as u64],
             gic,
         )?;
-        if usb_uart {
+        if physical_usb {
             stage2::protect_usb(
                 &mut *mmio,
                 &mut *pages,

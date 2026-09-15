@@ -2,15 +2,16 @@
 
 A lightweight hypervisor for Nintendo Switch.
 
-Switchvisor packages an externally supplied raw AArch64 payload as BL33 and runs
-it at EL1. The payload can be a bootloader such as U-Boot or another raw image
-that follows the entry contract below.
+Switchvisor occupies the platform's BL33 slot, establishes EL2 isolation, and
+starts one guest entry at EL1. That entry normally fills the guest's BL33 role,
+for example with U-Boot, but its raw image, address, and supporting memory layout
+are selected by the caller.
 
 The current platform integration boots through Hekate L4T and a compatible
 BL31. Early boot messages use Hekate's framebuffer.
 
 ```text
-Hekate -> BL31 -> Switchvisor (EL2) -> payload (EL1)
+Hekate -> BL31 -> Switchvisor (EL2) -> guest entry (EL1)
 ```
 
 ## Build environment
@@ -55,8 +56,12 @@ The script builds Switchvisor and writes these files to `dist/`:
 
 The bootstack directory is required. An optional output-directory argument
 overrides `dist/`. The three output files are replaced after the build and
-packaging succeed. A build with `--usb-uart` also writes `usb-uart.dtbo`; a
-build without it removes a stale overlay from the output directory.
+packaging succeed. A build with `--usb-uart` also writes `usb-uart.dtbo`. Pass
+`--usb-control` to enable USB control and guest bundle loading without adding a
+virtual UART to the guest; that profile writes `usb-control.dtbo`. The build
+removes stale overlay variants from the output directory. Add `--no-fallback`
+with either USB option to require an uploaded payload instead of starting the
+packaged payload automatically.
 
 Copy `dist/bl33.bin` to the microSD path configured for BL33 by the selected
 Hekate L4T boot entry.
@@ -113,7 +118,8 @@ The same entry and register options can be appended to this command. The output 
 
 ## USB console
 
-Enable the EL2-owned USB 2.0 CDC ACM transport when packaging:
+Enable the EL2-owned USB composite device and its guest CDC ACM transport when
+packaging:
 
 ```sh
 scripts/build-payload.sh path/to/bootstack/bl33.bin 0x68200 path/to/bootstack dist --usb-uart
@@ -153,7 +159,9 @@ The supported U-Boot payload provides `fdt apply`. The supplied overlay targets
 the supported ODIN/Erista node paths. A different guest DTB must declare the same
 UART and disable its physical USB, PHY, and role-control nodes.
 
-Connect the Switch to a host with a USB data cable. On macOS, open the new CDC ACM port:
+Connect the Switch to a host with a USB data cable. The composite device exposes
+separate guest-console and Switchvisor-control CDC ports. On macOS, open the
+guest-console port with minicom:
 
 ```sh
 ls /dev/cu.usbmodem*
@@ -165,20 +173,171 @@ Set `USB_PORT` to the actual port name printed by `ls`.
 
 USB transmits the guest's UART bytes unchanged. Handle terminal newline conversion in the guest console or TTY layer, or configure it in the host terminal.
 
-With `--usb-uart`, Switchvisor polls USB for two seconds before starting the payload and prints the port/endpoint state, event/setup counts, and last error on Hekate's framebuffer. Connect the host cable before boot to capture enumeration progress. Boot continues when this probe finishes even if no host is present.
+With `--usb-uart` or `--usb-control`, Switchvisor normally services USB for two
+seconds before starting the packaged payload and prints the port/endpoint
+state, event/setup counts, and last error on Hekate's framebuffer. Connect the
+host cable before boot to capture enumeration progress.
 
 Baud and line-coding settings are USB metadata. Guest transmit uses THR and polls LSR.THRE/TEMT; both stay ready even when the host is absent. Host input enters the receive FIFO, updates LSR.DR, and raises the UART receive interrupt when enabled through IER. The UART buffers up to 64 KiB of guest output and 4 KiB of host input. Later output bytes are dropped if the TX queue fills; completed USB input is backpressured until the guest makes RX space. Opening the host port asserts DTR and drains queued output.
 
 XUDC events use physical SPI 44 (architectural INTID 76), which EL2 services before delivering the same hardware-backed interrupt as the virtual UART RX line. Guest WFI remains native and USB traffic wakes EL2 through the physical interrupt. The boot probe and trapped guest exits retain bounded polling as a fallback. Guest USB controller accesses return an absent bus, while shared clock/reset/PMC writes preserve USB-owned resources and the XUDC SMMU client stays in bypass.
 
-## Payload entry contract
+## USB control and guest bundle loading
 
-Supply a raw binary that can execute at the fixed BL33 load address. Its file bytes are copied unchanged, and the remaining memory through `runtime-size` is cleared.
+Enable the management interfaces while packaging. Add `--usb-uart` as well if
+the guest needs the virtual console and its DT overlay.
+
+```sh
+scripts/build-payload.sh path/to/default.raw 0x100000 path/to/bootstack dist \
+  --usb-control
+```
+
+For a required-upload boot that never starts the packaged payload automatically,
+add `--no-fallback`:
+
+```sh
+scripts/build-payload.sh path/to/default.raw 0x100000 path/to/bootstack dist \
+  --usb-control --no-fallback
+```
+
+This mode waits for an upload and `BOOT` without a deadline. If USB cannot be
+initialized, Switchvisor reports the failure on the framebuffer and remains in
+EL2. The control port stays available for `status`, `reboot`, and `reboot-rcm`
+while waiting. `status` reports `fallback=disabled`.
+
+This profile produces `dist/usb-control.dtbo` for the supported ODIN/Erista
+platform DTB. Apply it to the final working DTB immediately before boot, using
+the same `fdt addr`, `fdt resize`, and `fdt apply` sequence shown for the console
+overlay. It disables the guest's physical USB, PHY, role-control, mailbox, and
+power-domain nodes without adding a virtual UART.
+
+Build the host utility inside the Nix development shell:
+
+```sh
+cargo build -p switchvisorctl --release
+```
+
+On macOS, the development shell also provides the pinned `nxboot` command used
+for RCM payload injection.
+
+The control port remains available after the guest starts. `switchvisorctl`
+selects the CDC function by its USB interface number. If automatic selection is
+unavailable, pass `--port /dev/cu.usbmodem...` before the command or set
+`SWITCHVISOR_CONTROL_PORT`.
+
+```sh
+target/release/switchvisorctl ping
+target/release/switchvisorctl status
+target/release/switchvisorctl reboot
+target/release/switchvisorctl reboot-rcm
+```
+
+To initialize several guest RAM regions and boot one of them, place a
+`bundle.json` beside the opaque input files:
+
+```json
+{
+  "version": 1,
+  "entry": "0xaa000000",
+  "preserve_boot_args": true,
+  "images": [
+    {
+      "path": "bootloader.bin",
+      "address": "0xaa000000",
+      "runtime_size": "0x100000"
+    },
+    {
+      "path": "kernel.img",
+      "address": "0xa0000000"
+    },
+    {
+      "path": "initramfs",
+      "address": "0x92000000"
+    }
+  ]
+}
+```
+
+Then deploy the directory while Switchvisor is in preboot:
+
+```sh
+target/release/switchvisorctl deploy path/to/bundle
+```
+
+`deploy` waits up to 15 seconds for the USB device, uploads every image,
+verifies each CRC32, commits the complete bundle, and boots its EL1 entry.
+`runtime_size` defaults to the file size; a larger value zero-fills the tail.
+`switchvisorctl hello` reports the accepted low guest RAM envelope. Images must
+fit within that envelope, must not overlap each other, and cannot overwrite the
+active initial EL1 stack or inherited framebuffer. Switchvisor assigns no
+meaning to image names or contents. A bootloader-specific handoff block or magic
+value can therefore be generated by an external project and included as another
+image.
+
+The bundle must designate an aligned entry inside the file extent of one
+uploaded image. This image is the guest's initial firmware entry and normally
+serves the BL33 role, but Switchvisor does not require U-Boot or a BL33-specific
+file format. By default the original BL31 x0-x7 values are preserved. Set
+`preserve_boot_args` to `false` for zero registers, or provide exactly eight
+numeric values in `registers` for explicit x0-x7. JSON numbers and strings may
+use decimal notation; strings may also use `0x` hexadecimal notation.
+
+For a single replacement at the conventional BL33 address, the compatibility
+command builds a one-image bundle and leaves it ready for an explicit boot:
+
+```sh
+target/release/switchvisorctl upload-bl33 path/to/payload.raw \
+  --runtime-size 0x100000 --entry-offset 0
+target/release/switchvisorctl boot
+```
+
+`runtime-size`, entry, and x0-x7 follow the same raw EL1 contract as packaged
+payloads. With no `--x0` through `--x7` options, the original BL31 registers are
+preserved. Once a transfer begins, the packaged fallback is no longer safe to
+use because guest RAM may have been overwritten. `abort` discards the transfer
+and permits a new one; it does not restore overwritten memory. Without
+`--no-fallback`, the packaged payload starts normally if no transfer begins in
+the preboot window. Transfers are rejected after guest execution begins.
+
+The loader status and abort operations are also available directly:
+
+```sh
+target/release/switchvisorctl hello
+target/release/switchvisorctl loader-status
+target/release/switchvisorctl abort
+```
+
+### Automatic payload cycle
+
+With a no-fallback Switchvisor entry installed on the microSD card, a single
+command can return a running guest to RCM, inject Hekate, select the Switchvisor
+entry by ID, upload a raw EL1 payload or guest bundle, and boot it:
+
+```sh
+scripts/run-payload.sh path/to/hekate.bin path/to/payload.raw 0x100000 \
+  --entry-offset 0
+
+scripts/run-payload.sh path/to/hekate.bin --bundle path/to/bundle
+```
+
+The Hekate entry ID defaults to `SWV-NX`. Set `SWITCHVISOR_HEKATE_ID` when the
+installed entry uses another ID. `SWITCHVISOR_CONTROL_PORT` and the upload
+register options work as described above. The Hekate payload path is always
+explicit; the script does not depend on a local Hekate checkout or download
+location. On macOS the script waits for APX enumeration and IOKit interface
+readiness before invoking nxboot.
+
+## Guest entry contract
+
+The packaged fallback and `upload-bl33` command use a raw binary at the fixed
+BL33 load address. A deployed bundle may choose another EL1 entry within any of
+its uploaded images. File bytes are copied unchanged, and each runtime tail is
+cleared through its declared `runtime_size`.
 
 | Item | Value |
 |---|---|
-| Load address | `0xAA000000` |
-| Entry address | Load address plus `--entry-offset`; 4-byte aligned and inside the file |
+| Image addresses | Packaged/single upload: `0xAA000000`; bundle: selected per image by its manifest |
+| Entry address | Packaged/single upload: load address plus `--entry-offset`; bundle: an aligned address inside one uploaded file |
 | CPU state | AArch64 EL1h, DAIF masked, MMU and caches off |
 | Guest address space | GPA=HPA, 36-bit Stage-2; VMM RAM `0xFEC00000`–`0xFFC00000` is unmapped |
 | Memory discovery | MC page `0x70019000` is trapped; disabled GSC5 advertises the VMM reservation |
@@ -187,7 +346,7 @@ Supply a raw binary that can execute at the fixed BL33 load address. Its file by
 | x0-x7 | Original BL31 inputs, or explicit register options |
 | x8-x30 | Zero |
 | Initial stack | SP_EL1=`0x8A800000`; the preceding 64 KiB are cleared |
-| Size limits | Composite package and payload runtime each at most 64 MiB |
+| Size limits | Composite package and conventional BL33 runtime each at most 64 MiB; bundle images must fit accepted guest RAM |
 
 Package overhead reduces the maximum raw file size. The Hekate environment window preceding `0xAA000000` is preserved. Payloads must keep any required pointed-to data outside the composite package that is overwritten during installation.
 

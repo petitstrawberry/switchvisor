@@ -38,7 +38,7 @@ impl Clock for Hardware {
 
 #[repr(C, align(4096))]
 struct Storage(UnsafeCell<[u32; DMA_SIZE / 4]>);
-// Only the VM console transport mutex owner accesses the buffer; hardware DMA uses volatile words.
+// Only the EL2 USB service mutex owner accesses the buffer; hardware DMA uses volatile words.
 unsafe impl Sync for Storage {}
 static STORAGE: Storage = Storage(UnsafeCell::new([0; DMA_SIZE / 4]));
 pub struct UsbDma;
