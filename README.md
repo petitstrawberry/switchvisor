@@ -216,6 +216,9 @@ Build the host utility inside the Nix development shell:
 cargo build -p switchvisorctl --release
 ```
 
+On macOS, the development shell also provides the pinned `nxboot` command used
+for RCM payload injection.
+
 The control port remains available after the guest starts. `switchvisorctl`
 selects the CDC function by its USB interface number. If automatic selection is
 unavailable, pass `--port /dev/cu.usbmodem...` before the command or set
@@ -255,6 +258,24 @@ target/release/switchvisorctl hello
 target/release/switchvisorctl loader-status
 target/release/switchvisorctl abort
 ```
+
+### Automatic payload cycle
+
+With a no-fallback Switchvisor entry installed on the microSD card, a single
+command can return a running guest to RCM, inject Hekate, select the Switchvisor
+entry by ID, upload a raw EL1 payload, and boot it:
+
+```sh
+scripts/run-payload.sh path/to/hekate.bin path/to/payload.raw 0x100000 \
+  --entry-offset 0
+```
+
+The Hekate entry ID defaults to `SWV-NX`. Set `SWITCHVISOR_HEKATE_ID` when the
+installed entry uses another ID. `SWITCHVISOR_CONTROL_PORT` and the upload
+register options work as described above. The Hekate payload path is always
+explicit; the script does not depend on a local Hekate checkout or download
+location. On macOS the script waits for APX enumeration and IOKit interface
+readiness before invoking nxboot.
 
 ## Payload entry contract
 
