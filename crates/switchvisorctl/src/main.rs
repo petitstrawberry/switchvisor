@@ -47,6 +47,10 @@ fn control_port(explicit: Option<PathBuf>) -> Result<PathBuf, String> {
     }
     let mut candidates = Vec::new();
     for port in serialport::available_ports().map_err(|error| error.to_string())? {
+        #[cfg(target_os = "macos")]
+        if !port.port_name.starts_with("/dev/cu.") {
+            continue;
+        }
         let SerialPortType::UsbPort(info) = port.port_type else {
             continue;
         };
