@@ -165,6 +165,9 @@ extern "C" fn rust_cpu_dispatch() -> ! {
     record(Stage::Wait);
     loop {
         if let Some(launch) = with_cpu(Participant::take_launch) {
+            if cpu::interrupt::initialize().is_err() {
+                cpu::park()
+            }
             let registers = [launch.context, 0, 0, 0, 0, 0, 0, 0];
             record(Stage::Guest);
             unsafe { cpu::enter_payload(registers.as_ptr(), launch.entry, 0) }

@@ -37,7 +37,7 @@ def main():
             for target in range(1,4):
                 context=0xcafe0000+target
                 if target!=2:context|=0xfedcba98<<32
-                physical.append((0xaa081000+target*64,struct.pack('<6Q',4,context,0xfec00000,1,1,1)))
+                physical.append((0xaa081000+target*64,struct.pack('<6Q',4,context,0xfec00000,1,2 if target < 3 else 1,1)))
                 physical.append((0x80030000+target*64+16,struct.pack('<Q',1)))
             physical.append((0xaa081000+3*64+48,struct.pack('<Q',1)))
         report=payload.execute_guest(image,raw.read_bytes(),[],nonce,output/name,

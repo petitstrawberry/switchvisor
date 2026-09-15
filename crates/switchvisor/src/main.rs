@@ -121,7 +121,9 @@ fn launch_payload(payload: Payload, handoff: &[u64; 8], screen: &mut Screen) -> 
         core::ptr::write_bytes((STACK_TOP - 64 * 1024) as *mut u8, 0, 64 * 1024);
         asm!("dsb sy", "ic iallu", "dsb sy", "isb", options(nostack));
     }
-    if stage2::prepare(payload.usb_uart).is_err() || mmu::prepare().is_err() {
+    let gic = cpu::interrupt::detect_layout();
+    cpu::interrupt::select_layout(gic);
+    if stage2::prepare(payload.usb_uart, gic).is_err() || mmu::prepare().is_err() {
         let _ = writeln!(screen, "STAGE2 REJECTED: TABLE PLACEMENT");
         park()
     }
@@ -129,7 +131,12 @@ fn launch_payload(payload: Payload, handoff: &[u64; 8], screen: &mut Screen) -> 
         mmu::enable();
         stage2::enable();
     }
+    vm::interrupt::initialize(gic);
     vcpu::initialize();
+    if let Err(error) = cpu::interrupt::initialize() {
+        let _ = writeln!(screen, "VGIC INIT FAILED: {error:?}");
+        park()
+    }
     _guest_hcr.store(
         switchvisor::stage2::HCR | if payload.usb_uart { 1 << 13 } else { 0 },
         core::sync::atomic::Ordering::Release,
@@ -150,6 +157,36 @@ fn launch_payload(payload: Payload, handoff: &[u64; 8], screen: &mut Screen) -> 
     let _ = writeln!(screen, "STAGE2 ON - VMM RAM EXCLUDED");
     vcpu::record(vcpu::Stage::Guest);
     unsafe { cpu::enter_payload(registers.as_ptr(), entry, STACK_TOP) }
+}
+
+fn guest_instruction(virtual_address: u64) -> Option<u32> {
+    if virtual_address & 3 != 0 {
+        return None;
+    }
+    let saved_par: u64;
+    let translated: u64;
+    unsafe {
+        asm!("mrs {saved}, par_el1", saved = out(reg) saved_par, options(nomem, nostack));
+        asm!(
+            "at s12e1r, {address}",
+            "isb",
+            "mrs {translated}, par_el1",
+            address = in(reg) virtual_address,
+            translated = out(reg) translated,
+            options(nostack),
+        );
+        asm!("msr par_el1, {saved}", saved = in(reg) saved_par, options(nomem, nostack));
+    }
+    if translated & 1 != 0 {
+        return None;
+    }
+    let physical_address = (translated & 0x0000_ffff_ffff_f000) | (virtual_address & 0xfff);
+    if physical_address >= switchvisor::IPA_LIMIT
+        || (RESIDENT_BASE..RESIDENT_BASE + RESIDENT_SIZE).contains(&physical_address)
+    {
+        return None;
+    }
+    Some(unsafe { core::ptr::read_volatile(physical_address as *const u32) })
 }
 
 #[unsafe(no_mangle)]
@@ -181,8 +218,12 @@ extern "C" fn rust_exception(registers: &mut [u64; 31]) {
     }
     if spsr & 0xf == 5
         && ((guest_console::enabled() && esr >> 26 == 1 && esr & 1 == 0 && esr & (1 << 25) != 0)
-            || vm::mmio::emulate(esr, far, hpfar, registers))
+            || vm::mmio::emulate(esr, far, hpfar, registers)
+            || guest_instruction(elr).is_some_and(|instruction| {
+                vm::interrupt::emulate_store_post_index(esr, far, hpfar, instruction, registers)
+            }))
     {
+        cpu::interrupt::synchronize_distributor();
         guest_console::service();
         unsafe {
             asm!("msr elr_el2, {value}", "msr spsr_el2, {spsr}",

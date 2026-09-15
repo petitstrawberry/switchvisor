@@ -73,3 +73,30 @@ fn unsupported_abort_syndromes_and_outside_addresses_are_rejected() {
     }
     assert!(decode(valid | (1 << 14), mc::BASE + mc::SIZE - 4).is_some());
 }
+
+#[test]
+fn post_index_store_can_be_decoded_when_cortex_a57_omits_isv() {
+    const GICD: u64 = 0x5004_1000;
+    const ADDRESS: u64 = GICD + 0x80;
+    const STR_W9_X11_POST_4: u32 = 0xb800_4569;
+    let syndrome = (0x24 << 26) | (1 << 25) | (1 << 6) | 7;
+    let mut registers = [0; 31];
+    registers[9] = u64::MAX;
+    registers[11] = ADDRESS;
+    let (access, writeback) = Access::decode_store_post_index_region(
+        syndrome,
+        ADDRESS,
+        (ADDRESS >> 8) & !15,
+        STR_W9_X11_POST_4,
+        GICD,
+        4096,
+        &registers,
+    )
+    .unwrap();
+    assert_eq!(access.offset, 0x80);
+    assert_eq!(access.size, 4);
+    assert_eq!(access.register, 9);
+    assert_eq!(access.store_data(&registers), u64::from(u32::MAX));
+    assert_eq!(writeback.register, 11);
+    assert_eq!(writeback.value, ADDRESS + 4);
+}

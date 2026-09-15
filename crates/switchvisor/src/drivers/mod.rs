@@ -1,4 +1,5 @@
 //! Physical device drivers, separate from guest-visible virtual devices.
+pub mod interrupt;
 pub mod usb;
 
 pub trait Driver {
@@ -6,6 +7,14 @@ pub trait Driver {
     fn initialize(&mut self) -> Result<(), Self::Error>;
     /// Service available work with bounded effort; never wait for a host.
     fn poll(&mut self) -> Result<(), Self::Error>;
+}
+
+/// Physical interrupt controller used by an architecture exception vector.
+/// Taking an interrupt and maintaining its virtual state are both bounded and
+/// must never wait for another vCPU.
+pub trait InterruptController: Driver {
+    type Event;
+    fn take_interrupt(&mut self) -> Self::Event;
 }
 
 pub trait TxTransport: Driver {

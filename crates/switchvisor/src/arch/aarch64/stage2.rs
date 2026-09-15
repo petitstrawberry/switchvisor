@@ -1,4 +1,5 @@
 use core::{arch::asm, cell::UnsafeCell};
+use switchvisor::drivers::interrupt::gicv2::Layout as GicLayout;
 use switchvisor::stage2::{self, Table};
 
 // CPU0 owns construction; the tables are immutable after the EL1 handoff.
@@ -9,8 +10,10 @@ static SPLIT: SharedTable = SharedTable(UnsafeCell::new(Table::zeroed()));
 static MMIO: SharedTable = SharedTable(UnsafeCell::new(Table::zeroed()));
 static PAGES: SharedTable = SharedTable(UnsafeCell::new(Table::zeroed()));
 static CAR: SharedTable = SharedTable(UnsafeCell::new(Table::zeroed()));
+static GIC_L2: SharedTable = SharedTable(UnsafeCell::new(Table::zeroed()));
+static GIC_PAGES: SharedTable = SharedTable(UnsafeCell::new(Table::zeroed()));
 
-pub fn prepare(usb_uart: bool) -> Result<(), stage2::MapError> {
+pub fn prepare(usb_uart: bool, gic: GicLayout) -> Result<(), stage2::MapError> {
     let root = ROOT.0.get();
     let split = SPLIT.0.get();
     let mmio = MMIO.0.get();
@@ -24,13 +27,29 @@ pub fn prepare(usb_uart: bool) -> Result<(), stage2::MapError> {
             &mut *pages,
             [root as u64, split as u64, mmio as u64, pages as u64],
         )?;
+        stage2::protect_gic(
+            &mut *root,
+            &mut *mmio,
+            &mut *GIC_L2.0.get(),
+            &mut *GIC_PAGES.0.get(),
+            [GIC_L2.0.get() as u64, GIC_PAGES.0.get() as u64],
+            &[root as u64, split as u64, mmio as u64, pages as u64],
+            gic,
+        )?;
         if usb_uart {
             stage2::protect_usb(
                 &mut *mmio,
                 &mut *pages,
                 &mut *CAR.0.get(),
                 CAR.0.get() as u64,
-                [root as u64, split as u64, mmio as u64, pages as u64],
+                &[
+                    root as u64,
+                    split as u64,
+                    mmio as u64,
+                    pages as u64,
+                    GIC_L2.0.get() as u64,
+                    GIC_PAGES.0.get() as u64,
+                ],
             )?;
         }
     };

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise resident protection with guest MMU off/on and direct EL1 interrupts."""
+"""Exercise resident protection with guest MMU off/on and virtualized EL1 IRQs."""
 import argparse
 import importlib.util
 import json

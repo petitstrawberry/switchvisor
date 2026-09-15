@@ -1,5 +1,7 @@
 use switchvisor::{
-    BLOCK_SIZE, IPA_LIMIT, PAGE_SIZE, mc,
+    BLOCK_SIZE, IPA_LIMIT, PAGE_SIZE,
+    drivers::interrupt::gicv2::Layout as GicLayout,
+    mc,
     payload::{RESIDENT_BASE, RESIDENT_SIZE},
     stage2::{self, GIB, Table},
     vdev::uart,
@@ -39,6 +41,7 @@ fn translate<const N: usize>(tables: &[Table; N], ipa: u64) -> Option<(u64, u64)
                     ADDRESSES[2],
                     ADDRESSES[3],
                     RESIDENT_BASE + 0x5000,
+                    RESIDENT_BASE + 0x6000,
                 ];
                 table = tables.get(
                     addresses
@@ -58,7 +61,7 @@ fn usb_profile_traps_controllers_car_and_pmc_without_hiding_other_devices() {
     let mut tables = core::array::from_fn::<_, 5, _>(|_| Table::zeroed());
     let [root, split, mmio, pages, car] = &mut tables;
     stage2::build(root, split, mmio, pages, ADDRESSES).unwrap();
-    stage2::protect_usb(mmio, pages, car, RESIDENT_BASE + 0x5000, ADDRESSES).unwrap();
+    stage2::protect_usb(mmio, pages, car, RESIDENT_BASE + 0x5000, &ADDRESSES).unwrap();
     for (start, size) in [
         (0x60000000, BLOCK_SIZE),
         (0x70000000, BLOCK_SIZE),
@@ -100,7 +103,7 @@ fn usb_table_must_be_unique_and_resident_before_the_map_is_changed() {
     ] {
         let mut tables = core::array::from_fn::<_, 3, _>(|_| Table([0x55; 512]));
         let [mmio, pages, car] = &mut tables;
-        assert!(stage2::protect_usb(mmio, pages, car, address, ADDRESSES).is_err());
+        assert!(stage2::protect_usb(mmio, pages, car, address, &ADDRESSES).is_err());
         assert!(tables.iter().all(|table| table.0 == [0x55; 512]));
     }
 }
@@ -141,8 +144,89 @@ fn every_block_and_mc_page_is_identity_mapped_except_the_exclusions() {
     assert_eq!(tables[0].0[0] & (0xf << 2), 0);
     assert_ne!(tables[0].0[0] & (1 << 54), 0);
     assert_eq!(tables[0].0[2] & (0xf << 2), 0xf << 2);
-    assert_eq!(stage2::HCR & ((1 << 3) | (1 << 4) | (1 << 5)), 0);
+    assert_eq!(stage2::HCR & ((1 << 3) | (1 << 5)), 0);
+    assert_eq!(stage2::HCR & (1 << 4), 1 << 4);
     assert_eq!(stage2::HCR & 1, 1);
+}
+
+fn gic_map(layout: GicLayout) -> [Table; 6] {
+    let mut tables = core::array::from_fn(|_| Table::zeroed());
+    let [root, split, mmio, pages, gic_l2, gic_pages] = &mut tables;
+    stage2::build(root, split, mmio, pages, ADDRESSES).unwrap();
+    stage2::protect_gic(
+        root,
+        mmio,
+        gic_l2,
+        gic_pages,
+        [RESIDENT_BASE + 0x5000, RESIDENT_BASE + 0x6000],
+        &ADDRESSES,
+        layout,
+    )
+    .unwrap();
+    tables
+}
+
+#[test]
+fn gic_cpu_interface_is_replaced_and_control_interfaces_are_hidden() {
+    for layout in [GicLayout::QEMU_VIRT, GicLayout::TEGRA210] {
+        let tables = gic_map(layout);
+        for offset in (0..layout.distributor_size).step_by(PAGE_SIZE as usize) {
+            assert_eq!(translate(&tables, layout.distributor + offset), None);
+        }
+        for offset in (0..layout.cpu_size).step_by(PAGE_SIZE as usize) {
+            assert_eq!(
+                translate(&tables, layout.cpu + offset).map(|entry| entry.0),
+                Some(layout.virtual_cpu + offset)
+            );
+        }
+        for (base, size) in [
+            (layout.hypervisor, layout.hypervisor_size),
+            (layout.virtual_cpu, layout.virtual_cpu_size),
+        ] {
+            for offset in (0..size).step_by(PAGE_SIZE as usize) {
+                assert_eq!(translate(&tables, base + offset), None);
+            }
+        }
+        let block = layout.distributor & !(BLOCK_SIZE - 1);
+        for address in [block, block + BLOCK_SIZE - PAGE_SIZE] {
+            if !(layout.distributor..layout.distributor + layout.distributor_size)
+                .contains(&address)
+                && !(layout.cpu..layout.cpu + layout.cpu_size).contains(&address)
+                && !(layout.hypervisor..layout.hypervisor + layout.hypervisor_size)
+                    .contains(&address)
+                && !(layout.virtual_cpu..layout.virtual_cpu + layout.virtual_cpu_size)
+                    .contains(&address)
+            {
+                assert_eq!(
+                    translate(&tables, address).map(|entry| entry.0),
+                    Some(address)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn gic_map_rejects_invalid_layout_before_changing_tables() {
+    let invalid = GicLayout {
+        cpu: GicLayout::QEMU_VIRT.distributor,
+        ..GicLayout::QEMU_VIRT
+    };
+    let mut tables = core::array::from_fn::<_, 4, _>(|_| Table([0x55; 512]));
+    let [root, mmio, gic_l2, gic_pages] = &mut tables;
+    assert_eq!(
+        stage2::protect_gic(
+            root,
+            mmio,
+            gic_l2,
+            gic_pages,
+            [RESIDENT_BASE + 0x5000, RESIDENT_BASE + 0x6000],
+            &ADDRESSES,
+            invalid,
+        ),
+        Err(stage2::MapError::GicLayout)
+    );
+    assert!(tables.iter().all(|table| table.0 == [0x55; 512]));
 }
 
 #[test]

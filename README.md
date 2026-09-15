@@ -144,7 +144,7 @@ With `--usb-uart`, Switchvisor polls USB for two seconds before starting the pay
 
 Baud and line-coding settings are USB metadata. Guest transmit uses THR and polls LSR.THRE/TEMT; both stay ready even when the host is absent. RX is empty, IER reads zero, IIR reports no interrupt, and host input is discarded. The UART buffers up to 64 KiB; later bytes are dropped if that queue fills. Opening the host port asserts DTR and drains the queued logs.
 
-The polling USB profile services UART/owned-MMIO/SMC exits and traps guest WFI. USB polling is limited to once per 250 µs across all cores; queued bytes are copied only when the transport has staging space. Guest idle loops still keep the physical CPU awake, and a busy guest that makes no exits can delay USB service. Physical IRQ/FIQ/SError still pass directly to EL1. Guest USB controller accesses return an absent bus, while shared clock/reset/PMC writes preserve USB-owned resources and the XUDC SMMU client stays in bypass.
+The polling USB profile services UART/owned-MMIO/SMC exits and traps guest WFI. USB polling is limited to once per 250 µs across all cores; queued bytes are copied only when the transport has staging space. Guest idle loops still keep the physical CPU awake, and a busy guest that makes no exits can delay USB service. Ordinary IRQ forwarding does not poll USB. Guest USB controller accesses return an absent bus, while shared clock/reset/PMC writes preserve USB-owned resources and the XUDC SMMU client stays in bypass.
 
 ## Payload entry contract
 
@@ -157,7 +157,7 @@ Supply a raw binary that can execute at the fixed BL33 load address. Its file by
 | CPU state | AArch64 EL1h, DAIF masked, MMU and caches off |
 | Guest address space | GPA=HPA, 36-bit Stage-2; VMM RAM `0xFEC00000`–`0xFFC00000` is unmapped |
 | Memory discovery | MC page `0x70019000` is trapped; disabled GSC5 advertises the VMM reservation |
-| Interrupts | Physical IRQ/FIQ/SError delivered directly to EL1 |
+| Interrupts | Physical IRQs forwarded through the GICv2 virtual CPU interface; FIQ/SError remain at EL1 |
 | Firmware calls | PSCI CPU_ON, CPU_OFF, CPU-level AFFINITY_INFO and their FEATURES queries; other native SMCs forwarded; suspend unsupported |
 | x0-x7 | Original BL31 inputs, or explicit register options |
 | x8-x30 | Zero |
@@ -168,7 +168,9 @@ Package overhead reduces the maximum raw file size. The Hekate environment windo
 
 MC emulation supports aligned 32-bit loads/stores with valid AArch64 abort syndrome information, including signed loads. The virtual GSC5 address and size registers are read-only; other accesses in the MC page pass through to hardware. Unsupported MC accesses stop the payload.
 
-The initial BL33 runs on CPU0. A guest may start CPUs 1–3 through PSCI using MPIDR affinities 1–3. Each CPU enters EL2, installs private stacks/vectors and the shared memory maps, then enters the supplied guest address at EL1h with MMU/caches off and DAIF masked. x0 receives the context, x1-x30 are zero, and SP_EL1 is zero; the secondary entry must install its own stack. CPU_ON entry addresses must be 4-byte aligned, in Normal guest memory, and outside the VMM region. CPU_OFF leaves the physical CPU waiting in EL2 for another virtual CPU_ON. Physical timers and IPIs remain assigned to the guest.
+The initial BL33 runs on CPU0. A guest may start CPUs 1–3 through PSCI using MPIDR affinities 1–3. Each CPU enters EL2, installs private stacks/vectors and the shared memory maps, then enters the supplied guest address at EL1h with MMU/caches off and DAIF masked. x0 receives the context, x1-x30 are zero, and SP_EL1 is zero; the secondary entry must install its own stack. CPU_ON entry addresses must be 4-byte aligned, in Normal guest memory, and outside the VMM region. CPU_OFF leaves the physical CPU waiting in EL2 for another virtual CPU_ON. Physical timers and IPIs remain assigned to the guest and are forwarded through vGICv2.
+
+Guest software keeps the platform GICv2 MMIO addresses. Stage-2 maps the guest GICC range to the hardware GICV interface, so guest interrupt acknowledge and EOI do not exit to EL2. A physical IRQ enters EL2 once to populate a hardware List Register; the GIC then handles guest delivery and PPI/SPI deactivation.
 
 Keep the VMM region out of bootloader allocations, OS memory banks, and device DMA buffers. A CPU access to this region faults at EL2 and parks the faulting CPU. Stage-2 does not constrain device DMA. The fixed VMM placement requires usable RAM throughout that region on the target boot configuration.
 

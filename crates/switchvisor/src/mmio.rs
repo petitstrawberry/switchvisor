@@ -1,4 +1,4 @@
-//! Decode the supported AArch64 Stage-2 MMIO aborts without reading guest instructions.
+//! Decode the supported AArch64 Stage-2 MMIO aborts.
 use crate::{IPA_LIMIT, mc};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -9,6 +9,12 @@ pub struct Access {
     pub sign_extend: bool,
     pub size: u8,
     pub wide: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Writeback {
+    pub register: usize,
+    pub value: u64,
 }
 
 impl Access {
@@ -30,11 +36,7 @@ impl Access {
         {
             return None;
         }
-        let mask = ((IPA_LIMIT - 1) >> 8) & !0xf;
-        if hpfar & !mask != 0 {
-            return None;
-        }
-        let ipa = ((hpfar & mask) << 8) | (far & 0xfff);
+        let ipa = ipa(far, hpfar)?;
         let size = 1u8 << ((esr >> 22) & 3);
         let offset = ipa.checked_sub(base)?;
         if offset.checked_add(u64::from(size))? > length || offset % u64::from(size) != 0 {
@@ -57,6 +59,66 @@ impl Access {
             size,
             wide,
         })
+    }
+
+    /// Decode an integer STR with post-index writeback when hardware omits the
+    /// instruction syndrome. Arm permits ISV=0 for this addressing form, as
+    /// observed from U-Boot's GIC distributor initialization on Cortex-A57.
+    pub fn decode_store_post_index_region(
+        esr: u64,
+        far: u64,
+        hpfar: u64,
+        instruction: u32,
+        base: u64,
+        length: u64,
+        registers: &[u64; 31],
+    ) -> Option<(Self, Writeback)> {
+        // Lower-EL AArch64 data abort, valid FAR, write translation fault at
+        // level 2/3, with no architected instruction syndrome.
+        if esr >> 26 != 0x24
+            || esr & (1 << 25) == 0
+            || esr & (1 << 24) != 0
+            || esr & 0x780 != 0
+            || esr & (1 << 6) == 0
+            || !matches!(esr & 0x3f, 6 | 7)
+            // STR{B,H,W,X} Rt, [Xn], #simm9. SIMD/FP and loads are excluded.
+            || instruction & 0x3fe0_0c00 != 0x3800_0400
+        {
+            return None;
+        }
+        let source = (instruction & 31) as usize;
+        let address_register = ((instruction >> 5) & 31) as usize;
+        // SP writeback needs separate architectural state. Overlap is
+        // constrained-unpredictable and is rejected rather than guessed.
+        if address_register == 31 || address_register == source {
+            return None;
+        }
+        let virtual_address = registers[address_register];
+        if virtual_address != far {
+            return None;
+        }
+        let size = 1u8 << (instruction >> 30);
+        let physical_address = ipa(far, hpfar)?;
+        let offset = physical_address.checked_sub(base)?;
+        if offset.checked_add(u64::from(size))? > length || offset % u64::from(size) != 0 {
+            return None;
+        }
+        let immediate = ((instruction >> 12) & 0x1ff) as i16;
+        let immediate = (immediate << 7) >> 7;
+        Some((
+            Self {
+                offset,
+                register: source,
+                write: true,
+                sign_extend: false,
+                size,
+                wide: size == 8,
+            },
+            Writeback {
+                register: address_register,
+                value: virtual_address.wrapping_add_signed(i64::from(immediate)),
+            },
+        ))
     }
 
     pub fn store_value(self, registers: &[u64; 31]) -> u32 {
@@ -89,4 +151,9 @@ impl Access {
             };
         }
     }
+}
+
+fn ipa(far: u64, hpfar: u64) -> Option<u64> {
+    let mask = ((IPA_LIMIT - 1) >> 8) & !0xf;
+    (hpfar & !mask == 0).then_some(((hpfar & mask) << 8) | (far & 0xfff))
 }

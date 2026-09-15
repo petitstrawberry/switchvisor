@@ -4,7 +4,9 @@
 //! This describes CPU access permissions, not DMA isolation or a hardware RAM audit.
 
 use crate::{
-    BLOCK_SIZE, IPA_LIMIT, PAGE_SIZE, mc,
+    BLOCK_SIZE, IPA_LIMIT, PAGE_SIZE,
+    drivers::interrupt::gicv2::Layout as GicLayout,
+    mc,
     payload::{RESIDENT_BASE, RESIDENT_SIZE},
     vdev::uart,
 };
@@ -13,9 +15,9 @@ pub const GIB: u64 = 1 << 30;
 pub const ENTRIES: usize = 512;
 pub const RAM_BASE: u64 = 0x8000_0000;
 pub const VTCR: u64 = (1 << 31) | (1 << 16) | (3 << 12) | (1 << 10) | (1 << 8) | (1 << 6) | 28;
-// Physical IRQ/FIQ/SError remain at EL1. Trap SMC for virtual CPU power state
-// and protected EL2 secondary entry; other native services are forwarded.
-pub const HCR: u64 = (1 << 31) | (1 << 19) | 1;
+// Route physical IRQs to EL2 for hardware-assisted GICv2 forwarding. FIQ and
+// SError remain at EL1. Trap SMC for virtual CPU power state.
+pub const HCR: u64 = (1 << 31) | (1 << 19) | (1 << 4) | 1;
 pub const VMID: u64 = 1;
 pub const SPLIT_INDEX: usize = (RESIDENT_BASE / GIB) as usize;
 pub const MC_INDEX: usize = (mc::BASE / GIB) as usize;
@@ -37,6 +39,7 @@ impl Table {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MapError {
     TablePlacement,
+    GicLayout,
 }
 
 fn resident_table(address: u64) -> bool {
@@ -98,7 +101,7 @@ pub fn protect_usb(
     pages: &mut Table,
     car: &mut Table,
     address: u64,
-    existing: [u64; 4],
+    existing: &[u64],
 ) -> Result<(), MapError> {
     use crate::vdev::usb_ownership::{self as ownership, CAR, PMC_PAGE};
     if !resident_table(address) || existing.contains(&address) {
@@ -117,5 +120,107 @@ pub fn protect_usb(
         *entry = if ipa == CAR { 0 } else { ipa | DEVICE | 2 };
     }
     mmio.0[((CAR % GIB) / BLOCK_SIZE) as usize] = address | 3;
+    Ok(())
+}
+
+fn page_range(base: u64, size: u64) -> Option<core::ops::Range<u64>> {
+    let end = base.checked_add(size)?;
+    (base % PAGE_SIZE == 0
+        && size != 0
+        && size % PAGE_SIZE == 0
+        && end <= IPA_LIMIT
+        && base / BLOCK_SIZE == (end - 1) / BLOCK_SIZE)
+        .then_some(base..end)
+}
+
+/// Trap the guest distributor, expose GICV at the guest's original GICC IPA,
+/// and hide the physical GICH/GICV windows. Both extra tables live in VMM RAM.
+pub fn protect_gic(
+    root: &mut Table,
+    mmio: &mut Table,
+    gic_l2: &mut Table,
+    gic_pages: &mut Table,
+    addresses: [u64; 2],
+    existing: &[u64],
+    layout: GicLayout,
+) -> Result<(), MapError> {
+    for (index, &address) in addresses.iter().enumerate() {
+        if !resident_table(address)
+            || existing.contains(&address)
+            || addresses[..index].contains(&address)
+        {
+            return Err(MapError::TablePlacement);
+        }
+    }
+    let ranges = [
+        page_range(layout.distributor, layout.distributor_size),
+        page_range(layout.cpu, layout.cpu_size),
+        page_range(layout.hypervisor, layout.hypervisor_size),
+        page_range(layout.virtual_cpu, layout.virtual_cpu_size),
+    ];
+    let [
+        Some(distributor),
+        Some(cpu),
+        Some(hypervisor),
+        Some(virtual_cpu),
+    ] = ranges
+    else {
+        return Err(MapError::GicLayout);
+    };
+    if layout.cpu_size > layout.virtual_cpu_size {
+        return Err(MapError::GicLayout);
+    }
+    let block_base = layout.distributor & !(BLOCK_SIZE - 1);
+    if [layout.cpu, layout.hypervisor, layout.virtual_cpu]
+        .iter()
+        .any(|base| *base & !(BLOCK_SIZE - 1) != block_base)
+    {
+        return Err(MapError::GicLayout);
+    }
+    let all = [&distributor, &cpu, &hypervisor, &virtual_cpu];
+    for index in 0..all.len() {
+        for other in &all[index + 1..] {
+            if all[index].start < other.end && other.start < all[index].end {
+                return Err(MapError::GicLayout);
+            }
+        }
+    }
+
+    let gib_index = (block_base / GIB) as usize;
+    let block_index = ((block_base % GIB) / BLOCK_SIZE) as usize;
+    if gib_index != MC_INDEX && (gib_index == SPLIT_INDEX || root.0[gib_index] & 3 != 1) {
+        return Err(MapError::GicLayout);
+    }
+
+    gic_l2.0.fill(0);
+    gic_pages.0.fill(0);
+    for (index, descriptor) in gic_pages.0.iter_mut().enumerate() {
+        let address = block_base + index as u64 * PAGE_SIZE;
+        *descriptor = address | DEVICE | 2;
+    }
+    for address in distributor.step_by(PAGE_SIZE as usize) {
+        gic_pages.0[((address - block_base) / PAGE_SIZE) as usize] = 0;
+    }
+    for offset in (0..layout.cpu_size).step_by(PAGE_SIZE as usize) {
+        let ipa = layout.cpu + offset;
+        gic_pages.0[((ipa - block_base) / PAGE_SIZE) as usize] =
+            (layout.virtual_cpu + offset) | DEVICE | 2;
+    }
+    for range in [hypervisor, virtual_cpu] {
+        for address in range.step_by(PAGE_SIZE as usize) {
+            gic_pages.0[((address - block_base) / PAGE_SIZE) as usize] = 0;
+        }
+    }
+
+    if gib_index == MC_INDEX {
+        mmio.0[block_index] = addresses[1] | 3;
+    } else {
+        let gib_base = gib_index as u64 * GIB;
+        for (index, descriptor) in gic_l2.0.iter_mut().enumerate() {
+            *descriptor = (gib_base + index as u64 * BLOCK_SIZE) | DEVICE;
+        }
+        gic_l2.0[block_index] = addresses[1] | 3;
+        root.0[gib_index] = addresses[0] | 3;
+    }
     Ok(())
 }

@@ -1,5 +1,5 @@
-// Four EL1 CPUs: independent MC traps, banked timers, physical SGIs, virtual
-// off/on, and invalid CPU_ON requests. SV_FAULT selects one AP for a VMM fault.
+// Four EL1 CPUs: independent MC traps, virtualized timers/SGIs, virtual off/on,
+// and invalid CPU_ON requests. SV_FAULT selects one AP for a VMM fault.
 .text
 .org 0x40
     mrs x9, CurrentEL
@@ -78,7 +78,7 @@
     b wait_forever // the host inspects the faulting AP instead of CPU0.
 .else
     bl uart_output
-    // Send a physical SGI to all three APs, without vGIC emulation.
+    // Send a physical SGI to all three APs; EL2 preserves its source in a vLR.
     ldr x9, =0x08000f00
     ldr w10, =0x000e0001
     str w10, [x9]
@@ -87,6 +87,18 @@
     ldr x9, =(0xaa081000 + \cpu * 64 + 40)
 1:  ldr x10, [x9]
     cbz x10, 1b
+    .endr
+    // A second SGI verifies that maintenance handling deactivated the first
+    // physical SGI after the guest acknowledged its software vLR.
+    ldr x9, =0x08000f00
+    ldr w10, =0x00060001
+    str w10, [x9]
+    dsb sy
+    .irp cpu,1,2
+    ldr x9, =(0xaa081000 + \cpu * 64 + 32)
+1:  ldr x10, [x9]
+    cmp x10, #2
+    b.lo 1b
     .endr
     // AP3 powers off virtually, then re-enters with a new context.
 affinity_off:

@@ -168,7 +168,7 @@ pub fn pack(args: &[OsString]) -> Result<Value, String> {
     Ok(json!({
         "kind":"el1-raw-payload", "hardware_validated":false, "stage2_enabled":true,
         "stage2":{"ipa_equals_pa":true,"ipa_bits":36,"resident_size_bytes":RESIDENT_SIZE,
-            "physical_interrupts":"el1","cpu_count":switchvisor::psci::CPU_COUNT,
+            "physical_interrupts":"vgicv2","cpu_count":switchvisor::psci::CPU_COUNT,
             "mc_trap_base":format!("{:#x}",switchvisor::mc::BASE), "virtual_carveout":"gsc5"},
         "output":output.display().to_string(), "sha256":digest(&bytes), "file_size_bytes":bytes.len(),
         "bootstrap":{"load_base":format!("{LOAD_BASE:#x}"), "resident_base":format!("{RESIDENT_BASE:#x}"),

@@ -84,10 +84,57 @@ _start:
 .balign 2048
 .global _el2_vectors
 _el2_vectors:
-    .rept 16
+    // Lower AArch64 IRQ has a short integer-only path. All other exceptions
+    // retain the diagnostic frame and common Rust dispatcher.
+    .rept 9
     b .Lexception
     .balign 128
     .endr
+    b .Lirq
+    .balign 128
+    .rept 6
+    b .Lexception
+    .balign 128
+    .endr
+.Lirq:
+    msr daifset, #15
+    // AAPCS64 preserves x19-x29. Save the caller-clobbered guest registers,
+    // x19 used as our frame pointer, and LR before calling Rust.
+    sub sp, sp, #176
+    stp x0, x1, [sp, #0]
+    stp x2, x3, [sp, #16]
+    stp x4, x5, [sp, #32]
+    stp x6, x7, [sp, #48]
+    stp x8, x9, [sp, #64]
+    stp x10, x11, [sp, #80]
+    stp x12, x13, [sp, #96]
+    stp x14, x15, [sp, #112]
+    stp x16, x17, [sp, #128]
+    stp x18, x19, [sp, #144]
+    str x30, [sp, #160]
+    mov x19, sp
+    mrs x11, mpidr_el1
+    and x11, x11, #0xff
+    msr spsel, #1
+    adrp x9, __exception_stack_top
+    add x9, x9, :lo12:__exception_stack_top
+    add x9, x9, x11, lsl #14
+    mov sp, x9
+    bl rust_irq
+    mov sp, x19
+    ldp x0, x1, [sp, #0]
+    ldp x2, x3, [sp, #16]
+    ldp x4, x5, [sp, #32]
+    ldp x6, x7, [sp, #48]
+    ldp x8, x9, [sp, #64]
+    ldp x10, x11, [sp, #80]
+    ldp x12, x13, [sp, #96]
+    ldp x14, x15, [sp, #112]
+    ldp x16, x17, [sp, #128]
+    ldp x18, x19, [sp, #144]
+    ldr x30, [sp, #160]
+    add sp, sp, #176
+    eret
 .Lexception:
     msr daifset, #15
     sub sp, sp, #256
@@ -154,7 +201,7 @@ _el2_vectors:
     b .Lexception_park
 
 // Raw BL33 entry. The existing bootloader establishes its own runtime after this handoff.
-// Stage-2 identity map, physical interrupts passed directly to EL1.
+// Stage-2 identity map with the virtual GIC CPU interface at the native GPA.
 .section .text.handoff, "ax"
 .global enter_payload
 .type enter_payload, %function
@@ -195,8 +242,8 @@ enter_payload:
     msr vpidr_el2, x10
     mrs x10, mpidr_el1
     msr vmpidr_el2, x10
-    // RW | VM | TSC, plus TWI only for the polling USB console profile.
-    // No IMO/FMO/AMO: physical exceptions remain at EL1.
+    // RW | VM | TSC | IMO, plus TWI only for the polling USB console profile.
+    // Physical IRQs enter the short EL2 forwarding path; FIQ/SError remain EL1.
     adrp x10, _guest_hcr
     add x10, x10, :lo12:_guest_hcr
     ldr x10, [x10]

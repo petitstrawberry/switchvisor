@@ -1,6 +1,7 @@
 //! EL2 entry, translation control and cache-off synchronization.
 use core::arch::{asm, global_asm};
 
+pub mod interrupt;
 pub mod mmu;
 pub mod stage2;
 pub mod sync;

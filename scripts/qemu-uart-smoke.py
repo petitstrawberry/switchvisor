@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise virtual UART, USB MMIO ownership and WFI/physical IRQs on QEMU A57."""
+"""Exercise virtual UART, USB MMIO ownership and WFI/vGIC IRQs on QEMU A57."""
 import argparse
 import importlib.util
 import json

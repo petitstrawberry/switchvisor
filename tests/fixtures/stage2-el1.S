@@ -67,10 +67,17 @@ entry:
     ldr x10, =SV_ADDRESS
     br x10
     b failure
-.elseif SV_ACTION == 4 // Physical CNTP interrupt goes straight to the EL1 GIC/vector.
+.elseif SV_ACTION == 4 // Physical CNTP is reinjected through a hardware vGIC LR.
     mov x9, #0x08000000
     mov w10, #1
     str w10, [x9]
+    add x12, x9, #0x80
+    mov w13, #-1
+    str w13, [x12], #4 // U-Boot uses this writeback form for GICD_IGROUPR.
+    add x14, x9, #0x84
+    cmp x12, x14
+    b.ne failure
+    str wzr, [x9, #0x80]
     mov w10, #0x40000000
     str w10, [x9, #0x100]
     mov x9, #0x08010000

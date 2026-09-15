@@ -1,4 +1,5 @@
 //! Guest-visible virtual devices. Physical device drivers live under `drivers`.
+pub mod gicv2;
 pub mod uart;
 pub mod usb_ownership;
 
@@ -36,6 +37,16 @@ pub fn emulate(
     let Some(access) = Access::decode_region(esr, far, hpfar, region.base, region.size) else {
         return false;
     };
+    emulate_access(device, access, registers)
+}
+
+/// Dispatch an access that was decoded from the faulting instruction because
+/// the hardware did not provide a valid instruction syndrome in ESR_EL2.
+pub fn emulate_access(
+    device: &mut dyn VirtualDevice,
+    access: Access,
+    registers: &mut [u64; 31],
+) -> bool {
     if access.write {
         device
             .write(access.offset, access.size, access.store_data(registers))
