@@ -117,7 +117,11 @@ pub fn protect_usb(
     let base = CAR & !(BLOCK_SIZE - 1);
     for (index, entry) in car.0.iter_mut().enumerate() {
         let ipa = base + index as u64 * PAGE_SIZE;
-        *entry = if ipa == CAR { 0 } else { ipa | DEVICE | 2 };
+        *entry = if matches!(ipa, CAR | ownership::LIC) {
+            0
+        } else {
+            ipa | DEVICE | 2
+        };
     }
     mmio.0[((CAR % GIB) / BLOCK_SIZE) as usize] = address | 3;
     Ok(())

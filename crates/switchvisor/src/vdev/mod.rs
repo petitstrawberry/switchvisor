@@ -1,5 +1,6 @@
 //! Guest-visible virtual devices. Physical device drivers live under `drivers`.
 pub mod gicv2;
+pub mod lic;
 pub mod uart;
 pub mod usb_ownership;
 

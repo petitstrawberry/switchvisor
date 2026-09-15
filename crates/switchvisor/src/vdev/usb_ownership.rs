@@ -1,6 +1,7 @@
 //! CPU MMIO ownership for the EL2 USB 2.0 device path; no device DMA isolation.
 
 pub use crate::drivers::usb::tegra210::{CAR, DEV_ASID, PMC};
+pub const LIC: u64 = super::lic::BASE;
 pub const PMC_PAGE: u64 = PMC & !4095;
 pub const CONTROLLERS: [(u64, u64); 3] = [
     (0x7009_0000, 0x10000),  // XUSB host and PADCTL.
