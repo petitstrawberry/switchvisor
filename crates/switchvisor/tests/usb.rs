@@ -4,19 +4,21 @@ use switchvisor::vdev::usb_ownership::{self as ownership, CAR, PMC};
 use switchvisor::{
     drivers::{
         Clock, DmaBuffer, Driver, Mmio, RxTransport, TxTransport,
-        usb::tegra210::{DEV, DMA_SIZE, Error, Xudc},
+        usb::tegra210::{Channel, DEV, DMA_SIZE, Error, Xudc},
     },
     payload::RESIDENT_BASE,
 };
 
 const BASE: u64 = RESIDENT_BASE + 0x200000;
-const RINGS: [usize; 4] = [0x200, 0x400, 0x300, 0x500];
-const EPS: [u32; 4] = [0, 2, 3, 5];
+const RINGS: [usize; 9] = [
+    0x200, 0x300, 0x400, 0x500, 0x600, 0x700, 0x800, 0x900, 0xa00,
+];
+const EPS: [u32; 9] = [0, 2, 3, 5, 6, 7, 9, 10, 11];
 struct State {
     registers: BTreeMap<u64, u32>,
     dma: [u32; DMA_SIZE / 4],
     writes: Vec<(u64, u32)>,
-    latest: [u64; 4],
+    latest: [u64; 9],
     event: usize,
     cycle: u32,
     time: u64,
@@ -34,7 +36,7 @@ impl Mock {
             registers: BTreeMap::new(),
             dma: [0; DMA_SIZE / 4],
             writes: vec![],
-            latest: [0; 4],
+            latest: [0; 9],
             event: 0,
             cycle: 1,
             time: 10_000,
@@ -166,8 +168,8 @@ impl DmaBuffer for Buffer {
         let mut state = self.mock.0.borrow_mut();
         let old = state.dma[offset / 4];
         state.dma[offset / 4] = value;
-        if (0x800..0x980).contains(&offset) && offset % 64 == 0 && old != value {
-            let mask = 1 << ((offset - 0x800) / 64);
+        if (0x1000..0x1300).contains(&offset) && offset % 64 == 0 && old != value {
+            let mask = 1 << ((offset - 0x1000) / 64);
             let old = state.registers.get(&(DEV + 0x5c)).copied().unwrap_or(0);
             state.registers.insert(DEV + 0x5c, old | mask);
         }
@@ -218,7 +220,7 @@ fn initialization_uses_resident_dram_and_enables_physical_usb_irq() {
     assert!(!usb.connected());
     assert_ne!(state.registers[&(DEV + 0x30)] & (1 << 4), 0);
     assert_eq!(state.registers[&(DEV + 0x9188)] & (1 << 16), 0);
-    assert_eq!(state.registers[&(DEV + 0x40)], (BASE + 0x800) as u32);
+    assert_eq!(state.registers[&(DEV + 0x40)], (BASE + 0x1000) as u32);
     assert_eq!(state.registers[&ownership::DEV_ASID], 0);
     // Device attachment requires the override's value, not just its enable.
     let vbus_id = state.registers[&0x7009fc60];
@@ -281,7 +283,7 @@ fn host_enumeration_descriptors_address_and_control_stages_work() {
     let (mut usb, mock) = new();
     mock.setup(0x80, 6, 0x100, 0, 8);
     usb.poll().unwrap();
-    assert_eq!(mock.bytes(0xa00, 8), [18, 1, 0, 2, 0xef, 2, 1, 64]);
+    assert_eq!(mock.bytes(0x1400, 8), [18, 1, 0, 2, 0xef, 2, 1, 64]);
     assert_eq!(mock.trb(0)[2], 8);
     mock.complete(0, 0, 1);
     usb.poll().unwrap();
@@ -297,10 +299,76 @@ fn host_enumeration_descriptors_address_and_control_stages_work() {
     configured(&mut usb, &mock, true);
     mock.setup(0x80, 6, 0x200, 0, 255);
     usb.poll().unwrap();
-    let bytes = mock.bytes(0xa00, 75);
-    assert_eq!(&bytes[..9], &[9, 2, 75, 0, 2, 1, 0, 0xc0, 1]);
-    assert_eq!(&bytes[71..74], &[2, 0, 2]);
-    assert_eq!(mock.0.borrow().dma[(0x800 + 3 * 64 + 4) / 4] >> 16, 512);
+    let bytes = mock.bytes(0x1400, 164);
+    assert_eq!(&bytes[..9], &[9, 2, 164, 0, 5, 1, 0, 0xc0, 1]);
+    let mut endpoints = Vec::new();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        let length = usize::from(bytes[cursor]);
+        assert!(length >= 2 && cursor + length <= bytes.len());
+        if bytes[cursor + 1] == 5 {
+            endpoints.push(bytes[cursor + 2]);
+        }
+        cursor += length;
+    }
+    assert_eq!(endpoints, [0x82, 0x01, 0x81, 0x84, 0x03, 0x83, 0x05, 0x85]);
+    assert_eq!(mock.0.borrow().dma[(0x1000 + 3 * 64 + 4) / 4] >> 16, 512);
+}
+
+#[test]
+fn composite_channels_have_independent_connection_and_storage() {
+    let (mut usb, mock) = new();
+    configured(&mut usb, &mock, true);
+    assert!(!usb.connected_channel(Channel::Control));
+    assert!(usb.connected_channel(Channel::Loader));
+
+    mock.setup(0x21, 0x22, 1, 2, 0);
+    usb.poll().unwrap();
+    mock.complete(0, 0, 1);
+    usb.poll().unwrap();
+    assert!(usb.connected_channel(Channel::Control));
+
+    assert_eq!(usb.send_channel(Channel::Control, b"status\n"), Ok(7));
+    assert_eq!(mock.bytes(0x1e00, 7), b"status\n");
+    assert_eq!(usb.send_channel(Channel::Loader, b"reply"), Ok(5));
+    assert_eq!(mock.bytes(0x4000, 5), b"reply");
+
+    let control_input = b"ping\n";
+    mock.put_bytes(0x1c00, control_input);
+    mock.complete(6, 512 - control_input.len() as u32, 13);
+    usb.poll().unwrap();
+    let mut received = [0; 16];
+    let count = usb
+        .receive_channel(Channel::Control, &mut received)
+        .unwrap();
+    assert_eq!(&received[..count], control_input);
+
+    let loader_input = b"loader frame";
+    mock.put_bytes(0x3000, loader_input);
+    mock.complete(10, 4096 - loader_input.len() as u32, 13);
+    usb.poll().unwrap();
+    let count = usb.receive_channel(Channel::Loader, &mut received).unwrap();
+    assert_eq!(&received[..count], loader_input);
+}
+
+#[test]
+fn loader_out_accepts_a_full_message_buffer_and_rearms() {
+    let (mut usb, mock) = new();
+    configured(&mut usb, &mock, true);
+    let input: Vec<u8> = (0..4096).map(|index| index as u8).collect();
+    mock.put_bytes(0x3000, &input);
+    let previous = mock.0.borrow().latest[7];
+    mock.complete(10, 0, 1);
+    usb.poll().unwrap();
+
+    let mut output = vec![0; 4096];
+    assert_eq!(
+        usb.receive_channel(Channel::Loader, &mut output),
+        Ok(output.len())
+    );
+    assert_eq!(output, input);
+    assert_ne!(mock.0.borrow().latest[7], previous);
+    assert_eq!(mock.trb(10)[2], 4096);
 }
 
 #[test]
@@ -313,7 +381,7 @@ fn bulk_output_is_nonblocking_and_exact_packets_get_a_zlp() {
         let bytes = vec![0x5a; if high { 512 } else { 64 }];
         assert_eq!(usb.send(&bytes), Ok(bytes.len()));
         assert_eq!(usb.send_capacity(), 0);
-        assert_eq!(mock.bytes(0xc00, bytes.len()), bytes);
+        assert_eq!(mock.bytes(0x1800, bytes.len()), bytes);
         assert_eq!(usb.send(b"not idle\n"), Ok(0));
         mock.complete(3, 0, 1);
         usb.poll().unwrap();
@@ -347,7 +415,7 @@ fn closing_and_reopening_the_host_port_preserves_pending_tx_storage() {
         assert_eq!(usb.send(b"blocked\n"), Ok(0));
     }
     assert_eq!(mock.0.borrow().latest[2], pointer);
-    assert_eq!(mock.bytes(0xc00, 8), b"pending\n");
+    assert_eq!(mock.bytes(0x1800, 8), b"pending\n");
 
     mock.complete(3, 0, 1);
     usb.poll().unwrap();
@@ -358,7 +426,7 @@ fn closing_and_reopening_the_host_port_preserves_pending_tx_storage() {
     usb.poll().unwrap();
     assert_eq!(usb.send_capacity(), 512);
     assert_eq!(usb.send(b"resumed\n"), Ok(8));
-    assert_eq!(mock.bytes(0xc00, 8), b"resumed\n");
+    assert_eq!(mock.bytes(0x1800, 8), b"resumed\n");
 }
 
 #[test]
@@ -371,8 +439,8 @@ fn line_coding_is_metadata_and_host_input_waits_for_transport_rx() {
     let coding = [0x80, 0x25, 0, 0, 0, 0, 8];
     {
         let mut state = mock.0.borrow_mut();
-        state.dma[0xa00 / 4] = u32::from_le_bytes(coding[..4].try_into().unwrap());
-        state.dma[0xa04 / 4] = u32::from_le_bytes([0, 0, 8, 0]);
+        state.dma[0x1400 / 4] = u32::from_le_bytes(coding[..4].try_into().unwrap());
+        state.dma[0x1404 / 4] = u32::from_le_bytes([0, 0, 8, 0]);
     }
     mock.complete(0, 0, 13);
     usb.poll().unwrap();
@@ -381,9 +449,9 @@ fn line_coding_is_metadata_and_host_input_waits_for_transport_rx() {
     usb.poll().unwrap();
     mock.setup(0xa1, 0x21, 0, 0, 7);
     usb.poll().unwrap();
-    assert_eq!(mock.bytes(0xa00, 7), coding);
+    assert_eq!(mock.bytes(0x1400, 7), coding);
     let input = b"host input\n";
-    mock.put_bytes(0xe00, input);
+    mock.put_bytes(0x1600, input);
     let previous = mock.0.borrow().latest[1];
     mock.complete(2, 512 - input.len() as u32, 13);
     usb.poll().unwrap();

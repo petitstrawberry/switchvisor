@@ -6,7 +6,7 @@
 //! Copyright (c) 2018 naehrwert; 2018-2026 CTCaer (clock implementation).
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use super::cdc::{Acm, CONTROL_SIZE, Reply, Setup};
+use super::composite::{CONTROL_SIZE, Composite, Reply, Setup};
 use crate::{
     drivers::{Clock, DmaBuffer, Driver, Mmio, RxTransport, TxTransport},
     payload::{RESIDENT_BASE, RESIDENT_SIZE},
@@ -16,18 +16,27 @@ pub const CAR: u64 = 0x6000_6000;
 pub const PMC: u64 = 0x7000_e400;
 pub const DEV_ASID: u64 = crate::mc::BASE + 0x28c;
 pub const DEV: u64 = 0x700d_0000;
+pub const INTERRUPT_ID: u32 = 32 + 44;
 const PAD: u64 = 0x7009_f000;
 const VBUS_ON: u32 = 1 << 14;
-pub const DMA_SIZE: usize = 8192;
+pub const DMA_SIZE: usize = 32 * 1024;
 const EVENT0: usize = 0;
 const EVENT1: usize = 0x100;
-const CONTEXT: usize = 0x800;
-const CONTROL: usize = 0xa00;
-const TX_BUFFER: usize = 0xc00;
-const RX_BUFFER: usize = 0xe00;
-const NOTIFY_BUFFER: usize = 0x1000;
-const RING_BASES: [usize; 4] = [0x200, 0x400, 0x300, 0x500];
-const ENDPOINTS: [u8; 4] = [0, 2, 3, 5];
+const CONTEXT: usize = 0x1000;
+const CONTROL: usize = 0x1400;
+const RING_BASES: [usize; 9] = [
+    0x200, 0x300, 0x400, 0x500, 0x600, 0x700, 0x800, 0x900, 0xa00,
+];
+const ENDPOINTS: [u8; 9] = [0, 2, 3, 5, 6, 7, 9, 10, 11];
+const ENDPOINT_KINDS: [u32; 9] = [4, 2, 6, 7, 2, 6, 7, 2, 6];
+const OUT_RINGS: [usize; 3] = [1, 4, 7];
+const IN_RINGS: [usize; 3] = [2, 5, 8];
+const NOTIFY_RINGS: [usize; 2] = [3, 6];
+const RX_BUFFERS: [usize; 3] = [0x1600, 0x1c00, 0x3000];
+const TX_BUFFERS: [usize; 3] = [0x1800, 0x1e00, 0x4000];
+const RX_CAPACITIES: [usize; 3] = [512, 512, 4096];
+const TX_CAPACITIES: [usize; 3] = [512, 512, 512];
+const NOTIFY_BUFFERS: [usize; 2] = [0x1a00, 0x2000];
 const PORT_CHANGES: u32 = (1 << 17) | (1 << 19) | (1 << 21) | (1 << 22) | (1 << 23);
 const XHCI_CTRL_IE: u32 = 1 << 4;
 const XHCI_ST_IP: u32 = 1 << 4;
@@ -66,6 +75,23 @@ pub struct Snapshot {
     pub ep0_state: u32,
     pub configuration: u8,
     pub dtr: bool,
+    pub control_dtr: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+pub enum Channel {
+    Console = 0,
+    Control = 1,
+    Loader = 2,
+}
+
+impl Channel {
+    const ALL: [Self; 3] = [Self::Console, Self::Control, Self::Loader];
+
+    const fn index(self) -> usize {
+        self as usize
+    }
 }
 
 struct Ring {
@@ -86,7 +112,7 @@ impl Ring {
 #[derive(Clone, Copy)]
 enum ControlPhase {
     In { zlp: bool },
-    OutLine,
+    OutLine(usize),
     Status,
     Zlp,
 }
@@ -97,22 +123,52 @@ struct Receive {
     length: usize,
 }
 
-/// Hardware access, DMA storage and console transport are independent contracts.
+#[derive(Clone, Copy)]
+struct ChannelState {
+    tx: Option<(u64, usize)>,
+    out: Option<u64>,
+    rx: Option<Receive>,
+    zlp_needed: bool,
+}
+
+impl ChannelState {
+    const fn new() -> Self {
+        Self {
+            tx: None,
+            out: None,
+            rx: None,
+            zlp_needed: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Notification {
+    transfer: Option<u64>,
+    needed: bool,
+}
+
+impl Notification {
+    const fn new() -> Self {
+        Self {
+            transfer: None,
+            needed: false,
+        }
+    }
+}
+
+/// Hardware access, DMA storage and logical USB channels are independent contracts.
 pub struct Xudc<H, D> {
     hardware: H,
     dma: D,
-    rings: [Ring; 4],
-    acm: Acm,
+    rings: [Ring; 9],
+    device: Composite,
     event: usize,
     event_cycle: u32,
     sequence: u16,
     control: Option<(u64, ControlPhase)>,
-    tx: Option<(u64, usize)>,
-    out: Option<u64>,
-    rx: Option<Receive>,
-    notify: Option<u64>,
-    notification_needed: bool,
-    zlp_needed: bool,
+    channels: [ChannelState; 3],
+    notifications: [Notification; 2],
     high_speed: bool,
     initialized: bool,
     failed: bool,
@@ -124,18 +180,14 @@ impl<H, D> Xudc<H, D> {
         Self {
             hardware,
             dma,
-            rings: [const { Ring::new() }; 4],
-            acm: Acm::new(),
+            rings: [const { Ring::new() }; 9],
+            device: Composite::new(),
             event: 0,
             event_cycle: 1,
             sequence: 0,
             control: None,
-            tx: None,
-            out: None,
-            rx: None,
-            notify: None,
-            notification_needed: false,
-            zlp_needed: false,
+            channels: [const { ChannelState::new() }; 3],
+            notifications: [const { Notification::new() }; 2],
             high_speed: false,
             initialized: false,
             failed: false,
@@ -166,8 +218,9 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
             endpoint_halt: self.hardware.read32(DEV + 0x50),
             endpoint_pause: self.hardware.read32(DEV + 0x54),
             ep0_state: self.dma.read32(CONTEXT) & 7,
-            configuration: self.acm.configuration,
-            dtr: self.acm.dtr,
+            configuration: self.device.configuration,
+            dtr: self.device.acm[Channel::Console.index()].dtr,
+            control_dtr: self.device.acm[Channel::Control.index()].dtr,
         }
     }
     fn update(&mut self, address: u64, clear: u32, set: u32) {
@@ -195,10 +248,14 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
         }
     }
     fn get_bytes(&mut self, offset: usize, output: &mut [u8]) {
-        for (index, byte) in output.iter_mut().enumerate() {
-            let address = offset + index;
+        let mut cursor = 0;
+        while cursor < output.len() {
+            let address = offset + cursor;
             let word = self.dma.read32(address & !3).to_le_bytes();
-            *byte = word[address & 3];
+            let start = address & 3;
+            let length = (4 - start).min(output.len() - cursor);
+            output[cursor..cursor + length].copy_from_slice(&word[start..start + length]);
+            cursor += length;
         }
     }
     fn endpoint(&mut self, ring: usize) -> Result<(), Error> {
@@ -216,13 +273,13 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
         }
         let packet = if ring == 0 {
             64
-        } else if ring == 3 {
+        } else if NOTIFY_RINGS.contains(&ring) {
             16
         } else {
             self.packet_size()
         };
-        let kind = [4, 2, 6, 7][ring];
-        let interval = if ring == 3 {
+        let kind = ENDPOINT_KINDS[ring];
+        let interval = if NOTIFY_RINGS.contains(&ring) {
             if self.high_speed { 8 } else { 7 }
         } else {
             0
@@ -235,7 +292,7 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
             context + 16,
             if ring == 0 {
                 8
-            } else if ring == 3 {
+            } else if NOTIFY_RINGS.contains(&ring) {
                 10 | (16 << 16)
             } else {
                 512
@@ -339,7 +396,7 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
     }
     fn stop_data(&mut self) -> Result<(), Error> {
         for &ep in ENDPOINTS.iter().skip(1) {
-            if self.acm.configuration != 0 {
+            if self.device.configuration != 0 {
                 self.update(DEV + 0x50, 0, 1 << ep);
                 self.dma.write32(CONTEXT + usize::from(ep) * 64, 0);
                 self.hardware.barrier();
@@ -348,26 +405,45 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
             }
             self.dma.write32(CONTEXT + usize::from(ep) * 64, 0);
         }
-        if let Some((_, length)) = self.tx.take() {
-            self.statistics.dropped = self.statistics.dropped.saturating_add(length as u64);
+        for state in &mut self.channels {
+            if let Some((_, length)) = state.tx.take() {
+                self.statistics.dropped = self.statistics.dropped.saturating_add(length as u64);
+            }
+            *state = ChannelState::new();
         }
-        self.out = None;
-        self.rx = None;
-        self.notify = None;
-        self.zlp_needed = false;
-        self.acm.configuration = 0;
-        self.acm.dtr = false;
+        self.notifications = [const { Notification::new() }; 2];
+        self.device.configuration = 0;
+        for acm in &mut self.device.acm {
+            acm.dtr = false;
+        }
         self.update(DEV + 0x30, 1, 0);
         Ok(())
     }
+
+    fn clear_endpoint_state(&mut self, ring: usize) {
+        if let Some(channel) = OUT_RINGS.iter().position(|&candidate| candidate == ring) {
+            self.channels[channel].out = None;
+            self.channels[channel].rx = None;
+        }
+        if let Some(channel) = IN_RINGS.iter().position(|&candidate| candidate == ring) {
+            if let Some((_, length)) = self.channels[channel].tx.take() {
+                self.statistics.dropped = self.statistics.dropped.saturating_add(length as u64);
+            }
+            self.channels[channel].zlp_needed = false;
+        }
+        if let Some(function) = NOTIFY_RINGS.iter().position(|&candidate| candidate == ring) {
+            self.notifications[function].transfer = None;
+        }
+    }
+
     fn setup(&mut self, words: [u32; 4]) -> Result<(), Error> {
         self.sequence = words[2] as u16;
         self.control = None; // A new SETUP supersedes the previous control request.
         self.halt(0, false)?;
         let setup = Setup::from_words([words[0], words[1]]);
-        let old_dtr = self.acm.dtr;
+        let old_dtr = [self.device.acm[0].dtr, self.device.acm[1].dtr];
         let mut output = [0; CONTROL_SIZE];
-        match self.acm.setup(setup, &mut output, self.high_speed) {
+        match self.device.setup(setup, &mut output, self.high_speed) {
             Reply::Data(length) => {
                 self.put_bytes(CONTROL, &output[..length]);
                 self.data(
@@ -378,7 +454,7 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
                     },
                 )
             }
-            Reply::LineCoding => self.data(7, false, ControlPhase::OutLine),
+            Reply::LineCoding(function) => self.data(7, false, ControlPhase::OutLine(function)),
             Reply::Address(address) => {
                 self.update(DEV + 0x30, 0x7f00_0000, u32::from(address) << 24);
                 self.dma.write32(CONTEXT + 44, u32::from(address));
@@ -387,12 +463,14 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
             Reply::Configuration(configuration) => {
                 self.stop_data()?;
                 if configuration != 0 {
-                    for ring in 1..4 {
+                    for ring in 1..ENDPOINTS.len() {
                         self.endpoint(ring)?;
                     }
                     self.update(DEV + 0x30, 0, 1);
-                    self.acm.configuration = 1;
-                    self.notification_needed = true;
+                    self.device.configuration = 1;
+                    for notification in &mut self.notifications {
+                        notification.needed = true;
+                    }
                 }
                 self.status(true)
             }
@@ -403,25 +481,15 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
                         .iter()
                         .position(|&ep| ep == endpoint)
                         .ok_or(Error::Transfer)?;
-                    if ring == 2 {
-                        if let Some((_, length)) = self.tx.take() {
-                            self.statistics.dropped += length as u64;
-                        }
-                        self.zlp_needed = false;
-                    }
-                    if ring == 1 {
-                        self.out = None;
-                        self.rx = None;
-                    }
-                    if ring == 3 {
-                        self.notify = None;
-                    }
+                    self.clear_endpoint_state(ring);
                     self.endpoint(ring)?;
                 }
                 self.status(true)
             }
             Reply::Status => {
-                self.notification_needed |= old_dtr != self.acm.dtr;
+                for (function, old) in old_dtr.into_iter().enumerate() {
+                    self.notifications[function].needed |= old != self.device.acm[function].dtr;
+                }
                 self.status(true)
             }
             Reply::Stall => self.halt(0, true),
@@ -460,36 +528,47 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
                 match phase {
                     ControlPhase::In { zlp: true } => self.data(0, true, ControlPhase::Zlp),
                     ControlPhase::In { zlp: false } | ControlPhase::Zlp => self.status(false),
-                    ControlPhase::OutLine => {
+                    ControlPhase::OutLine(function) => {
                         if remaining != 0 {
                             return self.halt(0, true);
                         }
                         let first = self.dma.read32(CONTROL).to_le_bytes();
                         let second = self.dma.read32(CONTROL + 4).to_le_bytes();
-                        self.acm.line_coding[..4].copy_from_slice(&first);
-                        self.acm.line_coding[4..].copy_from_slice(&second[..3]);
+                        self.device.acm[function].line_coding[..4].copy_from_slice(&first);
+                        self.device.acm[function].line_coding[4..].copy_from_slice(&second[..3]);
                         self.status(true)
                     }
                     ControlPhase::Status => Ok(()),
                 }
             }
-            1 => {
-                if self.out != Some(pointer) {
+            ring if OUT_RINGS.contains(&ring) => {
+                let channel = OUT_RINGS
+                    .iter()
+                    .position(|&candidate| candidate == ring)
+                    .ok_or(Error::Transfer)?;
+                let state = &mut self.channels[channel];
+                if state.out != Some(pointer) {
                     return Ok(());
                 }
-                self.out = None;
-                if remaining > 512 {
+                state.out = None;
+                let capacity = RX_CAPACITIES[channel];
+                if remaining > capacity {
                     return Err(Error::Transfer);
                 }
-                let length = 512 - remaining;
+                let length = capacity - remaining;
                 self.statistics.received += length as u64;
-                self.rx = (length != 0).then_some(Receive { cursor: 0, length });
+                state.rx = (length != 0).then_some(Receive { cursor: 0, length });
                 Ok(())
             }
-            2 => {
-                if let Some((expected, length)) = self.tx {
+            ring if IN_RINGS.contains(&ring) => {
+                let channel = IN_RINGS
+                    .iter()
+                    .position(|&candidate| candidate == ring)
+                    .ok_or(Error::Transfer)?;
+                let state = &mut self.channels[channel];
+                if let Some((expected, length)) = state.tx {
                     if pointer == expected {
-                        self.tx = None;
+                        state.tx = None;
                         if remaining > length {
                             return Err(Error::Transfer);
                         }
@@ -502,12 +581,17 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
                 }
                 Ok(())
             }
-            _ => {
-                if self.notify == Some(pointer) {
-                    self.notify = None;
+            ring if NOTIFY_RINGS.contains(&ring) => {
+                let function = NOTIFY_RINGS
+                    .iter()
+                    .position(|&candidate| candidate == ring)
+                    .ok_or(Error::Transfer)?;
+                if self.notifications[function].transfer == Some(pointer) {
+                    self.notifications[function].transfer = None;
                 }
                 Ok(())
             }
+            _ => Ok(()),
         }
     }
     fn port(&mut self) -> Result<(), Error> {
@@ -525,7 +609,7 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
         }
         if status & 1 == 0 || status & ((1 << 19) | (1 << 21)) != 0 {
             self.stop_data()?;
-            self.acm.reset();
+            self.device.reset();
             self.update(DEV + 0x30, 0x7f00_0000, 0);
             self.control = None;
             self.endpoint(0)?;
@@ -536,67 +620,77 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
         Ok(())
     }
     fn arm_data(&mut self) -> Result<(), Error> {
-        if self.acm.configuration == 0 || self.failed {
+        if self.device.configuration == 0 || self.failed {
             return Ok(());
         }
-        if self.out.is_none()
-            && self.rx.is_none()
-            && self.hardware.read32(DEV + 0x50) & (1 << 2) == 0
-        {
-            self.out = Some(self.queue(
-                1,
-                [
-                    self.dma_address(RX_BUFFER) as u32,
-                    0,
-                    512,
-                    (1 << 10) | (1 << 2) | (1 << 5),
-                ],
-            )?);
-        }
-        if self.notification_needed
-            && self.notify.is_none()
-            && self.hardware.read32(DEV + 0x50) & (1 << 5) == 0
-        {
-            self.put_bytes(
-                NOTIFY_BUFFER,
-                &[
-                    0xa1,
-                    0x20,
-                    0,
-                    0,
-                    0,
-                    0,
-                    2,
-                    0,
-                    if self.acm.dtr { 3 } else { 0 },
-                    0,
-                ],
-            );
-            self.notify = Some(self.queue(
-                3,
-                [
-                    self.dma_address(NOTIFY_BUFFER) as u32,
-                    0,
-                    10,
-                    (1 << 10) | (1 << 5),
-                ],
-            )?);
-            self.notification_needed = false;
-        }
-        if self.zlp_needed && self.tx.is_none() {
-            self.tx = Some((
-                self.queue(
-                    2,
+        for channel in Channel::ALL {
+            let index = channel.index();
+            let ring = OUT_RINGS[index];
+            let endpoint = ENDPOINTS[ring];
+            if self.channels[index].out.is_none()
+                && self.channels[index].rx.is_none()
+                && self.hardware.read32(DEV + 0x50) & (1 << endpoint) == 0
+            {
+                self.channels[index].out = Some(self.queue(
+                    ring,
                     [
-                        self.dma_address(TX_BUFFER) as u32,
+                        self.dma_address(RX_BUFFERS[index]) as u32,
+                        0,
+                        RX_CAPACITIES[index] as u32,
+                        (1 << 10) | (1 << 2) | (1 << 5),
+                    ],
+                )?);
+            }
+        }
+        for function in 0..self.notifications.len() {
+            let ring = NOTIFY_RINGS[function];
+            let endpoint = ENDPOINTS[ring];
+            if self.notifications[function].needed
+                && self.notifications[function].transfer.is_none()
+                && self.hardware.read32(DEV + 0x50) & (1 << endpoint) == 0
+            {
+                self.put_bytes(
+                    NOTIFY_BUFFERS[function],
+                    &[
+                        0xa1,
+                        0x20,
+                        0,
+                        0,
+                        (function as u16 * 2) as u8,
+                        0,
+                        2,
+                        0,
+                        if self.device.acm[function].dtr { 3 } else { 0 },
+                        0,
+                    ],
+                );
+                self.notifications[function].transfer = Some(self.queue(
+                    ring,
+                    [
+                        self.dma_address(NOTIFY_BUFFERS[function]) as u32,
+                        0,
+                        10,
+                        (1 << 10) | (1 << 5),
+                    ],
+                )?);
+                self.notifications[function].needed = false;
+            }
+        }
+        for channel in Channel::ALL {
+            let index = channel.index();
+            if self.channels[index].zlp_needed && self.channels[index].tx.is_none() {
+                let pointer = self.queue(
+                    IN_RINGS[index],
+                    [
+                        self.dma_address(TX_BUFFERS[index]) as u32,
                         0,
                         0,
                         (1 << 10) | (1 << 5),
                     ],
-                )?,
-                0,
-            ));
-            self.zlp_needed = false;
+                )?;
+                self.channels[index].tx = Some((pointer, 0));
+                self.channels[index].zlp_needed = false;
+            }
         }
         Ok(())
     }
@@ -617,14 +711,10 @@ impl<H: Mmio + Clock, D: DmaBuffer> Driver for Xudc<H, D> {
         }
         self.initialized = false;
         self.failed = false;
-        self.acm.reset();
+        self.device.reset();
         self.control = None;
-        self.tx = None;
-        self.out = None;
-        self.rx = None;
-        self.notify = None;
-        self.zlp_needed = false;
-        self.notification_needed = false;
+        self.channels = [const { ChannelState::new() }; 3];
+        self.notifications = [const { Notification::new() }; 2];
         // Keep this USB client in bypass even if the guest later enables the SMMU.
         self.hardware.write32(DEV_ASID, 0);
         self.hardware.barrier();
@@ -798,53 +888,89 @@ impl<H: Mmio + Clock, D: DmaBuffer> Driver for Xudc<H, D> {
     }
 }
 
-impl<H: Mmio + Clock, D: DmaBuffer> RxTransport for Xudc<H, D> {
-    fn receive(&mut self, output: &mut [u8]) -> Result<usize, Error> {
-        let Some(mut receive) = self.rx else {
+impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
+    pub fn connected_channel(&self, channel: Channel) -> bool {
+        self.initialized
+            && !self.failed
+            && self.device.configuration == 1
+            && match channel {
+                Channel::Console => self.device.acm[0].dtr,
+                Channel::Control => self.device.acm[1].dtr,
+                Channel::Loader => true,
+            }
+    }
+
+    pub fn receive_channel(&mut self, channel: Channel, output: &mut [u8]) -> Result<usize, Error> {
+        let index = channel.index();
+        let Some(mut receive) = self.channels[index].rx else {
             return Ok(0);
         };
         let count = output.len().min(receive.length - receive.cursor);
-        self.get_bytes(RX_BUFFER + receive.cursor, &mut output[..count]);
+        self.get_bytes(RX_BUFFERS[index] + receive.cursor, &mut output[..count]);
         receive.cursor += count;
         if receive.cursor == receive.length {
-            self.rx = None;
+            self.channels[index].rx = None;
             self.arm_data()?;
         } else {
-            self.rx = Some(receive);
+            self.channels[index].rx = Some(receive);
         }
         Ok(count)
     }
-}
 
-impl<H: Mmio + Clock, D: DmaBuffer> TxTransport for Xudc<H, D> {
-    fn connected(&self) -> bool {
-        self.initialized && !self.failed && self.acm.configuration == 1 && self.acm.dtr
-    }
-    fn send_capacity(&self) -> usize {
-        if self.connected() && self.tx.is_none() && !self.zlp_needed {
-            512
+    pub fn send_capacity_channel(&self, channel: Channel) -> usize {
+        let index = channel.index();
+        if self.connected_channel(channel)
+            && self.channels[index].tx.is_none()
+            && !self.channels[index].zlp_needed
+        {
+            TX_CAPACITIES[index]
         } else {
             0
         }
     }
-    fn send(&mut self, bytes: &[u8]) -> Result<usize, Error> {
-        let capacity = self.send_capacity();
-        if capacity == 0 || bytes.is_empty() || self.hardware.read32(DEV + 0x50) & (1 << 3) != 0 {
+
+    pub fn send_channel(&mut self, channel: Channel, bytes: &[u8]) -> Result<usize, Error> {
+        let index = channel.index();
+        let capacity = self.send_capacity_channel(channel);
+        let ring = IN_RINGS[index];
+        let endpoint = ENDPOINTS[ring];
+        if capacity == 0
+            || bytes.is_empty()
+            || self.hardware.read32(DEV + 0x50) & (1 << endpoint) != 0
+        {
             return Ok(0);
         }
         let length = bytes.len().min(capacity);
-        self.put_bytes(TX_BUFFER, &bytes[..length]);
+        self.put_bytes(TX_BUFFERS[index], &bytes[..length]);
         let pointer = self.queue(
-            2,
+            ring,
             [
-                self.dma_address(TX_BUFFER) as u32,
+                self.dma_address(TX_BUFFERS[index]) as u32,
                 0,
                 length as u32,
                 (1 << 10) | (1 << 5),
             ],
         )?;
-        self.tx = Some((pointer, length));
-        self.zlp_needed = length % self.packet_size() as usize == 0;
+        self.channels[index].tx = Some((pointer, length));
+        self.channels[index].zlp_needed = length % self.packet_size() as usize == 0;
         Ok(length)
+    }
+}
+
+impl<H: Mmio + Clock, D: DmaBuffer> RxTransport for Xudc<H, D> {
+    fn receive(&mut self, output: &mut [u8]) -> Result<usize, Error> {
+        self.receive_channel(Channel::Console, output)
+    }
+}
+
+impl<H: Mmio + Clock, D: DmaBuffer> TxTransport for Xudc<H, D> {
+    fn connected(&self) -> bool {
+        self.connected_channel(Channel::Console)
+    }
+    fn send_capacity(&self) -> usize {
+        self.send_capacity_channel(Channel::Console)
+    }
+    fn send(&mut self, bytes: &[u8]) -> Result<usize, Error> {
+        self.send_channel(Channel::Console, bytes)
     }
 }
