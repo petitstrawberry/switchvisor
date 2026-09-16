@@ -18,6 +18,8 @@ serde_json = "1.0"
 sha2 = "0.10.9"
 nusb = "0.2.7"
 serialport = { version = "4.10.1", default-features = false, features = ["usbportinfo-interface"] }
+gdbstub = { version = "0.7.10", default-features = false }
+gdbstub_arch = { version = "0.3.3", default-features = false }
 
 [profile.release]
 panic = "abort"

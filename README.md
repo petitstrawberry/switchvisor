@@ -60,7 +60,7 @@ packaging succeed. A build with `--usb-uart` also writes `usb-uart.dtbo`. Pass
 `--usb-control` to enable USB control and guest bundle loading without adding a
 virtual UART to the guest; that profile writes `usb-control.dtbo`. The build
 removes stale overlay variants from the output directory. Add `--no-fallback`
-with either USB option to require an uploaded payload instead of starting the
+with a USB option to require an uploaded payload instead of starting the
 packaged payload automatically.
 
 Copy `dist/bl33.bin` to the microSD path configured for BL33 by the selected
@@ -173,7 +173,7 @@ Set `USB_PORT` to the actual port name printed by `ls`.
 
 USB transmits the guest's UART bytes unchanged. Handle terminal newline conversion in the guest console or TTY layer, or configure it in the host terminal.
 
-With `--usb-uart` or `--usb-control`, Switchvisor normally services USB for two
+With `--usb-uart`, `--usb-control`, or `--usb-gdb`, Switchvisor normally services USB for two
 seconds before starting the packaged payload and prints the port/endpoint
 state, event/setup counts, and last error on Hekate's framebuffer. Connect the
 host cable before boot to capture enumeration progress.
@@ -306,6 +306,40 @@ target/release/switchvisorctl hello
 target/release/switchvisorctl loader-status
 target/release/switchvisorctl abort
 ```
+
+## EL2 GDB debugging
+
+Add `--usb-gdb` when building the payload to expose a dedicated GDB CDC port.
+It can be combined with `--usb-uart` and `--usb-control`. Without `--usb-uart`,
+the build writes `dist/usb-control.dtbo`; apply that overlay to the final guest
+DTB so the guest does not drive the physical USB controller.
+
+```sh
+scripts/build-payload.sh path/to/bootstack/bl33.bin 0x68200 path/to/bootstack dist \
+  --usb-gdb
+target/release/switchvisorctl gdb-port
+```
+
+Open the reported port from an AArch64-capable GDB after the guest starts:
+
+```gdb
+file path/to/guest.elf
+target remote /dev/cu.usbmodem...
+set scheduler-locking on
+info threads
+```
+
+GDB thread IDs 1–4 correspond to physical CPUs 0–3. Opening the serial port
+alone does not stop the guest; the first GDB packet starts an all-stop session.
+Registers, `continue`, `stepi`, software breakpoints, and guest RAM reads and
+writes are supported. `detach` resumes the guest and removes breakpoints.
+`switchvisorctl status` reports the debugger state and last stop.
+
+GDB memory addresses are guest physical addresses (`GPA = HPA`); the reported PC
+remains the guest virtual address. For a nonidentity-mapped guest, translate
+addresses before using GDB memory or software-breakpoint commands. Automatic
+breakpoint step-over assumes identity-mapped executable code. SGI 15 is reserved
+for EL2 while `--usb-gdb` is enabled.
 
 ### Automatic payload cycle
 

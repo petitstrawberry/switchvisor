@@ -24,19 +24,19 @@ const EVENT0: usize = 0;
 const EVENT1: usize = 0x100;
 const CONTEXT: usize = 0x1000;
 const CONTROL: usize = 0x1400;
-const RING_BASES: [usize; 9] = [
-    0x200, 0x300, 0x400, 0x500, 0x600, 0x700, 0x800, 0x900, 0xa00,
+const RING_BASES: [usize; 12] = [
+    0x200, 0x300, 0x400, 0x500, 0x600, 0x700, 0x800, 0x900, 0xa00, 0xb00, 0xc00, 0xd00,
 ];
-const ENDPOINTS: [u8; 9] = [0, 2, 3, 5, 6, 7, 9, 10, 11];
-const ENDPOINT_KINDS: [u32; 9] = [4, 2, 6, 7, 2, 6, 7, 2, 6];
-const OUT_RINGS: [usize; 3] = [1, 4, 7];
-const IN_RINGS: [usize; 3] = [2, 5, 8];
-const NOTIFY_RINGS: [usize; 2] = [3, 6];
-const RX_BUFFERS: [usize; 3] = [0x1600, 0x1c00, 0x3000];
-const TX_BUFFERS: [usize; 3] = [0x1800, 0x1e00, 0x4000];
-const RX_CAPACITIES: [usize; 3] = [512, 512, 4096];
-const TX_CAPACITIES: [usize; 3] = [512, 512, 512];
-const NOTIFY_BUFFERS: [usize; 2] = [0x1a00, 0x2000];
+const ENDPOINTS: [u8; 12] = [0, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15];
+const ENDPOINT_KINDS: [u32; 12] = [4, 2, 6, 7, 2, 6, 7, 2, 6, 7, 2, 6];
+const OUT_RINGS: [usize; 4] = [1, 4, 7, 10];
+const IN_RINGS: [usize; 4] = [2, 5, 8, 11];
+const NOTIFY_RINGS: [usize; 3] = [3, 6, 9];
+const RX_BUFFERS: [usize; 4] = [0x1600, 0x1c00, 0x3000, 0x2200];
+const TX_BUFFERS: [usize; 4] = [0x1800, 0x1e00, 0x4000, 0x2400];
+const RX_CAPACITIES: [usize; 4] = [512, 512, 4096, 512];
+const TX_CAPACITIES: [usize; 4] = [512, 512, 512, 512];
+const NOTIFY_BUFFERS: [usize; 3] = [0x1a00, 0x2000, 0x2600];
 const PORT_CHANGES: u32 = (1 << 17) | (1 << 19) | (1 << 21) | (1 << 22) | (1 << 23);
 const XHCI_CTRL_IE: u32 = 1 << 4;
 const XHCI_ST_IP: u32 = 1 << 4;
@@ -84,10 +84,11 @@ pub enum Channel {
     Console = 0,
     Control = 1,
     Loader = 2,
+    Gdb = 3,
 }
 
 impl Channel {
-    const ALL: [Self; 3] = [Self::Console, Self::Control, Self::Loader];
+    const ALL: [Self; 4] = [Self::Console, Self::Control, Self::Loader, Self::Gdb];
 
     const fn index(self) -> usize {
         self as usize
@@ -161,14 +162,14 @@ impl Notification {
 pub struct Xudc<H, D> {
     hardware: H,
     dma: D,
-    rings: [Ring; 9],
+    rings: [Ring; 12],
     device: Composite,
     event: usize,
     event_cycle: u32,
     sequence: u16,
     control: Option<(u64, ControlPhase)>,
-    channels: [ChannelState; 3],
-    notifications: [Notification; 2],
+    channels: [ChannelState; 4],
+    notifications: [Notification; 3],
     high_speed: bool,
     initialized: bool,
     failed: bool,
@@ -180,14 +181,14 @@ impl<H, D> Xudc<H, D> {
         Self {
             hardware,
             dma,
-            rings: [const { Ring::new() }; 9],
+            rings: [const { Ring::new() }; 12],
             device: Composite::new(),
             event: 0,
             event_cycle: 1,
             sequence: 0,
             control: None,
-            channels: [const { ChannelState::new() }; 3],
-            notifications: [const { Notification::new() }; 2],
+            channels: [const { ChannelState::new() }; 4],
+            notifications: [const { Notification::new() }; 3],
             high_speed: false,
             initialized: false,
             failed: false,
@@ -206,6 +207,22 @@ impl<H, D> Xudc<H, D> {
 }
 
 impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
+    pub fn set_gdb_enabled(&mut self, enabled: bool) {
+        self.device.set_gdb_enabled(enabled);
+    }
+
+    pub fn reset_count(&self) -> u64 {
+        self.statistics.resets
+    }
+
+    fn active_endpoints(&self) -> usize {
+        if self.device.gdb_enabled() {
+            ENDPOINTS.len()
+        } else {
+            9
+        }
+    }
+
     /// Read-only boot diagnostics. Call only after successful initialization.
     pub fn snapshot(&mut self) -> Snapshot {
         Snapshot {
@@ -395,7 +412,7 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
         Ok(())
     }
     fn stop_data(&mut self) -> Result<(), Error> {
-        for &ep in ENDPOINTS.iter().skip(1) {
+        for &ep in ENDPOINTS[..self.active_endpoints()].iter().skip(1) {
             if self.device.configuration != 0 {
                 self.update(DEV + 0x50, 0, 1 << ep);
                 self.dma.write32(CONTEXT + usize::from(ep) * 64, 0);
@@ -411,7 +428,7 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
             }
             *state = ChannelState::new();
         }
-        self.notifications = [const { Notification::new() }; 2];
+        self.notifications = [const { Notification::new() }; 3];
         self.device.configuration = 0;
         for acm in &mut self.device.acm {
             acm.dtr = false;
@@ -441,7 +458,11 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
         self.control = None; // A new SETUP supersedes the previous control request.
         self.halt(0, false)?;
         let setup = Setup::from_words([words[0], words[1]]);
-        let old_dtr = [self.device.acm[0].dtr, self.device.acm[1].dtr];
+        let old_dtr = [
+            self.device.acm[0].dtr,
+            self.device.acm[1].dtr,
+            self.device.acm[2].dtr,
+        ];
         let mut output = [0; CONTROL_SIZE];
         match self.device.setup(setup, &mut output, self.high_speed) {
             Reply::Data(length) => {
@@ -463,7 +484,7 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
             Reply::Configuration(configuration) => {
                 self.stop_data()?;
                 if configuration != 0 {
-                    for ring in 1..ENDPOINTS.len() {
+                    for ring in 1..self.active_endpoints() {
                         self.endpoint(ring)?;
                     }
                     self.update(DEV + 0x30, 0, 1);
@@ -497,7 +518,10 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
     }
     fn transfer(&mut self, words: [u32; 4]) -> Result<(), Error> {
         let ep = ((words[3] >> 16) & 31) as u8;
-        let Some(ring) = ENDPOINTS.iter().position(|&id| id == ep) else {
+        let Some(ring) = ENDPOINTS[..self.active_endpoints()]
+            .iter()
+            .position(|&id| id == ep)
+        else {
             return Ok(());
         };
         let pointer = u64::from(words[0]) | (u64::from(words[1]) << 32);
@@ -624,6 +648,9 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
             return Ok(());
         }
         for channel in Channel::ALL {
+            if channel == Channel::Gdb && !self.device.gdb_enabled() {
+                continue;
+            }
             let index = channel.index();
             let ring = OUT_RINGS[index];
             let endpoint = ENDPOINTS[ring];
@@ -643,6 +670,9 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
             }
         }
         for function in 0..self.notifications.len() {
+            if function == 2 && !self.device.gdb_enabled() {
+                continue;
+            }
             let ring = NOTIFY_RINGS[function];
             let endpoint = ENDPOINTS[ring];
             if self.notifications[function].needed
@@ -677,6 +707,9 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
             }
         }
         for channel in Channel::ALL {
+            if channel == Channel::Gdb && !self.device.gdb_enabled() {
+                continue;
+            }
             let index = channel.index();
             if self.channels[index].zlp_needed && self.channels[index].tx.is_none() {
                 let pointer = self.queue(
@@ -713,8 +746,8 @@ impl<H: Mmio + Clock, D: DmaBuffer> Driver for Xudc<H, D> {
         self.failed = false;
         self.device.reset();
         self.control = None;
-        self.channels = [const { ChannelState::new() }; 3];
-        self.notifications = [const { Notification::new() }; 2];
+        self.channels = [const { ChannelState::new() }; 4];
+        self.notifications = [const { Notification::new() }; 3];
         // Keep this USB client in bypass even if the guest later enables the SMMU.
         self.hardware.write32(DEV_ASID, 0);
         self.hardware.barrier();
@@ -897,6 +930,7 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
                 Channel::Console => self.device.acm[0].dtr,
                 Channel::Control => self.device.acm[1].dtr,
                 Channel::Loader => true,
+                Channel::Gdb => self.device.gdb_enabled() && self.device.acm[2].dtr,
             }
     }
 

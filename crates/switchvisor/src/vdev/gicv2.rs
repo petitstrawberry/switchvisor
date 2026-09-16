@@ -17,14 +17,20 @@ const GICD_ICPENDR0: u64 = 0x280;
 const GICD_ISACTIVER0: u64 = 0x300;
 const GICD_ICACTIVER0: u64 = 0x380;
 const GICD_IPRIORITYR0: u64 = 0x400;
+const GICD_IPRIORITYR3: u64 = 0x40c;
 const GICD_IPRIORITYR6: u64 = 0x418;
 const GICD_ITARGETSR0: u64 = 0x800;
 const GICD_ICFGR0: u64 = 0xc00;
 const GICD_ICFGR1: u64 = 0xc04;
+const GICD_SGIR: u64 = 0xf00;
+const GICD_CPENDSGIR3: u64 = 0xf1c;
+const GICD_SPENDSGIR3: u64 = 0xf2c;
 
 const MAINTENANCE_BIT: u32 = 1 << MAINTENANCE_IRQ;
 const MAINTENANCE_PRIORITY: u32 = 0xff << 8;
 const MAINTENANCE_CONFIG: u32 = 3 << 18;
+const DEBUG_SGI_BIT: u32 = 1 << 15;
+const DEBUG_SGI_BYTE: u32 = 0xff << 24;
 
 pub struct Distributor<M> {
     mmio: M,
@@ -32,6 +38,7 @@ pub struct Distributor<M> {
     guest_control: u32,
     owned_interrupt: u32,
     owned_interrupt_enabled: bool,
+    debug_sgi: bool,
 }
 
 impl<M: Mmio> Distributor<M> {
@@ -42,6 +49,7 @@ impl<M: Mmio> Distributor<M> {
             guest_control: 0,
             owned_interrupt: SPURIOUS_IRQ,
             owned_interrupt_enabled: false,
+            debug_sgi: false,
         }
     }
 
@@ -50,6 +58,10 @@ impl<M: Mmio> Distributor<M> {
             .filter(|id| (32..1020).contains(id))
             .unwrap_or(SPURIOUS_IRQ);
         self.owned_interrupt_enabled = false;
+    }
+
+    pub fn set_debug_sgi(&mut self, enabled: bool) {
+        self.debug_sgi = enabled;
     }
 
     /// Keep the physical Non-secure group enabled for the maintenance PPI,
@@ -122,7 +134,18 @@ impl<M: Mmio> Distributor<M> {
             GICD_ICFGR1 => MAINTENANCE_CONFIG,
             _ => 0,
         };
+        let debug = if self.debug_sgi {
+            match offset {
+                GICD_IGROUPR0 | GICD_ISENABLER0 | GICD_ICENABLER0 | GICD_ISPENDR0
+                | GICD_ICPENDR0 | GICD_ISACTIVER0 | GICD_ICACTIVER0 => DEBUG_SGI_BIT,
+                GICD_IPRIORITYR3 | GICD_CPENDSGIR3 | GICD_SPENDSGIR3 => DEBUG_SGI_BYTE,
+                _ => 0,
+            }
+        } else {
+            0
+        };
         maintenance
+            | debug
             | self.owned_action_mask(offset)
             | self.owned_byte_mask(offset, GICD_IPRIORITYR0)
             | self.owned_byte_mask(offset, GICD_ITARGETSR0)
@@ -172,6 +195,14 @@ impl<M: Mmio> Distributor<M> {
                 value |= owned;
             }
         }
+        if self.debug_sgi {
+            value &= match offset {
+                GICD_IGROUPR0 | GICD_ISENABLER0 | GICD_ICENABLER0 | GICD_ISPENDR0
+                | GICD_ICPENDR0 | GICD_ISACTIVER0 | GICD_ICACTIVER0 => !DEBUG_SGI_BIT,
+                GICD_IPRIORITYR3 | GICD_CPENDSGIR3 | GICD_SPENDSGIR3 => !DEBUG_SGI_BYTE,
+                _ => u32::MAX,
+            };
+        }
         value
     }
 }
@@ -193,6 +224,19 @@ impl<M: Mmio> VirtualDevice for Distributor<M> {
         let (word, shift, mask) = Self::decode_access(offset, size)?;
         let value = ((value as u32) << shift) & mask;
         let address = self.layout.distributor + word;
+
+        if word == GICD_SGIR {
+            // SGIR is write-only: a read/modify/write of a partial access can
+            // reissue a stale SGI. Send only the guest's supplied bits.
+            if mask & 0xf == 0 {
+                return Err(DeviceError::AccessSize);
+            }
+            if !(self.debug_sgi && value & 0xf == 15) {
+                self.mmio.write32(address, value);
+                self.mmio.barrier();
+            }
+            return Ok(());
+        }
 
         if value & self.owned_word_mask(word, GICD_ISENABLER0) != 0 {
             self.owned_interrupt_enabled = true;
@@ -353,5 +397,53 @@ mod tests {
             distributor.mmio.words[config as usize / 4] & (3 << 24),
             2 << 24
         );
+    }
+
+    #[test]
+    fn debug_sgi_is_invisible_and_cannot_be_reconfigured_or_generated() {
+        let mut distributor = distributor();
+        distributor.set_debug_sgi(true);
+        for register in [
+            GICD_IGROUPR0,
+            GICD_ISENABLER0,
+            GICD_ICENABLER0,
+            GICD_ISPENDR0,
+            GICD_ICPENDR0,
+            GICD_ISACTIVER0,
+            GICD_ICACTIVER0,
+        ] {
+            distributor.mmio.words[register as usize / 4] = DEBUG_SGI_BIT;
+            assert_eq!(
+                distributor.read(register, 4).unwrap() as u32 & DEBUG_SGI_BIT,
+                0
+            );
+            distributor
+                .write(register, 4, u64::from(DEBUG_SGI_BIT))
+                .unwrap();
+            assert_eq!(
+                distributor.mmio.words[register as usize / 4] & DEBUG_SGI_BIT,
+                if register == GICD_IGROUPR0 {
+                    DEBUG_SGI_BIT
+                } else {
+                    0
+                }
+            );
+        }
+        distributor.mmio.words[GICD_IPRIORITYR3 as usize / 4] = 0x1122_3344;
+        distributor
+            .write(GICD_IPRIORITYR3, 4, u64::from(u32::MAX))
+            .unwrap();
+        assert_eq!(
+            distributor.mmio.words[GICD_IPRIORITYR3 as usize / 4],
+            0x11ff_ffff
+        );
+        distributor.mmio.words[GICD_SGIR as usize / 4] = 0;
+        distributor.write(GICD_SGIR, 4, 0x0001_000f).unwrap();
+        assert_eq!(distributor.mmio.words[GICD_SGIR as usize / 4], 0);
+        assert_eq!(
+            distributor.write(GICD_SGIR + 2, 2, 0x0001),
+            Err(DeviceError::AccessSize)
+        );
+        assert_eq!(distributor.mmio.words[GICD_SGIR as usize / 4], 0);
     }
 }

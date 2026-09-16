@@ -17,10 +17,31 @@ fn fixture() -> (Payload, Vec<u8>) {
         preserve_boot_args: true,
         usb_uart: false,
         usb_control: false,
+        usb_gdb: false,
         require_upload: false,
         crc32: crc32(&package[0x4000..]),
     };
     (payload, package)
+}
+
+#[test]
+fn usb_gdb_flag_round_trips_without_changing_legacy_usb_modes() {
+    let (mut payload, _) = fixture();
+    payload.usb_gdb = true;
+    payload.require_upload = true;
+    let encoded = payload.encode().unwrap();
+    assert_eq!(
+        u32::from_le_bytes(encoded[12..16].try_into().unwrap()) & 0x1f,
+        0x19
+    );
+    assert_eq!(Payload::decode(&encoded).unwrap(), Some(payload));
+    payload.usb_gdb = false;
+    payload.require_upload = false;
+    let encoded = payload.encode().unwrap();
+    assert_eq!(
+        u32::from_le_bytes(encoded[12..16].try_into().unwrap()) & 0x1e,
+        0
+    );
 }
 
 #[test]

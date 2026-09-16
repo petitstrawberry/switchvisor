@@ -28,6 +28,49 @@ const RESET_NONE: u8 = 0;
 const RESET_NORMAL: u8 = 1;
 const RESET_RCM: u8 = 2;
 
+struct Fifo<const N: usize> {
+    bytes: [u8; N],
+    head: usize,
+    len: usize,
+}
+
+impl<const N: usize> Fifo<N> {
+    const fn new() -> Self {
+        Self {
+            bytes: [0; N],
+            head: 0,
+            len: 0,
+        }
+    }
+    fn capacity(&self) -> usize {
+        N - self.len
+    }
+    fn push(&mut self, bytes: &[u8]) -> usize {
+        let count = bytes.len().min(self.capacity());
+        for (i, byte) in bytes[..count].iter().enumerate() {
+            self.bytes[(self.head + self.len + i) % N] = *byte;
+        }
+        self.len += count;
+        count
+    }
+    fn pop(&mut self, bytes: &mut [u8]) -> usize {
+        let count = bytes.len().min(self.len);
+        for (i, byte) in bytes[..count].iter_mut().enumerate() {
+            *byte = self.bytes[(self.head + i) % N];
+        }
+        self.head = (self.head + count) % N;
+        self.len -= count;
+        count
+    }
+    fn peek(&self, bytes: &mut [u8]) -> usize {
+        let count = bytes.len().min(self.len);
+        for (i, byte) in bytes[..count].iter_mut().enumerate() {
+            *byte = self.bytes[(self.head + i) % N];
+        }
+        count
+    }
+}
+
 struct Output<const N: usize> {
     bytes: [u8; N],
     length: usize,
@@ -73,6 +116,9 @@ struct Service {
     loader: Loader,
     loader_input: [u8; MAX_MESSAGE_SIZE],
     loader_output: Output<MAX_RESPONSE_SIZE>,
+    gdb_rx: Fifo<4096>,
+    gdb_tx: Fifo<16384>,
+    gdb_reset_count: u64,
     boot: Option<BundleDescriptor>,
     error: Option<Error>,
 }
@@ -84,12 +130,16 @@ static USB: Mutex<Service> = Mutex::new(Service {
     loader: Loader::new(),
     loader_input: [0; MAX_MESSAGE_SIZE],
     loader_output: Output::new(),
+    gdb_rx: Fifo::new(),
+    gdb_tx: Fifo::new(),
+    gdb_reset_count: 0,
     boot: None,
     error: None,
 });
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static AVAILABLE: AtomicBool = AtomicBool::new(false);
 static REQUIRE_UPLOAD: AtomicBool = AtomicBool::new(false);
+static GDB_ENABLED: AtomicBool = AtomicBool::new(false);
 static GUEST_RUNNING: AtomicBool = AtomicBool::new(false);
 static LAST_SERVICE: AtomicU64 = AtomicU64::new(0);
 static GUEST_ENTRY: AtomicU64 = AtomicU64::new(0);
@@ -123,11 +173,13 @@ pub fn initialize(
     enabled: bool,
     console_enabled: bool,
     require_upload: bool,
+    gdb_enabled: bool,
     guest_entry: u64,
 ) -> Result<bool, Error> {
     ENABLED.store(enabled, Ordering::Release);
     AVAILABLE.store(false, Ordering::Release);
     REQUIRE_UPLOAD.store(require_upload, Ordering::Release);
+    GDB_ENABLED.store(gdb_enabled, Ordering::Release);
     GUEST_RUNNING.store(false, Ordering::Release);
     GUEST_ENTRY.store(guest_entry, Ordering::Release);
     RESET.store(RESET_NONE, Ordering::Release);
@@ -145,9 +197,14 @@ pub fn initialize(
             state.control_output = Output::new();
             state.loader = Loader::new();
             state.loader_output = Output::new();
+            state.gdb_rx = Fifo::new();
+            state.gdb_tx = Fifo::new();
             state.boot = None;
             state.error = None;
-            state.driver.initialize()
+            state.driver.set_gdb_enabled(gdb_enabled);
+            state.driver.initialize()?;
+            state.gdb_reset_count = state.driver.reset_count();
+            Ok(())
         })?;
     }
     AVAILABLE.store(true, Ordering::Release);
@@ -161,6 +218,44 @@ pub fn enabled() -> bool {
 
 pub fn available() -> bool {
     AVAILABLE.load(Ordering::Acquire)
+}
+
+pub fn gdb_connected() -> bool {
+    GDB_ENABLED.load(Ordering::Acquire)
+        && available()
+        && unsafe { USB.with(|state| state.driver.connected_channel(Channel::Gdb)) }
+}
+
+pub fn gdb_read(bytes: &mut [u8]) -> usize {
+    if !available() {
+        return 0;
+    }
+    unsafe { USB.with(|state| state.gdb_rx.pop(bytes)) }
+}
+
+pub fn gdb_write(bytes: &[u8]) -> usize {
+    if !available() {
+        return 0;
+    }
+    unsafe { USB.with(|state| state.gdb_tx.push(bytes)) }
+}
+
+/// Queue GDB output before CPU0 returns to a guest that may make no exits.
+pub fn gdb_flush() {
+    if !available() {
+        return;
+    }
+    let asserted = unsafe {
+        USB.with(|state| {
+            LAST_SERVICE.store(Hardware.now_us(), Ordering::Release);
+            service_locked(state);
+            guest_console::interrupt_pending()
+        })
+    };
+    if asserted {
+        crate::arch::aarch64::interrupt::pend_console_interrupt();
+    }
+    reset_if_requested();
 }
 
 pub fn enter_guest(entry: u64) {
@@ -220,6 +315,65 @@ fn service_locked(state: &mut Service) {
     service_guest_console(state);
     service_control(state);
     service_loader(state);
+    if GDB_ENABLED.load(Ordering::Acquire) {
+        service_gdb(state);
+    }
+}
+
+fn service_gdb(state: &mut Service) {
+    let reset_count = state.driver.reset_count();
+    if reset_count != state.gdb_reset_count {
+        state.gdb_reset_count = reset_count;
+        state.gdb_rx = Fifo::new();
+        state.gdb_tx = Fifo::new();
+        if crate::gdb::active() {
+            crate::debug::request_disconnect();
+        }
+    }
+    if !state.driver.connected_channel(Channel::Gdb) {
+        if crate::gdb::active() {
+            crate::debug::request_disconnect();
+        } else {
+            crate::debug::cancel_attach();
+        }
+        state.gdb_rx = Fifo::new();
+        state.gdb_tx = Fifo::new();
+        return;
+    }
+    let mut bytes = [0; 512];
+    let capacity = state.gdb_rx.capacity().min(bytes.len());
+    if capacity != 0 {
+        match state
+            .driver
+            .receive_channel(Channel::Gdb, &mut bytes[..capacity])
+        {
+            Ok(n) if n != 0 => {
+                state.gdb_rx.push(&bytes[..n]);
+                if !crate::gdb::active() {
+                    crate::debug::request_attach();
+                } else if !crate::debug::world_stopped() && bytes[..n].contains(&3) {
+                    crate::debug::request_interrupt();
+                }
+            }
+            Ok(_) => (),
+            Err(error) => state.error = Some(error),
+        }
+    }
+    let capacity = state
+        .driver
+        .send_capacity_channel(Channel::Gdb)
+        .min(bytes.len());
+    if capacity != 0 {
+        let count = state.gdb_tx.peek(&mut bytes[..capacity]);
+        if count != 0 {
+            match state.driver.send_channel(Channel::Gdb, &bytes[..count]) {
+                Ok(sent) => {
+                    let _ = state.gdb_tx.pop(&mut bytes[..sent]);
+                }
+                Err(error) => state.error = Some(error),
+            }
+        }
+    }
 }
 
 fn service_guest_console(state: &mut Service) {
@@ -323,6 +477,27 @@ fn control_reply(state: &mut Service, command: Result<Command, ParseError>) {
                 "enabled"
             };
             let _ = writeln!(state.control_output, "fallback={fallback}");
+            let _ = writeln!(state.control_output, "gdb={}", crate::debug::status());
+            let _ = writeln!(
+                state.control_output,
+                "gdb-stop-cpu={}",
+                crate::debug::last_stop_cpu()
+            );
+            let _ = writeln!(
+                state.control_output,
+                "gdb-stop-reason={}",
+                crate::debug::last_stop_cause()
+            );
+            let _ = writeln!(
+                state.control_output,
+                "gdb-missing-mask={:#x}",
+                crate::debug::last_missing_mask()
+            );
+            let _ = writeln!(
+                state.control_output,
+                "gdb-breakpoints={}",
+                crate::gdb::breakpoint_count()
+            );
             let _ = writeln!(
                 state.control_output,
                 "guest-entry={:#x}",

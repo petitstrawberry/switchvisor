@@ -23,6 +23,7 @@ static GICS: [PerCpu; switchvisor::CPU_COUNT] =
     [const { PerCpu(UnsafeCell::new(None)) }; switchvisor::CPU_COUNT];
 static LAYOUT: AtomicU64 = AtomicU64::new(0);
 static USB_INTERRUPT_OWNED: AtomicBool = AtomicBool::new(false);
+static DEBUG_SGI_OWNED: AtomicBool = AtomicBool::new(false);
 
 fn index() -> usize {
     let mpidr: u64;
@@ -49,6 +50,22 @@ pub fn select_usb_interrupt(owned: bool) {
     USB_INTERRUPT_OWNED.store(owned, Ordering::Release);
 }
 
+pub fn select_debug_sgi(owned: bool) {
+    DEBUG_SGI_OWNED.store(owned, Ordering::Release);
+}
+
+pub fn send_debug_kick(mask: u8) {
+    if !DEBUG_SGI_OWNED.load(Ordering::Acquire) || mask == 0 {
+        return;
+    }
+    let Some(slot) = GICS.get(index()) else {
+        return;
+    };
+    if let Some(gic) = unsafe { &mut *slot.0.get() } {
+        gic.send_debug_kick(mask);
+    }
+}
+
 fn selected_layout() -> Layout {
     if LAYOUT.load(Ordering::Acquire) == 1 {
         Layout::TEGRA210
@@ -66,6 +83,7 @@ pub fn initialize() -> Result<(), Error> {
     let state = unsafe { &mut *slot.0.get() };
     if let Some(gic) = state {
         gic.set_distributor_enabled(vm::interrupt::enabled());
+        gic.configure_debug_sgi();
         return Ok(());
     }
     let mut gic = GicV2::new(Hardware, selected_layout());
@@ -74,7 +92,9 @@ pub fn initialize() -> Result<(), Error> {
             .load(Ordering::Acquire)
             .then_some(USB_INTERRUPT_ID),
     );
+    gic.set_debug_sgi(DEBUG_SGI_OWNED.load(Ordering::Acquire));
     gic.initialize()?;
+    gic.configure_debug_sgi();
     if cpu == 0 && USB_INTERRUPT_OWNED.load(Ordering::Acquire) {
         gic.configure_owned_interrupt(1);
     }
@@ -111,19 +131,23 @@ pub fn synchronize_distributor() {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn rust_irq() {
+extern "C" fn rust_irq() -> u64 {
     let cpu = index();
     let Some(slot) = GICS.get(cpu) else {
-        return;
+        return 0;
     };
     let Some(gic) = (unsafe { &mut *slot.0.get() }) else {
-        return;
+        return 0;
     };
     gic.set_distributor_enabled(vm::interrupt::enabled());
-    if let Event::Owned(interrupt) = gic.take_interrupt() {
-        let deliver = crate::usb::service_interrupt()
-            && vm::interrupt::enabled()
-            && vm::interrupt::owned_interrupt_enabled();
-        gic.finish_owned_interrupt(interrupt, deliver);
+    match gic.take_interrupt() {
+        Event::Owned(interrupt) => {
+            let deliver = crate::usb::service_interrupt()
+                && vm::interrupt::enabled()
+                && vm::interrupt::owned_interrupt_enabled();
+            gic.finish_owned_interrupt(interrupt, deliver);
+        }
+        Event::DebugKick | Event::None | Event::Guest | Event::Maintenance => (),
     }
+    u64::from(crate::debug::irq_should_stop())
 }

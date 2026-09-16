@@ -8,6 +8,10 @@ repository.workspace = true
 homepage.workspace = true
 description = "A lightweight AArch64 hypervisor core for Nintendo Switch"
 
+[dependencies]
+gdbstub.workspace = true
+gdbstub_arch.workspace = true
+
 [features]
 baremetal = []
 

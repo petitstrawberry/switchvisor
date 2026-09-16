@@ -13,9 +13,11 @@ task_options=()
 if [[ $# -gt 4 ]]; then task_options=("${@:5}"); fi
 task_usb_uart=false
 task_usb_control=false
+task_usb_gdb=false
 for task_option in "${task_options[@]}"; do
     if [[ $task_option == --usb-uart ]]; then task_usb_uart=true; fi
     if [[ $task_option == --usb-control ]]; then task_usb_control=true; fi
+    if [[ $task_option == --usb-gdb ]]; then task_usb_gdb=true; fi
 done
 mkdir -p "$task_output"
 task_run_dir=$(mktemp -d "$task_output/.build.XXXXXX")
@@ -26,7 +28,7 @@ llvm-objcopy -O binary target/aarch64-unknown-none-softfloat/release/switchvisor
 target/debug/switchvisor-tool pack-payload "$task_run_dir/bootstrap.raw" "$task_bootstack" "$task_payload" "$task_runtime_size" "$task_run_dir/bl33.bin" "${task_options[@]}" > "$task_run_dir/manifest.json"
 if $task_usb_uart; then
     dtc -@ -I dts -O dtb -o "$task_run_dir/usb-uart.dtbo" config/tegra210-usb-uart.dts
-elif $task_usb_control; then
+elif $task_usb_control || $task_usb_gdb; then
     dtc -@ -I dts -O dtb -o "$task_run_dir/usb-control.dtbo" config/tegra210-usb-control.dts
 fi
 python3 - "$task_run_dir/manifest.json" "$task_output" "$task_payload" "$task_bootstack" <<'PY'

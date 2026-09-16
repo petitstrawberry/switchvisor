@@ -10,15 +10,15 @@ use switchvisor::{
 };
 
 const BASE: u64 = RESIDENT_BASE + 0x200000;
-const RINGS: [usize; 9] = [
-    0x200, 0x300, 0x400, 0x500, 0x600, 0x700, 0x800, 0x900, 0xa00,
+const RINGS: [usize; 12] = [
+    0x200, 0x300, 0x400, 0x500, 0x600, 0x700, 0x800, 0x900, 0xa00, 0xb00, 0xc00, 0xd00,
 ];
-const EPS: [u32; 9] = [0, 2, 3, 5, 6, 7, 9, 10, 11];
+const EPS: [u32; 12] = [0, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15];
 struct State {
     registers: BTreeMap<u64, u32>,
     dma: [u32; DMA_SIZE / 4],
     writes: Vec<(u64, u32)>,
-    latest: [u64; 9],
+    latest: [u64; 12],
     event: usize,
     cycle: u32,
     time: u64,
@@ -36,7 +36,7 @@ impl Mock {
             registers: BTreeMap::new(),
             dma: [0; DMA_SIZE / 4],
             writes: vec![],
-            latest: [0; 9],
+            latest: [0; 12],
             event: 0,
             cycle: 1,
             time: 10_000,
@@ -168,7 +168,7 @@ impl DmaBuffer for Buffer {
         let mut state = self.mock.0.borrow_mut();
         let old = state.dma[offset / 4];
         state.dma[offset / 4] = value;
-        if (0x1000..0x1300).contains(&offset) && offset % 64 == 0 && old != value {
+        if (0x1000..0x1400).contains(&offset) && offset % 64 == 0 && old != value {
             let mask = 1 << ((offset - 0x1000) / 64);
             let old = state.registers.get(&(DEV + 0x5c)).copied().unwrap_or(0);
             state.registers.insert(DEV + 0x5c, old | mask);
@@ -313,6 +313,56 @@ fn host_enumeration_descriptors_address_and_control_stages_work() {
     }
     assert_eq!(endpoints, [0x82, 0x01, 0x81, 0x84, 0x03, 0x83, 0x05, 0x85]);
     assert_eq!(mock.0.borrow().dma[(0x1000 + 3 * 64 + 4) / 4] >> 16, 512);
+}
+
+#[test]
+fn gdb_profile_adds_only_its_own_cdc_endpoints_and_channel() {
+    let mock = Mock::new();
+    let mut usb = Xudc::new(
+        mock.clone(),
+        Buffer {
+            mock: mock.clone(),
+            base: BASE,
+        },
+    );
+    usb.set_gdb_enabled(true);
+    usb.initialize().unwrap();
+    configured(&mut usb, &mock, true);
+    mock.setup(0x80, 6, 0x200, 0, 255);
+    usb.poll().unwrap();
+    let descriptor = mock.bytes(0x1400, 230);
+    assert_eq!(&descriptor[..9], &[9, 2, 230, 0, 7, 1, 0, 0xc0, 1]);
+    let mut endpoints = Vec::new();
+    let mut cursor = 0;
+    while cursor < descriptor.len() {
+        let length = usize::from(descriptor[cursor]);
+        assert!(length >= 2 && cursor + length <= descriptor.len());
+        if descriptor[cursor + 1] == 5 {
+            endpoints.push(descriptor[cursor + 2]);
+        }
+        cursor += length;
+    }
+    assert_eq!(
+        endpoints,
+        [
+            0x82, 0x01, 0x81, 0x84, 0x03, 0x83, 0x05, 0x85, 0x86, 0x07, 0x87
+        ]
+    );
+    mock.complete(0, 0, 1);
+    usb.poll().unwrap();
+    mock.setup(0x21, 0x22, 1, 5, 0);
+    usb.poll().unwrap();
+    mock.complete(0, 0, 1);
+    usb.poll().unwrap();
+    assert!(usb.connected_channel(Channel::Gdb));
+    assert_eq!(usb.send_channel(Channel::Gdb, b"$S05#b8"), Ok(7));
+    assert_eq!(mock.bytes(0x2400, 7), b"$S05#b8");
+    mock.put_bytes(0x2200, b"$?#3f");
+    mock.complete(14, 512 - 5, 13);
+    usb.poll().unwrap();
+    let mut received = [0; 8];
+    assert_eq!(usb.receive_channel(Channel::Gdb, &mut received), Ok(5));
+    assert_eq!(&received[..5], b"$?#3f");
 }
 
 #[test]

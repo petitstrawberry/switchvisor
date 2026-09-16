@@ -30,7 +30,7 @@ const DEVICE_WAIT: Duration = Duration::from_secs(15);
 const LOADER_INTERFACE: u8 = 4;
 const LOADER_OUT: u8 = 0x05;
 const LOADER_IN: u8 = 0x85;
-const USAGE: &str = "Usage:\n  switchvisorctl [--port <serial-device>] <ping|status|reboot|reboot-rcm>\n  switchvisorctl deploy <bundle-directory|bundle.json>\n  switchvisorctl upload-bl33 <payload.raw> --runtime-size <size> [--entry-offset <size>] [--x0 <value> ... --x7 <value>]\n  switchvisorctl <hello|loader-status|boot|abort>\n\nNumbers accept decimal or 0x-prefixed hexadecimal notation. SWITCHVISOR_CONTROL_PORT may supply the control serial device.";
+const USAGE: &str = "Usage:\n  switchvisorctl [--port <serial-device>] <ping|status|reboot|reboot-rcm>\n  switchvisorctl gdb-port\n  switchvisorctl deploy <bundle-directory|bundle.json>\n  switchvisorctl upload-bl33 <payload.raw> --runtime-size <size> [--entry-offset <size>] [--x0 <value> ... --x7 <value>]\n  switchvisorctl <hello|loader-status|boot|abort>\n\nNumbers accept decimal or 0x-prefixed hexadecimal notation. SWITCHVISOR_CONTROL_PORT may supply the control serial device.";
 
 fn number(value: &str) -> Result<u64, String> {
     match value
@@ -69,6 +69,27 @@ fn control_port(explicit: Option<PathBuf>) -> Result<PathBuf, String> {
         _ => {
             Err("multiple Switchvisor control CDC ports found; pass --port <serial-device>".into())
         }
+    }
+}
+
+fn gdb_port() -> Result<PathBuf, String> {
+    let mut candidates = Vec::new();
+    for port in serialport::available_ports().map_err(|error| error.to_string())? {
+        #[cfg(target_os = "macos")]
+        if !port.port_name.starts_with("/dev/cu.") {
+            continue;
+        }
+        let SerialPortType::UsbPort(info) = port.port_type else {
+            continue;
+        };
+        if info.vid == VID && info.pid == PID && matches!(info.interface, Some(5 | 6)) {
+            candidates.push(PathBuf::from(port.port_name));
+        }
+    }
+    match candidates.as_slice() {
+        [path] => Ok(path.clone()),
+        [] => Err("Switchvisor GDB CDC port not found".into()),
+        _ => Err("multiple Switchvisor GDB CDC ports found".into()),
     }
 }
 
@@ -500,6 +521,10 @@ fn run() -> Result<(), String> {
     match args[0].as_str() {
         command @ ("ping" | "status" | "reboot" | "reboot-rcm") if args.len() == 1 => {
             control(command, port)
+        }
+        "gdb-port" if args.len() == 1 && port.is_none() => {
+            println!("{}", gdb_port()?.display());
+            Ok(())
         }
         "deploy" if args.len() == 2 && port.is_none() => deploy(Path::new(&args[1])),
         "upload-bl33" if args.len() >= 2 && port.is_none() => {

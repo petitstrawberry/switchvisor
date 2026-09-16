@@ -6,6 +6,7 @@
 use crate::drivers::{Driver, InterruptController, Mmio};
 
 pub const MAINTENANCE_IRQ: u32 = 25;
+pub const DEBUG_SGI: u32 = 15;
 pub const SPURIOUS_IRQ: u32 = 1023;
 
 const GICD_CTLR: u64 = 0x000;
@@ -20,6 +21,7 @@ const GICD_IPRIORITYR6: u64 = 0x418;
 const GICD_ITARGETSR0: u64 = 0x800;
 const GICD_ICFGR0: u64 = 0xc00;
 const GICD_ICFGR1: u64 = 0xc04;
+const GICD_SGIR: u64 = 0xf00;
 const GICC_CTLR: u64 = 0x000;
 const GICC_PMR: u64 = 0x004;
 const GICC_BPR: u64 = 0x008;
@@ -103,6 +105,7 @@ pub enum Event {
     Guest,
     Owned(OwnedInterrupt),
     Maintenance,
+    DebugKick,
 }
 
 /// A physical interrupt acknowledged by EL2 but not yet deactivated or injected.
@@ -138,6 +141,7 @@ pub struct GicV2<M> {
     pending: [Pending; PENDING_SLOTS],
     pending_count: u16,
     owned_interrupt: u32,
+    debug_sgi: bool,
     // Original physical IAR values for software SGI LRs awaiting guest EOI.
     lr_iar: [u32; 64],
 }
@@ -152,6 +156,7 @@ impl<M: Mmio> GicV2<M> {
             pending: [Pending::EMPTY; PENDING_SLOTS],
             pending_count: 0,
             owned_interrupt: SPURIOUS_IRQ,
+            debug_sgi: false,
             lr_iar: [SPURIOUS_IRQ; 64],
         }
     }
@@ -376,6 +381,34 @@ impl<M: Mmio> GicV2<M> {
             .unwrap_or(SPURIOUS_IRQ);
     }
 
+    pub fn set_debug_sgi(&mut self, enabled: bool) {
+        self.debug_sgi = enabled;
+    }
+
+    pub fn configure_debug_sgi(&mut self) {
+        if !self.debug_sgi {
+            return;
+        }
+        let bit = 1 << DEBUG_SGI;
+        let group = self.read_dist(GICD_IGROUPR0) | bit;
+        self.write_dist(GICD_IGROUPR0, group);
+        let priority_register = GICD_IPRIORITYR0 + u64::from(DEBUG_SGI / 4) * 4;
+        let shift = (DEBUG_SGI % 4) * 8;
+        let priority = self.read_dist(priority_register) & !(0xff << shift);
+        self.write_dist(priority_register, priority);
+        // A stop request may race with a secondary's first GIC setup. Keep
+        // any pending SGI so it can stop that CPU after its EL1 handoff.
+        self.write_dist(GICD_ISENABLER0, bit);
+        self.mmio.barrier();
+    }
+
+    pub fn send_debug_kick(&mut self, target_mask: u8) {
+        if self.debug_sgi && target_mask != 0 {
+            self.write_dist(GICD_SGIR, (u32::from(target_mask) << 16) | DEBUG_SGI);
+            self.mmio.barrier();
+        }
+    }
+
     /// Configure the physical PPI/SPI so EL2 can service it independently from
     /// the guest distributor state. Call once on the boot CPU.
     pub fn configure_owned_interrupt(&mut self, target_mask: u8) {
@@ -514,6 +547,11 @@ impl<M: Mmio> InterruptController for GicV2<M> {
             self.complete_owned_interrupt(iar);
             self.mmio.barrier();
             return Event::Maintenance;
+        }
+        if self.debug_sgi && id == DEBUG_SGI {
+            self.complete_owned_interrupt(iar);
+            self.mmio.barrier();
+            return Event::DebugKick;
         }
 
         let pending = Pending {
@@ -675,6 +713,48 @@ mod tests {
         );
         assert_eq!(
             (gic.mmio.words[(GICD_ICFGR0 + 16) as usize / 4] >> 24) & 3,
+            0
+        );
+    }
+
+    #[test]
+    fn private_sgi_is_consumed_by_el2_without_a_guest_list_register() {
+        const TEST_LAYOUT: Layout = Layout {
+            distributor: 0,
+            distributor_size: 0x1000,
+            cpu: 0x2000,
+            cpu_size: 0x2000,
+            hypervisor: 0x4000,
+            hypervisor_size: 0x2000,
+            virtual_cpu: 0x6000,
+            virtual_cpu_size: 0x2000,
+        };
+        let mut gic = GicV2::new(Memory::new(), TEST_LAYOUT);
+        gic.list_registers = 1;
+        gic.set_debug_sgi(true);
+        gic.configure_debug_sgi();
+        assert_ne!(
+            gic.mmio.words[GICD_IGROUPR0 as usize / 4] & (1 << DEBUG_SGI),
+            0
+        );
+        gic.send_debug_kick(0b1010);
+        assert_eq!(
+            gic.mmio.words[GICD_SGIR as usize / 4],
+            (0b1010 << 16) | DEBUG_SGI
+        );
+        let iar = DEBUG_SGI | (2 << 10);
+        gic.mmio.words[(TEST_LAYOUT.cpu + GICC_IAR) as usize / 4] = iar;
+        assert_eq!(gic.take_interrupt(), Event::DebugKick);
+        assert_eq!(
+            gic.mmio.words[(TEST_LAYOUT.cpu + GICC_EOIR) as usize / 4],
+            iar
+        );
+        assert_eq!(
+            gic.mmio.words[(TEST_LAYOUT.cpu + GICC_DIR) as usize / 4],
+            iar
+        );
+        assert_eq!(
+            gic.mmio.words[(TEST_LAYOUT.hypervisor + GICH_LR0) as usize / 4],
             0
         );
     }

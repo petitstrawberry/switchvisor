@@ -1,4 +1,4 @@
-use crate::arch::aarch64 as cpu;
+use crate::{arch::aarch64 as cpu, debug};
 use core::{
     arch::asm,
     cell::UnsafeCell,
@@ -36,7 +36,7 @@ pub enum Stage {
 }
 
 pub fn record(stage: Stage) {
-    STAGES[index()].store(stage as u64, Ordering::Release);
+    STAGES[index()].store(stage as u64, Ordering::SeqCst);
 }
 
 pub fn diagnostics(screen: &mut impl Write) {
@@ -61,6 +61,16 @@ pub fn initialize() {
 
 pub fn cpu_mask() -> u8 {
     unsafe { (&*MACHINE.0.get()).online_mask() }
+}
+
+/// Only CPUs which have crossed the EL1 entry gate need an SGI or guest
+/// context. PSCI can report ON while a secondary is still in its EL2 setup.
+pub fn guest_mask() -> u8 {
+    STAGES.iter().enumerate().fold(0, |mask, (cpu, stage)| {
+        let current = stage.load(Ordering::SeqCst);
+        let active = current == Stage::Guest as u64 || current == Stage::Smc as u64;
+        mask | (u8::from(active) << cpu)
+    })
 }
 
 fn index() -> usize {
@@ -168,12 +178,26 @@ extern "C" fn rust_secondary() -> ! {
 extern "C" fn rust_cpu_dispatch() -> ! {
     record(Stage::Wait);
     loop {
+        if !debug::guest_entry_allowed() {
+            unsafe { asm!("wfe", options(nomem, nostack)) };
+            continue;
+        }
         if let Some(launch) = with_cpu(Participant::take_launch) {
             if cpu::interrupt::initialize().is_err() {
                 cpu::park()
             }
             let registers = [launch.context, 0, 0, 0, 0, 0, 0, 0];
-            record(Stage::Guest);
+            loop {
+                // Publish entry intent before the final gate check. A stop
+                // racing this check either sees this CPU in its target mask
+                // or makes the CPU return to Wait without entering EL1.
+                record(Stage::Guest);
+                if debug::guest_entry_allowed() {
+                    break;
+                }
+                record(Stage::Wait);
+                unsafe { asm!("wfe", options(nomem, nostack)) };
+            }
             unsafe { cpu::enter_payload(registers.as_ptr(), launch.entry, 0) }
         }
         unsafe {

@@ -121,6 +121,8 @@ _el2_vectors:
     add x9, x9, x11, lsl #14
     mov sp, x9
     bl rust_irq
+    cbnz x0, .Lirq_debug
+.Lirq_resume:
     mov sp, x19
     ldp x0, x1, [sp, #0]
     ldp x2, x3, [sp, #16]
@@ -135,6 +137,28 @@ _el2_vectors:
     ldr x30, [sp, #160]
     add sp, sp, #176
     eret
+.Lirq_debug:
+    bl debug_context_ptr
+    mov x9, #0
+.Lirq_copy:
+    add x12, x19, x9
+    ldp x10, x11, [x12]
+    add x12, x0, x9
+    stp x10, x11, [x12]
+    add x9, x9, #16
+    cmp x9, #160
+    b.ne .Lirq_copy
+    stp x20, x21, [x0, #160]
+    stp x22, x23, [x0, #176]
+    stp x24, x25, [x0, #192]
+    stp x26, x27, [x0, #208]
+    stp x28, x29, [x0, #224]
+    ldr x9, [x19, #160]
+    str x9, [x0, #240]
+    add x9, x19, #176
+    str x9, [x0, #824]
+    bl debug_capture_system
+    bl rust_debug_park
 .Lexception:
     msr daifset, #15
     sub sp, sp, #256
@@ -171,6 +195,8 @@ _el2_vectors:
     add x9, x9, x11, lsl #14
     mov sp, x9
     bl rust_exception
+    cbnz x0, .Lexception_debug
+.Lexception_resume:
     mov sp, x19
     mrs x11, mpidr_el1
     and x11, x11, #0xff
@@ -196,9 +222,131 @@ _el2_vectors:
     ldr x30, [sp, #240]
     add sp, sp, #256
     eret
+.Lexception_debug:
+    bl debug_context_ptr
+    mov x9, #0
+.Lexception_copy:
+    add x12, x19, x9
+    ldp x10, x11, [x12]
+    add x12, x0, x9
+    stp x10, x11, [x12]
+    add x9, x9, #16
+    cmp x9, #240
+    b.ne .Lexception_copy
+    ldr x9, [x19, #240]
+    str x9, [x0, #240]
+    add x9, x19, #256
+    str x9, [x0, #824]
+    bl debug_capture_system
+    bl rust_debug_park
 .Lexception_park:
     wfe
     b .Lexception_park
+
+// The Rust EL2 target remains softfloat. Only these explicit context-transfer
+// instructions touch the guest's FP/SIMD state on Cortex-A57.
+.arch armv8-a+simd
+.global debug_capture_system
+.type debug_capture_system, %function
+debug_capture_system:
+    mrs x9, sp_el0
+    str x9, [x0, #248]
+    mrs x9, sp_el1
+    str x9, [x0, #256]
+    mrs x9, elr_el2
+    str x9, [x0, #264]
+    mrs x9, spsr_el2
+    str x9, [x0, #272]
+    stp q0, q1, [x0, #288]
+    stp q2, q3, [x0, #320]
+    stp q4, q5, [x0, #352]
+    stp q6, q7, [x0, #384]
+    stp q8, q9, [x0, #416]
+    stp q10, q11, [x0, #448]
+    stp q12, q13, [x0, #480]
+    stp q14, q15, [x0, #512]
+    stp q16, q17, [x0, #544]
+    stp q18, q19, [x0, #576]
+    stp q20, q21, [x0, #608]
+    stp q22, q23, [x0, #640]
+    stp q24, q25, [x0, #672]
+    stp q26, q27, [x0, #704]
+    stp q28, q29, [x0, #736]
+    stp q30, q31, [x0, #768]
+    mrs x9, fpcr
+    str w9, [x0, #800]
+    mrs x9, fpsr
+    str w9, [x0, #804]
+    mrs x9, mdscr_el1
+    str x9, [x0, #832]
+    mov x9, #1
+    str x9, [x0, #816]
+    ret
+.size debug_capture_system, . - debug_capture_system
+
+.global debug_resume
+.type debug_resume, %function
+debug_resume:
+    msr daifset, #15
+    mov x30, x0
+    ldp q0, q1, [x30, #288]
+    ldp q2, q3, [x30, #320]
+    ldp q4, q5, [x30, #352]
+    ldp q6, q7, [x30, #384]
+    ldp q8, q9, [x30, #416]
+    ldp q10, q11, [x30, #448]
+    ldp q12, q13, [x30, #480]
+    ldp q14, q15, [x30, #512]
+    ldp q16, q17, [x30, #544]
+    ldp q18, q19, [x30, #576]
+    ldp q20, q21, [x30, #608]
+    ldp q22, q23, [x30, #640]
+    ldp q24, q25, [x30, #672]
+    ldp q26, q27, [x30, #704]
+    ldp q28, q29, [x30, #736]
+    ldp q30, q31, [x30, #768]
+    ldr w9, [x30, #800]
+    msr fpcr, x9
+    ldr w9, [x30, #804]
+    msr fpsr, x9
+    ldr x9, [x30, #248]
+    msr sp_el0, x9
+    ldr x9, [x30, #256]
+    msr sp_el1, x9
+    ldr x9, [x30, #832]
+    msr mdscr_el1, x9
+    ldr x9, [x30, #840]
+    msr mdcr_el2, x9
+    ldr x9, [x30, #264]
+    msr elr_el2, x9
+    ldr x9, [x30, #272]
+    msr spsr_el2, x9
+    mrs x9, mpidr_el1
+    and x9, x9, #0xff
+    adrp x10, _exception_active
+    add x10, x10, :lo12:_exception_active
+    str xzr, [x10, x9, lsl #3]
+    ldr x9, [x30, #824]
+    mov sp, x9
+    ldp x0, x1, [x30, #0]
+    ldp x2, x3, [x30, #16]
+    ldp x4, x5, [x30, #32]
+    ldp x6, x7, [x30, #48]
+    ldp x8, x9, [x30, #64]
+    ldp x10, x11, [x30, #80]
+    ldp x12, x13, [x30, #96]
+    ldp x14, x15, [x30, #112]
+    ldp x16, x17, [x30, #128]
+    ldp x18, x19, [x30, #144]
+    ldp x20, x21, [x30, #160]
+    ldp x22, x23, [x30, #176]
+    ldp x24, x25, [x30, #192]
+    ldp x26, x27, [x30, #208]
+    ldp x28, x29, [x30, #224]
+    ldr x30, [x30, #240]
+    isb
+    eret
+.size debug_resume, . - debug_resume
 
 // Raw BL33 entry. The supplied payload establishes its own runtime after this handoff.
 // Stage-2 identity map with the virtual GIC CPU interface at the native GPA.

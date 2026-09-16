@@ -13,9 +13,10 @@ static ENABLED: AtomicBool = AtomicBool::new(true);
 static OWNED_INTERRUPT_ENABLED: AtomicBool = AtomicBool::new(false);
 static LIC_OWNED_SOURCE_ENABLED: AtomicBool = AtomicBool::new(true);
 
-pub fn initialize(layout: Layout, owned_interrupt: Option<u32>) {
+pub fn initialize(layout: Layout, owned_interrupt: Option<u32>, debug_sgi: bool) {
     let mut distributor = Distributor::new(Hardware, layout);
     distributor.set_owned_interrupt(owned_interrupt);
+    distributor.set_debug_sgi(debug_sgi);
     distributor.initialize();
     ENABLED.store(distributor.enabled(), Ordering::Release);
     OWNED_INTERRUPT_ENABLED.store(distributor.owned_interrupt_enabled(), Ordering::Release);

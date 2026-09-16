@@ -3,8 +3,9 @@
 use super::cdc::{Acm, PID, VID};
 
 pub const CONTROL_SIZE: usize = 256;
-pub const ACM_COUNT: usize = 2;
+pub const ACM_COUNT: usize = 3;
 pub const CONFIGURATION_SIZE: usize = 164;
+pub const GDB_CONFIGURATION_SIZE: usize = 230;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Setup {
@@ -41,6 +42,7 @@ pub enum Reply {
 pub struct Composite {
     pub acm: [Acm; ACM_COUNT],
     pub configuration: u8,
+    gdb_enabled: bool,
     halted: u16,
 }
 
@@ -55,12 +57,23 @@ impl Composite {
         Self {
             acm: [Acm::new(); ACM_COUNT],
             configuration: 0,
+            gdb_enabled: false,
             halted: 0,
         }
     }
 
+    pub fn set_gdb_enabled(&mut self, enabled: bool) {
+        self.gdb_enabled = enabled;
+    }
+
+    pub const fn gdb_enabled(&self) -> bool {
+        self.gdb_enabled
+    }
+
     pub fn reset(&mut self) {
+        let gdb_enabled = self.gdb_enabled;
         *self = Self::new();
+        self.gdb_enabled = gdb_enabled;
     }
 
     pub fn setup(
@@ -100,10 +113,13 @@ impl Composite {
                     } else {
                         high_speed
                     };
-                    configuration(output, (setup.value >> 8) as u8, high)
+                    configuration(output, (setup.value >> 8) as u8, high, self.gdb_enabled)
                 }
                 (3, 0) if setup.index == 0 => copy(output, &[4, 3, 9, 4]),
-                (3, index @ 1..=6) if setup.index == 0x0409 || setup.index == 0 => {
+                (3, index @ 1..=7)
+                    if (setup.index == 0x0409 || setup.index == 0)
+                        && (index <= 6 || self.gdb_enabled) =>
+                {
                     string(output, index)
                 }
                 (6, 0) if setup.index == 0 => copy(output, &[10, 6, 0, 2, 0xef, 2, 1, 64, 1, 0]),
@@ -121,17 +137,23 @@ impl Composite {
             (0x80, 0) if setup.value == 0 && setup.index == 0 && setup.length == 2 => {
                 copy(output, &[1, 0])
             }
-            (0x81, 0) if setup.value == 0 && setup.index <= 4 && setup.length == 2 => {
+            (0x81, 0)
+                if setup.value == 0 && setup.index <= self.max_interface() && setup.length == 2 =>
+            {
                 copy(output, &[0, 0])
             }
-            (0x81, 10) if setup.value == 0 && setup.index <= 4 && setup.length == 1 => {
+            (0x81, 10)
+                if setup.value == 0 && setup.index <= self.max_interface() && setup.length == 1 =>
+            {
                 copy(output, &[0])
             }
-            (0x01, 11) if setup.value == 0 && setup.index <= 4 && setup.length == 0 => {
+            (0x01, 11)
+                if setup.value == 0 && setup.index <= self.max_interface() && setup.length == 0 =>
+            {
                 return Reply::Status;
             }
             (0x82, 0) if setup.value == 0 && setup.length == 2 => {
-                let Some(endpoint) = endpoint(setup.index) else {
+                let Some(endpoint) = endpoint(setup.index, self.gdb_enabled) else {
                     return Reply::Stall;
                 };
                 copy(output, &[u8::from(self.halted & (1 << endpoint) != 0), 0])
@@ -139,7 +161,8 @@ impl Composite {
             (0x02, request @ (1 | 3))
                 if setup.value == 0 && setup.length == 0 && self.configuration == 1 =>
             {
-                let Some(endpoint @ (2 | 3 | 5 | 6 | 7 | 9 | 10 | 11)) = endpoint(setup.index)
+                let Some(endpoint @ (2 | 3 | 5 | 6 | 7 | 9 | 10 | 11 | 13 | 14 | 15)) =
+                    endpoint(setup.index, self.gdb_enabled)
                 else {
                     return Reply::Stall;
                 };
@@ -152,7 +175,7 @@ impl Composite {
                 return Reply::Halt { endpoint, halted };
             }
             (request_type @ (0x21 | 0xa1), request) if self.configuration == 1 => {
-                let Some(function) = acm_function(setup.index) else {
+                let Some(function) = acm_function(setup.index, self.gdb_enabled) else {
                     return Reply::Stall;
                 };
                 match (request_type, request) {
@@ -174,9 +197,18 @@ impl Composite {
         };
         Reply::Data(size.min(usize::from(setup.length)))
     }
+
+    const fn max_interface(&self) -> u16 {
+        if self.gdb_enabled { 6 } else { 4 }
+    }
 }
 
-fn configuration(output: &mut [u8; CONTROL_SIZE], descriptor_type: u8, high: bool) -> usize {
+fn configuration(
+    output: &mut [u8; CONTROL_SIZE],
+    descriptor_type: u8,
+    high: bool,
+    gdb_enabled: bool,
+) -> usize {
     let packet: u16 = if high { 512 } else { 64 };
     let interval = if high { 9 } else { 16 };
     let mut cursor = 0;
@@ -186,9 +218,13 @@ fn configuration(output: &mut [u8; CONTROL_SIZE], descriptor_type: u8, high: boo
         &[
             9,
             descriptor_type,
-            CONFIGURATION_SIZE as u8,
-            (CONFIGURATION_SIZE >> 8) as u8,
-            5,
+            if gdb_enabled {
+                GDB_CONFIGURATION_SIZE as u8
+            } else {
+                CONFIGURATION_SIZE as u8
+            },
+            0,
+            if gdb_enabled { 7 } else { 5 },
             1,
             0,
             0xc0,
@@ -246,7 +282,27 @@ fn configuration(output: &mut [u8; CONTROL_SIZE], descriptor_type: u8, high: boo
             0,
         ],
     );
-    debug_assert_eq!(cursor, CONFIGURATION_SIZE);
+    if gdb_enabled {
+        append_cdc(
+            output,
+            &mut cursor,
+            5,
+            0x86,
+            0x07,
+            0x87,
+            7,
+            packet,
+            interval,
+        );
+    }
+    debug_assert_eq!(
+        cursor,
+        if gdb_enabled {
+            GDB_CONFIGURATION_SIZE
+        } else {
+            CONFIGURATION_SIZE
+        }
+    );
     cursor
 }
 
@@ -345,6 +401,7 @@ fn string(output: &mut [u8; CONTROL_SIZE], index: u8) -> usize {
         4 => "Guest console",
         5 => "Switchvisor control",
         6 => "Guest bundle loader",
+        7 => "Switchvisor GDB",
         _ => return 0,
     };
     let size = 2 + text.len() * 2;
@@ -367,15 +424,16 @@ fn copy(output: &mut [u8; CONTROL_SIZE], data: &[u8]) -> usize {
     data.len()
 }
 
-fn acm_function(interface: u16) -> Option<usize> {
+fn acm_function(interface: u16, gdb_enabled: bool) -> Option<usize> {
     match interface {
         0 => Some(0),
         2 => Some(1),
+        5 if gdb_enabled => Some(2),
         _ => None,
     }
 }
 
-fn endpoint(address: u16) -> Option<u8> {
+fn endpoint(address: u16, gdb_enabled: bool) -> Option<u8> {
     match address {
         0 | 0x80 => Some(0),
         0x01 => Some(2),
@@ -386,6 +444,9 @@ fn endpoint(address: u16) -> Option<u8> {
         0x84 => Some(9),
         0x05 => Some(10),
         0x85 => Some(11),
+        0x86 if gdb_enabled => Some(13),
+        0x07 if gdb_enabled => Some(14),
+        0x87 if gdb_enabled => Some(15),
         _ => None,
     }
 }

@@ -11,6 +11,8 @@ use switchvisor::payload::{
 use vm::vcpu;
 
 mod arch;
+mod debug;
+mod gdb;
 mod platform;
 mod usb;
 mod vm;
@@ -120,7 +122,7 @@ fn launch_payload(payload: Payload, handoff: &[u64; 8], screen: &mut Screen) -> 
     }
     let gic = cpu::interrupt::detect_layout();
     cpu::interrupt::select_layout(gic);
-    let physical_usb = payload.usb_uart || payload.usb_control;
+    let physical_usb = payload.usb_uart || payload.usb_control || payload.usb_gdb;
     if stage2::prepare(physical_usb, gic).is_err() || mmu::prepare().is_err() {
         let _ = writeln!(screen, "STAGE2 REJECTED: TABLE PLACEMENT");
         park()
@@ -134,6 +136,7 @@ fn launch_payload(payload: Payload, handoff: &[u64; 8], screen: &mut Screen) -> 
         physical_usb,
         payload.usb_uart,
         payload.require_upload,
+        payload.usb_gdb,
         entry,
     ) {
         Ok(true) => {
@@ -150,8 +153,11 @@ fn launch_payload(payload: Payload, handoff: &[u64; 8], screen: &mut Screen) -> 
     vm::interrupt::initialize(
         gic,
         usb::available().then_some(switchvisor::drivers::usb::tegra210::INTERRUPT_ID),
+        payload.usb_gdb && usb::available(),
     );
     cpu::interrupt::select_usb_interrupt(usb::available());
+    debug::initialize(payload.usb_gdb && usb::available());
+    cpu::interrupt::select_debug_sgi(debug::enabled());
     if let Err(error) = cpu::interrupt::initialize() {
         let _ = writeln!(screen, "VGIC INIT FAILED: {error:?}");
         park()
@@ -174,6 +180,9 @@ fn launch_payload(payload: Payload, handoff: &[u64; 8], screen: &mut Screen) -> 
         );
     }
     usb::enter_guest(entry);
+    if debug::attach_requested() {
+        cpu::interrupt::send_debug_kick(1);
+    }
     unsafe {
         asm!("dsb sy", "ic iallu", "dsb sy", "isb", options(nostack));
     }
@@ -213,7 +222,7 @@ fn guest_instruction(virtual_address: u64) -> Option<u32> {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn rust_exception(registers: &mut [u64; 31]) {
+extern "C" fn rust_exception(registers: &mut [u64; 31]) -> u64 {
     let esr: u64;
     let far: u64;
     let hpfar: u64;
@@ -226,6 +235,12 @@ extern "C" fn rust_exception(registers: &mut [u64; 31]) {
         asm!("mrs {value}, elr_el2", value = out(reg) elr, options(nomem, nostack));
         asm!("mrs {value}, spsr_el2", value = out(reg) spsr, options(nomem, nostack));
     }
+    if let Some(stop) = debug::sysreg_trap(esr, registers, elr, spsr) {
+        return u64::from(stop);
+    }
+    if matches!(spsr & 0xf, 0 | 4 | 5) && debug::exception(esr, far) {
+        return 1;
+    }
     if esr >> 26 == 0x17 && esr & 0xffff == 0 && spsr & 0xf == 5 {
         if !vcpu::handle(registers) {
             // Other SMCCC calls retain the native EL3 firmware service.
@@ -237,7 +252,7 @@ extern "C" fn rust_exception(registers: &mut [u64; 31]) {
             asm!("msr elr_el2, {value}", "msr spsr_el2, {spsr}",
                 value = in(reg) (elr + 4), spsr = in(reg) spsr, options(nostack));
         }
-        return;
+        return u64::from(debug::emulated_step() || debug::irq_should_stop());
     }
     if spsr & 0xf == 5
         && (vm::mmio::emulate(esr, far, hpfar, registers)
@@ -251,7 +266,7 @@ extern "C" fn rust_exception(registers: &mut [u64; 31]) {
             asm!("msr elr_el2, {value}", "msr spsr_el2, {spsr}",
                 value = in(reg) (elr + 4), spsr = in(reg) spsr, options(nostack));
         }
-        return;
+        return u64::from(debug::emulated_step() || debug::irq_should_stop());
     }
     let mut screen = console();
     screen.clear();
@@ -271,6 +286,7 @@ extern "C" fn rust_exception(registers: &mut [u64; 31]) {
         "FATAL EL2 EXCEPTION\nESR = {esr:016x}\nFAR = {far:016x}\nHPFAR = {hpfar:016x}\nELR = {elr:016x}\nSPSR = {spsr:016x}\nCPU PARKED"
     );
     vcpu::diagnostics(&mut screen);
+    debug::diagnostics(&mut screen);
     if esr >> 26 == 0x2f {
         let _ = writeln!(screen, "SERROR: FAR AND ELR MAY BE UNRELATED");
     }
@@ -285,6 +301,7 @@ fn panic(info: &PanicInfo<'_>) -> ! {
     let mut screen = console();
     screen.clear();
     let _ = writeln!(screen, "RUST PANIC\n{info}");
+    debug::diagnostics(&mut screen);
     unsafe {
         asm!("dsb sy", options(nostack));
     }
