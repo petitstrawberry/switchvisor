@@ -27,10 +27,8 @@ pub enum PlacementError {
     Gsc5InUse,
 }
 
-/// Match the pinned U-Boot's RAM-size and lowest-carveout calculation below 4 GiB.
-/// Called before relocation; this function uses no mutable globals or absolute pointers.
-#[inline]
-pub fn validate(mut read: impl FnMut(u64) -> u32) -> Result<(), PlacementError> {
+/// End of the DRAM aperture reported by the Tegra210 memory controller.
+pub fn ram_end(mut read: impl FnMut(u64) -> u32) -> Result<u64, PlacementError> {
     let config = read(EMEM_CFG);
     let megabytes = if config & (1 << 31) != 0 {
         (config & 0x3fff)
@@ -43,7 +41,14 @@ pub fn validate(mut read: impl FnMut(u64) -> u32) -> Result<(), PlacementError> 
     if bytes == 0 || bytes > crate::IPA_LIMIT - 0x8000_0000 {
         return Err(PlacementError::RamSize);
     }
-    let mut top = 0x8000_0000 + bytes.min(0x8000_0000);
+    Ok(0x8000_0000 + bytes)
+}
+
+/// Match the pinned U-Boot's RAM-size and lowest-carveout calculation below 4 GiB.
+/// Called before relocation; this function uses no mutable globals or absolute pointers.
+#[inline]
+pub fn validate(mut read: impl FnMut(u64) -> u32) -> Result<(), PlacementError> {
+    let mut top = ram_end(&mut read)?.min(0x1_0000_0000);
     for (bom, high, size) in CARVEOUTS {
         let address = u64::from(read(bom)) | (u64::from(read(high)) << 32);
         if read(size) != 0 && (0x8000_0000..=0x1_0000_0000).contains(&address) {

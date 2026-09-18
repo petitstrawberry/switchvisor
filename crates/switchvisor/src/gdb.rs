@@ -1,4 +1,4 @@
-//! RSP endpoint for guest-physical, all-stop EL2 debugging.
+//! RSP endpoint for all-stop EL2 debugging of guest RAM.
 //!
 //! Only CPU0 touches this module's mutable state. The state machine and its
 //! packet buffer remain resident while CPU0 is executing the guest.
@@ -33,14 +33,13 @@ use switchvisor::{
     loader::{GUEST_RAM_BASE, GUEST_RAM_END},
 };
 
-use crate::{debug, usb, vm::vcpu};
+use crate::{arch::aarch64::mmu, debug, usb, vm::vcpu};
 
 const MAX_BREAKPOINTS: usize = 64;
 const BRK: u32 = 0xd420_0000 | (0x5a5a << 5);
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static BREAKPOINT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static NEEDS_CLEANUP: AtomicBool = AtomicBool::new(false);
-
 type Machine = GdbStubStateMachine<'static, GdbTarget, GdbConnection>;
 struct Cell<T>(UnsafeCell<T>);
 // CPU0 is the sole writer; DAIF is masked in the monitor and IRQ paths.
@@ -52,6 +51,7 @@ static PACKET: Cell<[u8; 4096]> = Cell(UnsafeCell::new([0; 4096]));
 #[derive(Clone, Copy)]
 struct Breakpoint {
     address: u64,
+    physical: u64,
     original: [u8; 4],
     active: bool,
     planted: bool,
@@ -60,6 +60,7 @@ impl Breakpoint {
     const fn empty() -> Self {
         Self {
             address: 0,
+            physical: 0,
             original: [0; 4],
             active: false,
             planted: false,
@@ -116,6 +117,14 @@ impl GdbTarget {
             .iter()
             .position(|bp| bp.active && bp.address == address)
     }
+    fn breakpoint_at_pc(&self, address: u64) -> Option<usize> {
+        self.breakpoint(address).or_else(|| {
+            let physical = debug_address(address)?;
+            self.breakpoints
+                .iter()
+                .position(|bp| bp.active && bp.physical == physical)
+        })
+    }
     fn planted(&self) -> bool {
         self.breakpoints.iter().any(|bp| bp.active && bp.planted)
     }
@@ -127,14 +136,14 @@ impl GdbTarget {
     }
     fn plant(&mut self, index: usize) {
         if !self.breakpoints[index].planted {
-            Self::patch(self.breakpoints[index].address, BRK.to_le_bytes());
+            Self::patch(self.breakpoints[index].physical, BRK.to_le_bytes());
             self.breakpoints[index].planted = true;
         }
     }
     fn unplant(&mut self, index: usize) {
         if self.breakpoints[index].planted {
             Self::patch(
-                self.breakpoints[index].address,
+                self.breakpoints[index].physical,
                 self.breakpoints[index].original,
             );
             self.breakpoints[index].planted = false;
@@ -143,8 +152,12 @@ impl GdbTarget {
     fn stop_reason(&self, cpu: usize) -> MultiThreadStopReason<u64> {
         let tid = Self::tid(cpu);
         match debug::stop_cause(cpu) {
+            4 => MultiThreadStopReason::SignalWithThread {
+                tid,
+                signal: Signal::SIGBUS,
+            },
             3 => MultiThreadStopReason::DoneStep,
-            2 if debug::context(cpu).is_some_and(|ctx| self.breakpoint(ctx.pc).is_some()) => {
+            2 if debug::context(cpu).is_some_and(|ctx| self.breakpoint_at_pc(ctx.pc).is_some()) => {
                 MultiThreadStopReason::SwBreak(tid)
             }
             _ => MultiThreadStopReason::SignalWithThread {
@@ -180,7 +193,7 @@ impl GdbTarget {
         report_step: bool,
     ) -> Result<(), &'static str> {
         let address = debug::context(cpu).ok_or("missing stopped CPU context")?.pc;
-        let index = self.breakpoint(address).ok_or("missing breakpoint")?;
+        let index = self.breakpoint_at_pc(address).ok_or("missing breakpoint")?;
         self.unplant(index);
         self.step_over = Some(StepOver {
             cpu,
@@ -197,7 +210,7 @@ impl GdbTarget {
         let mut mask = 0u8;
         for cpu in 0..CPU_COUNT {
             if plan[cpu] != Action::Stop
-                && debug::context(cpu).is_some_and(|ctx| self.breakpoint(ctx.pc).is_some())
+                && debug::context(cpu).is_some_and(|ctx| self.breakpoint_at_pc(ctx.pc).is_some())
             {
                 mask |= 1 << cpu;
             }
@@ -222,7 +235,7 @@ impl GdbTarget {
         if pending.cpu != cpu {
             return Ok(StepOverResult::None);
         }
-        if let Some(index) = self.breakpoint(pending.address) {
+        if let Some(index) = self.breakpoint_at_pc(pending.address) {
             self.plant(index);
         }
         self.step_over = None;
@@ -317,40 +330,57 @@ impl MultiThreadBase for GdbTarget {
         .ok_or(TargetError::NonFatal)
     }
     fn read_addrs(&mut self, start: u64, bytes: &mut [u8], _tid: Tid) -> TargetResult<usize, Self> {
-        if !debug::world_stopped() || !debuggable_ram(start, bytes.len()) {
+        if !debug::world_stopped() || !debug_range(start, bytes.len()) {
             return Err(TargetError::NonFatal);
         }
-        for (offset, byte) in bytes.iter_mut().enumerate() {
-            let address = start + offset as u64;
-            *byte = self
-                .breakpoints
-                .iter()
-                .find_map(|bp| {
-                    (bp.active && (bp.address..bp.address + 4).contains(&address))
-                        .then_some(bp.original[(address - bp.address) as usize])
-                })
-                .unwrap_or_else(|| unsafe { core::ptr::read_volatile(address as *const u8) });
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let virtual_address = start + offset as u64;
+            let physical = debug_address(virtual_address).ok_or(TargetError::NonFatal)?;
+            let count = (4096 - (virtual_address as usize & 4095)).min(bytes.len() - offset);
+            for (index, byte) in bytes[offset..offset + count].iter_mut().enumerate() {
+                let address = physical + index as u64;
+                *byte = self
+                    .breakpoints
+                    .iter()
+                    .find_map(|bp| {
+                        if bp.active && (bp.physical..bp.physical + 4).contains(&address) {
+                            Some(bp.original[(address - bp.physical) as usize])
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| unsafe { core::ptr::read_volatile(address as *const u8) });
+            }
+            offset += count;
         }
         Ok(bytes.len())
     }
     fn write_addrs(&mut self, start: u64, bytes: &[u8], _tid: Tid) -> TargetResult<(), Self> {
-        if !debug::world_stopped() || !debuggable_ram(start, bytes.len()) {
+        if !debug::world_stopped() || !debug_range(start, bytes.len()) {
             return Err(TargetError::NonFatal);
         }
-        for (offset, byte) in bytes.iter().enumerate() {
-            let address = start + offset as u64;
-            if let Some(bp) = self
-                .breakpoints
-                .iter_mut()
-                .find(|bp| bp.active && (bp.address..bp.address + 4).contains(&address))
-            {
-                bp.original[(address - bp.address) as usize] = *byte;
-                if !bp.planted {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let virtual_address = start + offset as u64;
+            let physical = debug_address(virtual_address).ok_or(TargetError::NonFatal)?;
+            let count = (4096 - (virtual_address as usize & 4095)).min(bytes.len() - offset);
+            for (index, byte) in bytes[offset..offset + count].iter().enumerate() {
+                let address = physical + index as u64;
+                if let Some(bp) = self
+                    .breakpoints
+                    .iter_mut()
+                    .find(|bp| bp.active && (bp.physical..bp.physical + 4).contains(&address))
+                {
+                    bp.original[(address - bp.physical) as usize] = *byte;
+                    if !bp.planted {
+                        unsafe { core::ptr::write_volatile(address as *mut u8, *byte) };
+                    }
+                } else {
                     unsafe { core::ptr::write_volatile(address as *mut u8, *byte) };
                 }
-            } else {
-                unsafe { core::ptr::write_volatile(address as *mut u8, *byte) };
             }
+            offset += count;
         }
         unsafe { asm!("dsb sy", "ic iallu", "dsb sy", "isb", options(nostack)) };
         Ok(())
@@ -438,18 +468,27 @@ impl Breakpoints for GdbTarget {
 }
 impl SwBreakpoint for GdbTarget {
     fn add_sw_breakpoint(&mut self, address: u64, kind: usize) -> TargetResult<bool, Self> {
-        if !debug::world_stopped() || kind != 4 || address & 3 != 0 || !debuggable_ram(address, 4) {
+        if !debug::world_stopped() || kind != 4 || address & 3 != 0 || !debug_range(address, 4) {
             return Ok(false);
         }
         if self.breakpoint(address).is_some() {
             return Ok(true);
         }
+        let physical = debug_address(address).ok_or(TargetError::NonFatal)?;
+        if self
+            .breakpoints
+            .iter()
+            .any(|bp| bp.active && bp.physical == physical)
+        {
+            return Ok(false);
+        }
         let Some(index) = self.breakpoints.iter().position(|bp| !bp.active) else {
             return Ok(false);
         };
-        let original = unsafe { core::ptr::read_volatile(address as *const u32) }.to_le_bytes();
+        let original = unsafe { core::ptr::read_volatile(physical as *const u32) }.to_le_bytes();
         self.breakpoints[index] = Breakpoint {
             address,
+            physical,
             original,
             active: true,
             planted: false,
@@ -479,10 +518,40 @@ impl SwBreakpoint for GdbTarget {
 }
 
 fn debuggable_ram(address: u64, size: usize) -> bool {
-    address >= GUEST_RAM_BASE
-        && address
-            .checked_add(size as u64)
-            .is_some_and(|end| end <= GUEST_RAM_END)
+    let Some(end) = address.checked_add(size as u64) else {
+        return false;
+    };
+    (address >= GUEST_RAM_BASE && end <= GUEST_RAM_END)
+        || (address >= 0x1_0000_0000 && end <= debug::ram_end())
+}
+
+fn debug_address(address: u64) -> Option<u64> {
+    // Preserve explicit physical access to the identity-mapped guest RAM.
+    // Other addresses use the current EL1 stage-1 plus stage-2 translation.
+    let physical = if debuggable_ram(address, 1) {
+        address
+    } else {
+        mmu::guest_physical(address)?
+    };
+    debuggable_ram(physical, 1).then_some(physical)
+}
+
+fn debug_range(start: u64, size: usize) -> bool {
+    let Some(end) = start.checked_add(size as u64) else {
+        return false;
+    };
+    let mut address = start;
+    while address < end {
+        let Some(physical) = debug_address(address) else {
+            return false;
+        };
+        let count = ((4096 - (address & 4095)).min(end - address)) as usize;
+        if !debuggable_ram(physical, count) {
+            return false;
+        }
+        address += count as u64;
+    }
+    true
 }
 
 pub fn active() -> bool {

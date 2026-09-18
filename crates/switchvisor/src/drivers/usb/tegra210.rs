@@ -60,6 +60,8 @@ pub struct Statistics {
     pub dropped: u64,
     pub received: u64,
     pub transmitted: u64,
+    pub channel_received: [u64; 4],
+    pub channel_transmitted: [u64; 4],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -76,6 +78,10 @@ pub struct Snapshot {
     pub configuration: u8,
     pub dtr: bool,
     pub control_dtr: bool,
+    pub gdb_dtr: bool,
+    pub out_armed: u8,
+    pub rx_pending: u8,
+    pub tx_pending: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -201,6 +207,8 @@ impl<H, D> Xudc<H, D> {
                 dropped: 0,
                 received: 0,
                 transmitted: 0,
+                channel_received: [0; 4],
+                channel_transmitted: [0; 4],
             },
         }
     }
@@ -225,6 +233,14 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
 
     /// Read-only boot diagnostics. Call only after successful initialization.
     pub fn snapshot(&mut self) -> Snapshot {
+        let mut out_armed = 0;
+        let mut rx_pending = 0;
+        let mut tx_pending = 0;
+        for (index, channel) in self.channels.iter().enumerate() {
+            out_armed |= u8::from(channel.out.is_some()) << index;
+            rx_pending |= u8::from(channel.rx.is_some()) << index;
+            tx_pending |= u8::from(channel.tx.is_some()) << index;
+        }
         Snapshot {
             control: self.hardware.read32(DEV + 0x30),
             port: self.hardware.read32(DEV + 0x3c),
@@ -238,6 +254,10 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
             configuration: self.device.configuration,
             dtr: self.device.acm[Channel::Console.index()].dtr,
             control_dtr: self.device.acm[Channel::Control.index()].dtr,
+            gdb_dtr: self.device.acm[2].dtr,
+            out_armed,
+            rx_pending,
+            tx_pending,
         }
     }
     fn update(&mut self, address: u64, clear: u32, set: u32) {
@@ -450,7 +470,24 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
         }
         if let Some(function) = NOTIFY_RINGS.iter().position(|&candidate| candidate == ring) {
             self.notifications[function].transfer = None;
+            self.notifications[function].needed = true;
         }
+    }
+
+    fn recover_data_endpoint(&mut self, ep: u8) -> Result<bool, Error> {
+        let Some(ring) = ENDPOINTS[1..self.active_endpoints()]
+            .iter()
+            .position(|&candidate| candidate == ep)
+            .map(|index| index + 1)
+        else {
+            return Ok(false);
+        };
+        // A host abort can complete an in-flight CDC transfer with an error.
+        // Reset only that endpoint; the control and other CDC ports remain live.
+        self.halt(ep, true)?;
+        self.clear_endpoint_state(ring);
+        self.endpoint(ring)?;
+        Ok(true)
     }
 
     fn setup(&mut self, words: [u32; 4]) -> Result<(), Error> {
@@ -581,6 +618,7 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
                 }
                 let length = capacity - remaining;
                 self.statistics.received += length as u64;
+                self.statistics.channel_received[channel] += length as u64;
                 state.rx = (length != 0).then_some(Receive { cursor: 0, length });
                 Ok(())
             }
@@ -597,6 +635,7 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
                             return Err(Error::Transfer);
                         }
                         self.statistics.transmitted += (length - remaining) as u64;
+                        self.statistics.channel_transmitted[channel] += (length - remaining) as u64;
                         self.statistics.dropped += remaining as u64;
                         if remaining != 0 {
                             return Err(Error::Transfer);
@@ -913,8 +952,21 @@ impl<H: Mmio + Clock, D: DmaBuffer> Driver for Xudc<H, D> {
             );
             if let Err(error) = result {
                 self.statistics.errors += 1;
-                self.failed = true;
-                return Err(error);
+                let recovered = if (control >> 10) & 63 == 32 {
+                    match self.recover_data_endpoint(((control >> 16) & 31) as u8) {
+                        Ok(recovered) => recovered,
+                        Err(recovery_error) => {
+                            self.failed = true;
+                            return Err(recovery_error);
+                        }
+                    }
+                } else {
+                    false
+                };
+                if !recovered {
+                    self.failed = true;
+                    return Err(error);
+                }
             }
         }
         self.arm_data()

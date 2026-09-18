@@ -310,7 +310,6 @@ pub fn service_interrupt() -> bool {
 fn service_locked(state: &mut Service) {
     if let Err(error) = state.driver.poll() {
         state.error = Some(error);
-        return;
     }
     service_guest_console(state);
     service_control(state);
@@ -362,6 +361,9 @@ fn service_gdb(state: &mut Service) {
     let capacity = state
         .driver
         .send_capacity_channel(Channel::Gdb)
+        // Keep each RSP fragment below the high-speed max packet size. Large
+        // memory replies otherwise force an intervening CDC zero-length packet.
+        .min(256)
         .min(bytes.len());
     if capacity != 0 {
         let count = state.gdb_tx.peek(&mut bytes[..capacity]);
@@ -470,6 +472,47 @@ fn control_reply(state: &mut Service, command: Result<Command, ParseError>) {
             let _ = writeln!(state.control_output, "state={boot}");
             let _ = writeln!(state.control_output, "cpu-mask={:#x}", vcpu::cpu_mask());
             let _ = writeln!(state.control_output, "usb=up");
+            let snapshot = state.driver.snapshot();
+            let stats = &state.driver.statistics;
+            let _ = writeln!(state.control_output, "usb-errors={}", stats.errors);
+            let _ = writeln!(
+                state.control_output,
+                "usb-dtr={}/{}/{}",
+                u8::from(snapshot.dtr),
+                u8::from(snapshot.control_dtr),
+                u8::from(snapshot.gdb_dtr)
+            );
+            let _ = writeln!(
+                state.control_output,
+                "usb-endpoints={:08x},{:08x},{:x},{:x},{:x}",
+                snapshot.endpoint_halt,
+                snapshot.endpoint_pause,
+                snapshot.out_armed,
+                snapshot.rx_pending,
+                snapshot.tx_pending
+            );
+            let _ = writeln!(
+                state.control_output,
+                "usb-data={},{},{},{}",
+                stats.received, stats.transmitted, stats.dropped, stats.events
+            );
+            let rx = stats.channel_received;
+            let tx = stats.channel_transmitted;
+            let _ = writeln!(
+                state.control_output,
+                "usb-rx={},{},{},{}",
+                rx[0], rx[1], rx[2], rx[3]
+            );
+            let _ = writeln!(
+                state.control_output,
+                "usb-tx={},{},{},{}",
+                tx[0], tx[1], tx[2], tx[3]
+            );
+            let _ = writeln!(
+                state.control_output,
+                "usb-last-event={:08x},{:08x},{:08x},{:08x}",
+                stats.last_event[0], stats.last_event[1], stats.last_event[2], stats.last_event[3]
+            );
             let _ = writeln!(state.control_output, "loader={loader}");
             let fallback = if REQUIRE_UPLOAD.load(Ordering::Acquire) {
                 "disabled"
@@ -488,6 +531,14 @@ fn control_reply(state: &mut Service, command: Result<Command, ParseError>) {
                 "gdb-stop-reason={}",
                 crate::debug::last_stop_cause()
             );
+            let stop_cpu = crate::debug::last_stop_cpu() as usize;
+            if stop_cpu < switchvisor::CPU_COUNT {
+                let _ = writeln!(
+                    state.control_output,
+                    "gdb-stop-esr={:#x}",
+                    crate::debug::stop_esr(stop_cpu)
+                );
+            }
             let _ = writeln!(
                 state.control_output,
                 "gdb-missing-mask={:#x}",

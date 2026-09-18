@@ -6,10 +6,10 @@ use core::{
     cell::UnsafeCell,
     sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
-use switchvisor::CPU_COUNT;
+use switchvisor::{CPU_COUNT, mc};
 
 use crate::{arch::aarch64::interrupt, platform::tegra210::io::Hardware, vm::vcpu};
-use switchvisor::drivers::Clock;
+use switchvisor::drivers::{Clock, Mmio};
 
 const DISABLED: u8 = 0;
 const RUNNING: u8 = 1;
@@ -19,6 +19,7 @@ const RESUMING: u8 = 4;
 const RESUME_NONE: u8 = 0;
 const RESUME_CONTINUE: u8 = 1;
 const STOP_TIMEOUT_US: u64 = 1_000_000;
+const HCR_AMO: u64 = 1 << 5;
 
 #[repr(C, align(16))]
 #[derive(Clone, Copy)]
@@ -118,6 +119,7 @@ static STOP_FAR: [AtomicU64; CPU_COUNT] = [const { AtomicU64::new(0) }; CPU_COUN
 static LAST_STOP_CPU: AtomicU8 = AtomicU8::new(0xff);
 static LAST_STOP_CAUSE: AtomicU8 = AtomicU8::new(0);
 static LAST_MISSING_MASK: AtomicU8 = AtomicU8::new(0);
+static RAM_END: AtomicU64 = AtomicU64::new(0);
 
 unsafe extern "C" {
     fn debug_resume(context: *const GuestContext) -> !;
@@ -130,8 +132,14 @@ fn cpu_id() -> usize {
 }
 
 pub fn initialize(enabled: bool) {
+    let ram_end = mc::ram_end(|offset| Hardware.read32(mc::BASE + offset)).unwrap_or(0);
+    RAM_END.store(ram_end, Ordering::Release);
     ENABLED.store(enabled, Ordering::Release);
     WORLD.store(if enabled { RUNNING } else { DISABLED }, Ordering::SeqCst);
+}
+
+pub fn ram_end() -> u64 {
+    RAM_END.load(Ordering::Acquire)
 }
 
 pub fn enabled() -> bool {
@@ -197,13 +205,20 @@ pub fn irq_should_stop() -> bool {
 }
 
 pub fn exception(esr: u64, far: u64) -> bool {
-    if !enabled() || !matches!(esr >> 26, 0x30 | 0x32 | 0x34 | 0x3c) {
+    if !enabled() || !matches!(esr >> 26, 0x2f | 0x30 | 0x32 | 0x34 | 0x3c) {
         return false;
     }
     let cpu = cpu_id();
     STOP_ESR[cpu].store(esr, Ordering::Release);
     STOP_FAR[cpu].store(far, Ordering::Release);
-    record_stop(cpu, if esr >> 26 == 0x32 { 3 } else { 2 });
+    record_stop(
+        cpu,
+        match esr >> 26 {
+            0x2f => 4,
+            0x32 => 3,
+            _ => 2,
+        },
+    );
     true
 }
 
@@ -491,6 +506,17 @@ pub fn return_to_guest(cpu: usize) -> ! {
     }
     RESUME_READY[cpu].store(false, Ordering::Release);
     PARKED[cpu].store(false, Ordering::Release);
+    // Keep asynchronous guest errors in EL2 while GDB owns the vCPU. If an
+    // SError arrives during a step, report it instead of letting the guest's
+    // fatal handler park CPU0 and strand the USB control port.
+    let hcr: u64;
+    unsafe { asm!("mrs {value}, hcr_el2", value = out(reg) hcr, options(nomem, nostack)) };
+    let hcr = if crate::gdb::active() {
+        hcr | HCR_AMO
+    } else {
+        hcr & !HCR_AMO
+    };
+    unsafe { asm!("msr hcr_el2, {value}", "isb", value = in(reg) hcr, options(nostack)) };
     unsafe { debug_resume(debug_contexts[cpu].0.get()) }
 }
 
@@ -526,6 +552,17 @@ pub fn stop_world() -> bool {
 #[unsafe(no_mangle)]
 extern "C" fn rust_debug_park() -> ! {
     let cpu = cpu_id();
+    // Firmware and the guest can leave either OS debug lock set. The monitor
+    // owns debug exceptions while a GDB session is active, so unlock this
+    // CPU before programming MDSCR_EL1 for single-step on resume.
+    unsafe {
+        asm!(
+            "msr osdlr_el1, xzr",
+            "msr oslar_el1, xzr",
+            "isb",
+            options(nostack)
+        );
+    }
     let ctx = unsafe { &mut *debug_contexts[cpu].0.get() };
     if ctx.stepping != 0 {
         ctx.pstate = (ctx.pstate & !(1 << 21)) | ctx.saved_guest_ss;

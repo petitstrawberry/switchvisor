@@ -355,6 +355,11 @@ fn gdb_profile_adds_only_its_own_cdc_endpoints_and_channel() {
     mock.complete(0, 0, 1);
     usb.poll().unwrap();
     assert!(usb.connected_channel(Channel::Gdb));
+    mock.setup(0x21, 0x22, 1, 2, 0);
+    usb.poll().unwrap();
+    mock.complete(0, 0, 1);
+    usb.poll().unwrap();
+    assert!(usb.connected_channel(Channel::Control));
     assert_eq!(usb.send_channel(Channel::Gdb, b"$S05#b8"), Ok(7));
     assert_eq!(mock.bytes(0x2400, 7), b"$S05#b8");
     mock.put_bytes(0x2200, b"$?#3f");
@@ -363,6 +368,13 @@ fn gdb_profile_adds_only_its_own_cdc_endpoints_and_channel() {
     let mut received = [0; 8];
     assert_eq!(usb.receive_channel(Channel::Gdb, &mut received), Ok(5));
     assert_eq!(&received[..5], b"$?#3f");
+
+    mock.complete(15, 0, 4);
+    assert_eq!(usb.poll(), Ok(()));
+    assert_eq!(usb.statistics.errors, 1);
+    assert!(usb.connected_channel(Channel::Gdb));
+    assert!(usb.connected_channel(Channel::Control));
+    assert_eq!(usb.send_channel(Channel::Gdb, b"retry"), Ok(5));
 }
 
 #[test]
@@ -565,12 +577,14 @@ fn unplug_and_bus_reset_drop_inflight_bytes_and_allow_reenumeration() {
     configured(&mut usb, &mock, true);
     assert_eq!(usb.send(b"again\n"), Ok(6));
     mock.complete(3, 0, 4);
-    assert_eq!(usb.poll(), Err(Error::Transfer));
-    assert!(!usb.connected());
+    assert_eq!(usb.poll(), Ok(()));
+    assert_eq!(usb.statistics.errors, 1);
+    assert!(usb.connected());
+    assert_eq!(usb.send(b"recovered\n"), Ok(10));
     mock.port(1 | (3 << 10) | (1 << 21));
     usb.poll().unwrap();
     configured(&mut usb, &mock, true);
-    assert_eq!(usb.send(b"recovered\n"), Ok(10));
+    assert_eq!(usb.send(b"after reset\n"), Ok(12));
 }
 
 #[test]

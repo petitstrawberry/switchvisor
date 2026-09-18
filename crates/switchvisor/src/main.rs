@@ -195,24 +195,7 @@ fn guest_instruction(virtual_address: u64) -> Option<u32> {
     if virtual_address & 3 != 0 {
         return None;
     }
-    let saved_par: u64;
-    let translated: u64;
-    unsafe {
-        asm!("mrs {saved}, par_el1", saved = out(reg) saved_par, options(nomem, nostack));
-        asm!(
-            "at s12e1r, {address}",
-            "isb",
-            "mrs {translated}, par_el1",
-            address = in(reg) virtual_address,
-            translated = out(reg) translated,
-            options(nostack),
-        );
-        asm!("msr par_el1, {saved}", saved = in(reg) saved_par, options(nomem, nostack));
-    }
-    if translated & 1 != 0 {
-        return None;
-    }
-    let physical_address = (translated & 0x0000_ffff_ffff_f000) | (virtual_address & 0xfff);
+    let physical_address = mmu::guest_physical(virtual_address)?;
     if physical_address >= switchvisor::IPA_LIMIT
         || (RESIDENT_BASE..RESIDENT_BASE + RESIDENT_SIZE).contains(&physical_address)
     {

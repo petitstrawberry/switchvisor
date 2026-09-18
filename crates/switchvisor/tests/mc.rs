@@ -22,8 +22,16 @@ fn registers() -> [u32; 1024] {
 #[test]
 fn standard_and_swiss_cheese_ram_discovery_leave_room_for_resident_el2() {
     let mut words = registers();
+    assert_eq!(
+        mc::ram_end(|offset| words[offset as usize / 4]),
+        Ok(0x1_8000_0000)
+    );
     assert_eq!(mc::validate(|offset| words[offset as usize / 4]), Ok(()));
     words[0x50 / 4] = 0x80001800;
+    assert_eq!(
+        mc::ram_end(|offset| words[offset as usize / 4]),
+        Ok(0x1_8000_0000)
+    );
     assert_eq!(mc::validate(|offset| words[offset as usize / 4]), Ok(()));
     words[0x50 / 4] = 0x800007ff;
     assert_eq!(

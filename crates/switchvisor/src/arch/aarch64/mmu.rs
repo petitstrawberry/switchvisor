@@ -28,3 +28,24 @@ pub unsafe fn enable() {
             sctlr = in(reg) ((sctlr | 1) & !((1 << 2) | (1 << 12))), options(nostack));
     }
 }
+
+/// Translate an EL1 virtual address through the current guest's stage 1 and
+/// stage 2 tables. The caller must validate the resulting physical address.
+pub fn guest_physical(virtual_address: u64) -> Option<u64> {
+    let saved_par: u64;
+    let translated: u64;
+    unsafe {
+        asm!("mrs {saved}, par_el1", saved = out(reg) saved_par, options(nomem, nostack));
+        asm!(
+            "at s12e1r, {address}",
+            "isb",
+            "mrs {translated}, par_el1",
+            address = in(reg) virtual_address,
+            translated = out(reg) translated,
+            options(nostack),
+        );
+        asm!("msr par_el1, {saved}", saved = in(reg) saved_par, options(nomem, nostack));
+    }
+    (translated & 1 == 0)
+        .then_some((translated & 0x0000_ffff_ffff_f000) | (virtual_address & 0xfff))
+}

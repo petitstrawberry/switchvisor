@@ -329,17 +329,29 @@ set scheduler-locking on
 info threads
 ```
 
+On macOS, LLDB can reach the serial port through a local TCP bridge:
+
+```sh
+socat TCP-LISTEN:2159,bind=127.0.0.1,reuseaddr \
+  FILE:/dev/cu.usbmodem...,rawer,echo=0,ispeed=115200,ospeed=115200
+```
+
+In another terminal, run `lldb path/to/guest.elf` and enter `gdb-remote 2159`.
+
 GDB thread IDs 1–4 correspond to physical CPUs 0–3. Opening the serial port
 alone does not stop the guest; the first GDB packet starts an all-stop session.
 Registers, `continue`, `stepi`, software breakpoints, and guest RAM reads and
 writes are supported. `detach` resumes the guest and removes breakpoints.
 `switchvisorctl status` reports the debugger state and last stop.
 
-GDB memory addresses are guest physical addresses (`GPA = HPA`); the reported PC
-remains the guest virtual address. For a nonidentity-mapped guest, translate
-addresses before using GDB memory or software-breakpoint commands. Automatic
-breakpoint step-over assumes identity-mapped executable code. SGI 15 is reserved
-for EL2 while `--usb-gdb` is enabled.
+GDB memory and software-breakpoint addresses inside guest RAM are treated as
+physical addresses (`GPA = HPA`) for compatibility. Other addresses, including
+high kernel virtual addresses, are translated through CPU0's current EL1 and
+stage-2 page tables. Low guest RAM below the Switchvisor reservation and the
+high DRAM bank reported by the memory controller are accessible; MMIO and
+Switchvisor's resident memory remain excluded. Kernel mappings shared across
+CPUs work with this model, while per-process address spaces on other CPUs are
+not yet supported. SGI 15 is reserved for EL2 while `--usb-gdb` is enabled.
 
 ### Automatic payload cycle
 
