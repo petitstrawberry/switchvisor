@@ -1,0 +1,53 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// EL2-owned USB policy for the supported ODIN (Erista) platform DTB.
+/dts-v1/;
+/plugin/;
+
+/ {
+    fragment@0 {
+        target-path = "/xusb@70090000";
+        __overlay__ { status = "disabled"; };
+    };
+    fragment@1 {
+        target-path = "/xusb_padctl@7009f000";
+        __overlay__ { status = "disabled"; };
+    };
+    fragment@2 {
+        target-path = "/usb_cd";
+        __overlay__ { status = "disabled"; };
+    };
+    fragment@3 {
+        target-path = "/mailbox@70098000";
+        __overlay__ { status = "disabled"; };
+    };
+    fragment@4 {
+        target-path = "/i2c@7000c000/bm92t@18";
+        __overlay__ { status = "disabled"; };
+    };
+    fragment@5 {
+        target-path = "/power-domain/xusba-pd";
+        __overlay__ { status = "disabled"; };
+    };
+    fragment@6 {
+        target-path = "/power-domain/xusbb-pd";
+        __overlay__ { status = "disabled"; };
+    };
+    fragment@7 {
+        target-path = "/power-domain/xusbc-pd";
+        __overlay__ { status = "disabled"; };
+    };
+    fragment@8 {
+        target-path = "/";
+        __overlay__ {
+            #address-cells = <2>;
+            #size-cells = <2>;
+            virtio_net@700fe000 {
+                compatible = "virtio,mmio";
+                reg = <0 0x700fe000 0 0x1000>;
+                interrupt-parent = <&lic>;
+                interrupts = <0 39 4>;
+                status = "okay";
+            };
+        };
+    };
+};

@@ -26,14 +26,14 @@ def main():
     reports = []
     cases = [(f"mmu{mmu}-{name}", mmu, action, usb)
              for mmu in [0, 1] for name, action, usb in [
-                 ("uart", 12, False), ("uart-usb", 12, True), ("owned-usb", 14, True),
+                 ("uart-disabled", 16, False), ("uart-usb", 12, True), ("owned-usb", 14, True),
                  ("uart-invalid-width", 15, True), ("wfi-physical-irq", 4, True)]]
-    cases += [(f"uart-stage1-alias-usb{int(usb)}", 1, 13, usb) for usb in [False, True]]
+    cases += [("uart-stage1-alias-usb1", 1, 13, True)]
     for nonce, (name, mmu, action, usb) in enumerate(cases, 1):
         raw = output / f"{name}.raw"
         payload.assemble(f".set SV_MMU,{mmu}\n.set SV_ACTION,{action}\n"
                          f".set SV_ADDRESS,0x700ff000\n.set SV_NONCE,{nonce}\n" + fixture, raw)
-        expected = [4, 0 if action == 15 else 1, *([0] * 9), nonce]
+        expected = [4, 0 if action in [15, 16] else 1, *([0] * 9), nonce]
         loaders = []
         physical = []
         fault = None
@@ -41,7 +41,7 @@ def main():
             expected[2:11] = [1, 0x60, 0xc1, 5, 0xffffffa5, 0xffffffffffffffa5, 0xa5, 0, 0]
         elif action == 4:
             expected[2:4] = [4, 30]
-        elif action == 15:
+        elif action in [15, 16]:
             fault = (0x700ff000, 0x24, 7)
             loaders.append((0x700ff000, stage2.SENTINEL))
         else:

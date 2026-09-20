@@ -70,6 +70,7 @@ fn usb_profile_traps_controllers_car_and_pmc_without_hiding_other_devices() {
         for address in (start..start + size).step_by(PAGE_SIZE as usize) {
             let trapped = address == mc::BASE
                 || address == uart::BASE
+                || address == switchvisor::vdev::virtio_net::BASE
                 || address == ownership::CAR
                 || address == ownership::LIC
                 || address == ownership::PMC_PAGE
@@ -132,7 +133,10 @@ fn every_block_and_mc_page_is_identity_mapped_except_the_exclusions() {
         for ipa in [page, page + PAGE_SIZE - 1] {
             assert_eq!(
                 translate(&tables, ipa).map(|r| r.0),
-                (page != mc::BASE && page != uart::BASE).then_some(ipa)
+                (page != mc::BASE
+                    && page != uart::BASE
+                    && page != switchvisor::vdev::virtio_net::BASE)
+                    .then_some(ipa)
             );
             if let Some((_, descriptor)) = translate(&tables, ipa) {
                 assert_eq!(descriptor & (0xf << 2), 0);

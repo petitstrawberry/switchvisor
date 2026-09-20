@@ -3,6 +3,7 @@ pub mod gicv2;
 pub mod lic;
 pub mod uart;
 pub mod usb_ownership;
+pub mod virtio_net;
 
 use crate::mmio::Access;
 

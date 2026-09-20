@@ -6,6 +6,7 @@ use switchvisor::{drivers::Mmio, mc, mmio::Access, vdev::usb_ownership as owners
 
 pub fn emulate(esr: u64, far: u64, hpfar: u64, registers: &mut [u64; 31]) -> bool {
     console::emulate_uart(esr, far, hpfar, registers)
+        || super::network::emulate(esr, far, hpfar, registers)
         || super::interrupt::emulate(esr, far, hpfar, registers)
         || usb(esr, far, hpfar, registers)
         || mc(esr, far, hpfar, registers)

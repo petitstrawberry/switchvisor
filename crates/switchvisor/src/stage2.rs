@@ -85,7 +85,8 @@ pub fn build(
     let page_base = mc::BASE & !(BLOCK_SIZE - 1);
     for (index, descriptor) in pages.0.iter_mut().enumerate() {
         let address = page_base + index as u64 * PAGE_SIZE;
-        if address != mc::BASE && address != uart::BASE {
+        if address != mc::BASE && address != uart::BASE && address != crate::vdev::virtio_net::BASE
+        {
             *descriptor = address | DEVICE | 2; // L3 page descriptor
         }
     }

@@ -1,4 +1,4 @@
-//! Tegra210 LIC pass-through with one EL2-owned interrupt source.
+//! Tegra210 LIC pass-through with EL2-owned USB and network interrupt sources.
 
 use super::{DeviceError, MmioRegion, VirtualDevice};
 use crate::drivers::Mmio;
@@ -19,100 +19,112 @@ const CPU_IEP_CLASS: u64 = 0x2c;
 
 pub struct Lic<M> {
     mmio: M,
-    owned_source: Option<u32>,
-    guest_enabled: bool,
+    owned_source: [Option<u32>; 2],
+    guest_enabled: [bool; 2],
 }
 
 impl<M: Mmio> Lic<M> {
     pub const fn new(mmio: M) -> Self {
         Self {
             mmio,
-            owned_source: None,
-            guest_enabled: false,
+            owned_source: [None; 2],
+            guest_enabled: [false; 2],
         }
     }
 
     pub fn set_owned_source(&mut self, source: Option<u32>) {
-        self.owned_source = source.filter(|source| *source < SOURCE_COUNT);
-        self.guest_enabled = false;
+        self.owned_source[0] = source.filter(|source| *source < SOURCE_COUNT);
+        self.guest_enabled[0] = false;
     }
 
-    fn owned(&self) -> Option<(u64, u32)> {
-        self.owned_source
+    pub fn set_network_source(&mut self, source: Option<u32>) {
+        self.owned_source[1] = source.filter(|source| *source < SOURCE_COUNT);
+        self.guest_enabled[1] = false;
+    }
+
+    pub fn network_source_enabled(&self) -> bool {
+        self.guest_enabled[1]
+    }
+
+    fn owned(&self, index: usize) -> Option<(u64, u32)> {
+        self.owned_source[index]
             .map(|source| (u64::from(source / 32) * BANK_STRIDE, 1 << (source % 32)))
     }
 
     /// Keep the physical source routed to the CPU as an IRQ. Guest enable
     /// state is exposed separately and only controls virtual delivery.
     pub fn initialize(&mut self) {
-        let Some((bank, bit)) = self.owned() else {
-            return;
-        };
-        let class = self.mmio.read32(BASE + bank + CPU_IEP_CLASS);
-        self.mmio.write32(BASE + bank + CPU_IEP_CLASS, class & !bit);
-        self.mmio.write32(BASE + bank + CPU_IER_SET, bit);
+        for index in 0..2 {
+            let Some((bank, bit)) = self.owned(index) else {
+                continue;
+            };
+            let class = self.mmio.read32(BASE + bank + CPU_IEP_CLASS);
+            self.mmio.write32(BASE + bank + CPU_IEP_CLASS, class & !bit);
+            self.mmio.write32(BASE + bank + CPU_IER_SET, bit);
+        }
         self.mmio.barrier();
     }
 
     pub const fn owned_source_enabled(&self) -> bool {
-        self.guest_enabled
+        self.guest_enabled[0]
     }
 
     fn read_word(&mut self, offset: u64) -> u32 {
         let mut value = self.mmio.read32(BASE + offset);
-        let Some((bank, bit)) = self.owned() else {
-            return value;
-        };
-        let register = offset.checked_sub(bank);
-        if matches!(
-            register,
-            Some(
-                CPU_IEP_VFIQ
-                    | CPU_ISR
-                    | CPU_IEP_FIR
-                    | CPU_IEP_FIR_SET
-                    | CPU_IEP_FIR_CLR
-                    | CPU_IER
-                    | CPU_IER_SET
-                    | CPU_IER_CLR
-                    | CPU_IEP_CLASS
-            )
-        ) {
-            value &= !bit;
-        }
-        if register == Some(CPU_IER) && self.guest_enabled {
-            value |= bit;
+        for index in 0..2 {
+            let Some((bank, bit)) = self.owned(index) else {
+                continue;
+            };
+            let register = offset.checked_sub(bank);
+            if matches!(
+                register,
+                Some(
+                    CPU_IEP_VFIQ
+                        | CPU_ISR
+                        | CPU_IEP_FIR
+                        | CPU_IEP_FIR_SET
+                        | CPU_IEP_FIR_CLR
+                        | CPU_IER
+                        | CPU_IER_SET
+                        | CPU_IER_CLR
+                        | CPU_IEP_CLASS
+                )
+            ) {
+                value &= !bit;
+            }
+            if register == Some(CPU_IER) && self.guest_enabled[index] {
+                value |= bit;
+            }
         }
         value
     }
 
     fn write_word(&mut self, offset: u64, mut value: u32) {
-        let Some((bank, bit)) = self.owned() else {
-            self.mmio.write32(BASE + offset, value);
-            self.mmio.barrier();
-            return;
-        };
-        match offset.checked_sub(bank) {
-            Some(CPU_IER_SET) => {
-                self.guest_enabled |= value & bit != 0;
-                value &= !bit;
+        for index in 0..2 {
+            let Some((bank, bit)) = self.owned(index) else {
+                continue;
+            };
+            match offset.checked_sub(bank) {
+                Some(CPU_IER_SET) => {
+                    self.guest_enabled[index] |= value & bit != 0;
+                    value &= !bit;
+                }
+                Some(CPU_IER_CLR) => {
+                    self.guest_enabled[index] &= value & bit == 0;
+                    value &= !bit;
+                }
+                Some(CPU_IEP_CLASS) => {
+                    let current = self.mmio.read32(BASE + offset);
+                    value = (value & !bit) | (current & bit);
+                }
+                Some(
+                    CPU_IEP_VFIQ | CPU_ISR | CPU_IEP_FIR | CPU_IEP_FIR_SET | CPU_IEP_FIR_CLR
+                    | CPU_IER,
+                ) => value &= !bit,
+                _ => {}
             }
-            Some(CPU_IER_CLR) => {
-                self.guest_enabled &= value & bit == 0;
-                value &= !bit;
-            }
-            Some(CPU_IEP_CLASS) => {
-                let current = self.mmio.read32(BASE + offset);
-                value = (value & !bit) | (current & bit);
-            }
-            Some(
-                CPU_IEP_VFIQ | CPU_ISR | CPU_IEP_FIR | CPU_IEP_FIR_SET | CPU_IEP_FIR_CLR | CPU_IER,
-            ) => value &= !bit,
-            _ => {}
         }
-        if value != 0 || !matches!(offset.checked_sub(bank), Some(CPU_IER_SET | CPU_IER_CLR)) {
-            self.mmio.write32(BASE + offset, value);
-        }
+        self.mmio.write32(BASE + offset, value);
         self.mmio.barrier();
     }
 }
@@ -179,6 +191,29 @@ mod tests {
         });
         lic.set_owned_source(Some(SOURCE));
         lic
+    }
+
+    #[test]
+    fn usb_and_network_sources_keep_separate_guest_enables() {
+        let mut lic = lic();
+        lic.set_network_source(Some(39));
+        lic.initialize();
+        assert_eq!(
+            lic.mmio.words[(BANK + CPU_IER) as usize / 4] & (BIT | 128),
+            BIT | 128
+        );
+        lic.write(BANK + CPU_IER_SET, 4, 128).unwrap();
+        assert!(lic.network_source_enabled());
+        assert!(!lic.owned_source_enabled());
+        assert_eq!(lic.read(BANK + CPU_IER, 4), Ok(128));
+        lic.write(BANK + CPU_IER_SET, 4, BIT.into()).unwrap();
+        lic.write(BANK + CPU_IER_CLR, 4, 128).unwrap();
+        assert!(!lic.network_source_enabled());
+        assert!(lic.owned_source_enabled());
+        assert_eq!(
+            lic.mmio.words[(BANK + CPU_IER) as usize / 4] & (BIT | 128),
+            BIT | 128
+        );
     }
 
     #[test]

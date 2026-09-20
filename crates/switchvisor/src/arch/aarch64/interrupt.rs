@@ -22,6 +22,7 @@ unsafe impl Sync for PerCpu {}
 static GICS: [PerCpu; switchvisor::CPU_COUNT] =
     [const { PerCpu(UnsafeCell::new(None)) }; switchvisor::CPU_COUNT];
 static LAYOUT: AtomicU64 = AtomicU64::new(0);
+static NETWORK_INTERRUPT_OWNED: AtomicBool = AtomicBool::new(false);
 static USB_INTERRUPT_OWNED: AtomicBool = AtomicBool::new(false);
 
 fn index() -> usize {
@@ -49,6 +50,10 @@ pub fn select_usb_interrupt(owned: bool) {
     USB_INTERRUPT_OWNED.store(owned, Ordering::Release);
 }
 
+pub fn select_network_interrupt(owned: bool) {
+    NETWORK_INTERRUPT_OWNED.store(owned, Ordering::Release);
+}
+
 fn selected_layout() -> Layout {
     if LAYOUT.load(Ordering::Acquire) == 1 {
         Layout::TEGRA210
@@ -74,8 +79,16 @@ pub fn initialize() -> Result<(), Error> {
             .load(Ordering::Acquire)
             .then_some(USB_INTERRUPT_ID),
     );
+    gic.set_network_interrupt(
+        NETWORK_INTERRUPT_OWNED
+            .load(Ordering::Acquire)
+            .then_some(switchvisor::vdev::virtio_net::INTERRUPT_ID),
+    );
     gic.initialize()?;
-    if cpu == 0 && USB_INTERRUPT_OWNED.load(Ordering::Acquire) {
+    if cpu == 0
+        && (USB_INTERRUPT_OWNED.load(Ordering::Acquire)
+            || NETWORK_INTERRUPT_OWNED.load(Ordering::Acquire))
+    {
         gic.configure_owned_interrupt(1);
     }
     gic.set_distributor_enabled(vm::interrupt::enabled());
@@ -97,6 +110,20 @@ pub fn pend_console_interrupt() {
     }
 }
 
+pub fn pend_network_interrupt() {
+    if !NETWORK_INTERRUPT_OWNED.load(Ordering::Acquire)
+        || !vm::interrupt::enabled()
+        || !vm::interrupt::network_interrupt_enabled()
+    {
+        return;
+    }
+    if let Some(slot) = GICS.get(index()) {
+        if let Some(gic) = unsafe { &mut *slot.0.get() } {
+            gic.pend_network_interrupt();
+        }
+    }
+}
+
 pub fn synchronize_distributor() {
     let cpu = index();
     let Some(slot) = GICS.get(cpu) else {
@@ -104,6 +131,9 @@ pub fn synchronize_distributor() {
     };
     if let Some(gic) = unsafe { &mut *slot.0.get() } {
         gic.set_distributor_enabled(vm::interrupt::enabled());
+        if vm::interrupt::network_interrupt_enabled() && vm::network::interrupt_pending() {
+            gic.pend_network_interrupt();
+        }
         if vm::interrupt::owned_interrupt_enabled() && vm::console::interrupt_pending() {
             gic.pend_owned_interrupt();
         }
@@ -121,9 +151,29 @@ extern "C" fn rust_irq() {
     };
     gic.set_distributor_enabled(vm::interrupt::enabled());
     if let Event::Owned(interrupt) = gic.take_interrupt() {
-        let deliver = crate::usb::service_interrupt()
-            && vm::interrupt::enabled()
-            && vm::interrupt::owned_interrupt_enabled();
-        gic.finish_owned_interrupt(interrupt, deliver);
+        let (deliver, priority) = if interrupt.id() == USB_INTERRUPT_ID {
+            let console = crate::usb::service_interrupt();
+            if vm::interrupt::enabled()
+                && vm::network::interrupt_pending()
+                && vm::interrupt::network_interrupt_enabled()
+            {
+                gic.pend_network_interrupt();
+            }
+            (
+                console && vm::interrupt::owned_interrupt_enabled(),
+                vm::interrupt::owned_interrupt_priority(),
+            )
+        } else {
+            // This SPI is only a virtio notification/recheck. Polling XUDC here
+            // would take USB/NETWORK locks and repeat the physical IRQ's work.
+            (
+                vm::network::interrupt_pending() && vm::interrupt::network_interrupt_enabled(),
+                vm::interrupt::network_interrupt_priority(),
+            )
+        };
+        gic.finish_owned_interrupt(
+            interrupt.with_guest_priority(priority),
+            vm::interrupt::enabled() && deliver,
+        );
     }
 }

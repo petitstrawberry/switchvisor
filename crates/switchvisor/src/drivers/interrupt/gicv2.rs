@@ -9,6 +9,7 @@ pub const MAINTENANCE_IRQ: u32 = 25;
 pub const SPURIOUS_IRQ: u32 = 1023;
 
 const GICD_CTLR: u64 = 0x000;
+const GICD_TYPER: u64 = 0x004;
 const GICD_IGROUPR0: u64 = 0x080;
 const GICD_ISENABLER0: u64 = 0x100;
 const GICD_ICENABLER0: u64 = 0x180;
@@ -113,6 +114,18 @@ pub struct OwnedInterrupt {
     pending: Pending,
 }
 
+impl OwnedInterrupt {
+    pub fn id(self) -> u32 {
+        self.pending.iar & IRQ_ID_MASK
+    }
+
+    /// Guest priority is independent from the EL2 physical service priority.
+    pub fn with_guest_priority(mut self, priority: u8) -> Self {
+        self.pending.priority = priority >> 3;
+        self
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Pending {
     iar: u32,
@@ -138,6 +151,7 @@ pub struct GicV2<M> {
     pending: [Pending; PENDING_SLOTS],
     pending_count: u16,
     owned_interrupt: u32,
+    network_interrupt: u32,
     // Original physical IAR values for software SGI LRs awaiting guest EOI.
     lr_iar: [u32; 64],
 }
@@ -152,6 +166,7 @@ impl<M: Mmio> GicV2<M> {
             pending: [Pending::EMPTY; PENDING_SLOTS],
             pending_count: 0,
             owned_interrupt: SPURIOUS_IRQ,
+            network_interrupt: SPURIOUS_IRQ,
             lr_iar: [SPURIOUS_IRQ; 64],
         }
     }
@@ -187,7 +202,7 @@ impl<M: Mmio> GicV2<M> {
 
     fn configure_maintenance_interrupt(&mut self) {
         let bit = 1 << MAINTENANCE_IRQ;
-        let group = self.read_dist(GICD_IGROUPR0) | bit;
+        let group = self.owned_group(GICD_IGROUPR0, bit);
         self.write_dist(GICD_IGROUPR0, group);
         let priorities = self.read_dist(GICD_IPRIORITYR6) & !(0xff << 8);
         self.write_dist(GICD_IPRIORITYR6, priorities);
@@ -198,6 +213,15 @@ impl<M: Mmio> GicV2<M> {
         self.write_dist(GICD_ISENABLER0, bit);
         let control = self.read_dist(GICD_CTLR);
         self.write_dist(GICD_CTLR, control | 1);
+    }
+
+    fn owned_group(&mut self, register: u64, bit: u32) -> u32 {
+        let group = self.read_dist(register);
+        if self.read_dist(GICD_TYPER) & (1 << 10) != 0 {
+            group | bit // Non-secure Group 1 on Tegra / GIC with SecurityExtn.
+        } else {
+            group & !bit // QEMU without SecurityExtn exposes Group 0 directly.
+        }
     }
 
     fn slot(iar: u32) -> Option<usize> {
@@ -376,10 +400,20 @@ impl<M: Mmio> GicV2<M> {
             .unwrap_or(SPURIOUS_IRQ);
     }
 
+    pub fn set_network_interrupt(&mut self, interrupt: Option<u32>) {
+        self.network_interrupt = interrupt
+            .filter(|id| (32..1020).contains(id))
+            .unwrap_or(SPURIOUS_IRQ);
+    }
+
     /// Configure the physical PPI/SPI so EL2 can service it independently from
     /// the guest distributor state. Call once on the boot CPU.
     pub fn configure_owned_interrupt(&mut self, target_mask: u8) {
-        let id = self.owned_interrupt;
+        self.configure_interrupt(self.owned_interrupt, target_mask);
+        self.configure_interrupt(self.network_interrupt, target_mask);
+    }
+
+    fn configure_interrupt(&mut self, id: u32, target_mask: u8) {
         if id >= 1020 {
             return;
         }
@@ -387,7 +421,7 @@ impl<M: Mmio> GicV2<M> {
         let bit = 1 << (id % 32);
         self.write_dist(GICD_ICENABLER0 + register, bit);
 
-        let group = self.read_dist(GICD_IGROUPR0 + register) | bit;
+        let group = self.owned_group(GICD_IGROUPR0 + register, bit);
         self.write_dist(GICD_IGROUPR0 + register, group);
 
         let byte_register = u64::from(id / 4) * 4;
@@ -423,14 +457,22 @@ impl<M: Mmio> GicV2<M> {
         self.mmio.barrier();
     }
 
+    pub fn pend_network_interrupt(&mut self) {
+        let id = self.network_interrupt;
+        if id < 1020 {
+            self.write_dist(GICD_ISPENDR0 + u64::from(id / 32) * 4, 1 << (id % 32));
+            self.mmio.barrier();
+        }
+    }
+
     /// Complete EL2 service, either deactivating the source or forwarding it.
     pub fn finish_owned_interrupt(&mut self, interrupt: OwnedInterrupt, deliver: bool) {
         let id = interrupt.pending.iar & IRQ_ID_MASK;
-        debug_assert_eq!(id, self.owned_interrupt);
+        debug_assert!(id == self.owned_interrupt || id == self.network_interrupt);
         if deliver {
             // Leave another instance pending while the current hardware LR is
             // active. Guest EOI deactivates the LR's physical interrupt; if the
-            // virtual UART is still asserted, the pending instance returns to
+            // virtual device is still asserted, the pending instance returns to
             // EL2 and is injected again.
             self.write_dist(GICD_ISPENDR0 + u64::from(id / 32) * 4, 1 << (id % 32));
             if self.pending_count != 0 || !self.try_inject(interrupt.pending) {
@@ -523,7 +565,7 @@ impl<M: Mmio> InterruptController for GicV2<M> {
         // EOImodeNS=1 drops only physical priority. A HW LR lets guest EOI
         // deactivate the PPI/SPI later; software SGIs are handled by EISR.
         self.write_cpu(GICC_EOIR, iar);
-        if id == self.owned_interrupt {
+        if id == self.owned_interrupt || id == self.network_interrupt {
             self.mmio.barrier();
             return Event::Owned(OwnedInterrupt { pending });
         }
@@ -539,6 +581,32 @@ impl<M: Mmio> InterruptController for GicV2<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owned_spi_stays_in_group_zero_without_security_extensions() {
+        let layout = Layout {
+            distributor: 0,
+            distributor_size: 0x1000,
+            cpu: 0x2000,
+            cpu_size: 0x2000,
+            hypervisor: 0x4000,
+            hypervisor_size: 0x2000,
+            virtual_cpu: 0x6000,
+            virtual_cpu_size: 0x2000,
+        };
+        let mut gic = GicV2::new(Memory::new(), layout);
+        gic.set_network_interrupt(Some(71));
+        gic.mmio.words[(GICD_IGROUPR0 + 8) as usize / 4] = u32::MAX;
+        gic.configure_owned_interrupt(1);
+        assert_eq!(gic.mmio.words[(GICD_IGROUPR0 + 8) as usize / 4] & 128, 0);
+        gic.mmio.words[(layout.cpu + GICC_IAR) as usize / 4] = 71;
+        let Event::Owned(interrupt) = gic.take_interrupt() else {
+            panic!("network source was forwarded without service");
+        };
+        assert_eq!(interrupt.id(), 71);
+        gic.finish_owned_interrupt(interrupt, false);
+        assert_eq!(gic.mmio.words[(layout.cpu + GICC_DIR) as usize / 4], 71);
+    }
 
     #[test]
     fn pending_slots_distinguish_sgi_sources() {
@@ -622,7 +690,7 @@ mod tests {
             0
         );
 
-        gic.finish_owned_interrupt(interrupt, true);
+        gic.finish_owned_interrupt(interrupt.with_guest_priority(0xa0), true);
         assert_eq!(
             gic.mmio.words[(TEST_LAYOUT.distributor + GICD_ISPENDR0 + 8) as usize / 4],
             1 << (OWNED % 32)
@@ -631,6 +699,7 @@ mod tests {
         assert_eq!(lr & IRQ_ID_MASK, OWNED);
         assert_eq!((lr >> 10) & IRQ_ID_MASK, OWNED);
         assert_ne!(lr & LR_HARDWARE, 0);
+        assert_eq!((lr >> LR_PRIORITY_SHIFT) & 0x1f, 0xa0 >> 3);
         assert_eq!(gic.mmio.words[(TEST_LAYOUT.cpu + GICC_DIR) as usize / 4], 0);
     }
 
@@ -649,6 +718,7 @@ mod tests {
         };
         let mut gic = GicV2::new(Memory::new(), TEST_LAYOUT);
         gic.set_owned_interrupt(Some(OWNED));
+        gic.mmio.words[GICD_TYPER as usize / 4] = 1 << 10;
         gic.mmio.words[(GICD_IPRIORITYR0 + 76) as usize / 4] = u32::MAX;
         gic.mmio.words[(GICD_ITARGETSR0 + 76) as usize / 4] = u32::MAX;
         gic.mmio.words[(GICD_ICFGR0 + 16) as usize / 4] = u32::MAX;

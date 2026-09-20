@@ -13,6 +13,7 @@ pub mod loader;
 pub mod mc;
 pub mod memory;
 pub mod mmio;
+pub mod net;
 pub mod payload;
 pub mod psci;
 pub mod stage2;

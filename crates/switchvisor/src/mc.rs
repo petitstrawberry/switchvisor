@@ -68,3 +68,27 @@ pub fn read_override(offset: u64) -> Option<u32> {
         _ => None,
     }
 }
+
+/// Conservative upper-bank DMA envelope for software devices. Snapshot before
+/// guest execution: RAM above 4 GiB ends at the first firmware carveout, just as
+/// the pinned bootloader's bank discovery does. Invalid geometry permits none.
+pub fn guest_high_end(mut read: impl FnMut(u64) -> u32) -> u64 {
+    let config = read(EMEM_CFG);
+    let megabytes = if config & (1 << 31) != 0 {
+        (config & 0x3fff).saturating_sub(0x800)
+    } else {
+        config
+    };
+    let end = 0x8000_0000u64 + (u64::from(megabytes) << 20);
+    if !(0x1_0000_0000..=crate::IPA_LIMIT).contains(&end) {
+        return 0x1_0000_0000;
+    }
+    let mut top = end;
+    for (bom, high, size) in CARVEOUTS {
+        let address = u64::from(read(bom)) | (u64::from(read(high)) << 32);
+        if read(size) != 0 && address >= 0x1_0000_0000 {
+            top = top.min(address);
+        }
+    }
+    top
+}

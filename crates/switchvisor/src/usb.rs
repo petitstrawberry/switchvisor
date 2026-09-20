@@ -122,6 +122,7 @@ impl Storage for GuestMemory {
 pub fn initialize(
     enabled: bool,
     console_enabled: bool,
+    network_enabled: bool,
     require_upload: bool,
     guest_entry: u64,
 ) -> Result<bool, Error> {
@@ -132,6 +133,7 @@ pub fn initialize(
     GUEST_ENTRY.store(guest_entry, Ordering::Release);
     RESET.store(RESET_NONE, Ordering::Release);
     guest_console::configure(console_enabled);
+    crate::vm::network::configure(network_enabled);
     if !enabled {
         return Ok(false);
     }
@@ -147,6 +149,7 @@ pub fn initialize(
             state.loader_output = Output::new();
             state.boot = None;
             state.error = None;
+            state.driver.enable_network(network_enabled);
             state.driver.initialize()
         })?;
     }
@@ -173,6 +176,8 @@ pub fn enter_guest(entry: u64) {
 
 pub fn service() {
     if !available() {
+        // Offline queue progress is driven by explicit virtio kicks. No reason
+        // to scan network queues on every unrelated guest MMIO/SMC exit.
         return;
     }
     let last = LAST_SERVICE.load(Ordering::Acquire);
@@ -193,6 +198,9 @@ pub fn service() {
     if asserted {
         crate::arch::aarch64::interrupt::pend_console_interrupt();
     }
+    if crate::vm::network::interrupt_pending() {
+        crate::arch::aarch64::interrupt::pend_network_interrupt();
+    }
     reset_if_requested();
 }
 
@@ -212,14 +220,34 @@ pub fn service_interrupt() -> bool {
     asserted
 }
 
+/// Queue kicks are serviced immediately, including when no Tegra USB IP exists
+/// in a CPU-only QEMU test. Never call this while holding NETWORK or a GIC borrow.
+pub fn service_network() {
+    if !crate::vm::network::enabled() {
+        return;
+    }
+    if available() {
+        unsafe {
+            USB.with(|state| crate::vm::network::service(&mut state.driver));
+        }
+    } else {
+        crate::vm::network::service(&mut crate::vm::network::Disconnected);
+    }
+    if crate::vm::network::interrupt_pending() {
+        crate::arch::aarch64::interrupt::pend_network_interrupt();
+    }
+}
+
 fn service_locked(state: &mut Service) {
     if let Err(error) = state.driver.poll() {
         state.error = Some(error);
+        crate::vm::network::service(&mut state.driver);
         return;
     }
     service_guest_console(state);
     service_control(state);
     service_loader(state);
+    crate::vm::network::service(&mut state.driver);
 }
 
 fn service_guest_console(state: &mut Service) {

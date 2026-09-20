@@ -17,6 +17,7 @@ fn fixture() -> (Payload, Vec<u8>) {
         preserve_boot_args: true,
         usb_uart: false,
         usb_control: false,
+        usb_net: false,
         require_upload: false,
         crc32: crc32(&package[0x4000..]),
     };
@@ -142,4 +143,14 @@ fn corrupted_and_truncated_input_is_rejected_before_a_copy() {
     let mut corrupted = package;
     *corrupted.last_mut().unwrap() ^= 1;
     assert_eq!(payload.source(&corrupted), Err(PayloadError::Checksum));
+}
+
+#[test]
+fn usb_network_is_opt_in_and_allows_required_upload() {
+    let (mut payload, _) = fixture();
+    payload.usb_net = true;
+    payload.require_upload = true;
+    let bytes = payload.encode().unwrap();
+    assert_eq!(u32::from_le_bytes(bytes[12..16].try_into().unwrap()), 25);
+    assert_eq!(Payload::decode(&bytes), Ok(Some(payload)));
 }

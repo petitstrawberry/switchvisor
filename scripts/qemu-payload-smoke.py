@@ -60,7 +60,7 @@ def markers(raw, rejected, fault=False):
 
 def execute_guest(image, payload, registers, nonce, output, rejected=False, *,
                   fault=None, result_words=None, extra_loaders=(), secure=False, entry_source=None,
-                  placement_rejected=False, physical_words=(), cpu_count=1, firmware=False, inspect_cpu=0):
+                  placement_rejected=False, physical_words=(), cpu_count=1, firmware=False, inspect_cpu=0, diagnostic_regions=()):
     loaded = image.read_bytes()
     output.mkdir(parents=True, exist_ok=False)
     with tempfile.TemporaryDirectory(prefix="sv-raw-qemu-") as directory:
@@ -158,6 +158,10 @@ def execute_guest(image, payload, registers, nonce, output, rejected=False, *,
                             if cpu_count > 1:
                                 (output / "failure-cpu-results.raw").write_bytes(memory(0xaa081000,256,"failure-cpus.raw"))
                                 (output / "failure-firmware.raw").write_bytes(memory(0x80030000,256,"failure-fw.raw"))
+                            (output / "failure-result.raw").write_bytes(memory(RESULT_BASE, RESULT_SIZE, "failure-result.raw"))
+                            for address, length in diagnostic_regions:
+                                name = f"diagnostic-{address:x}.raw"
+                                (output / name).write_bytes(memory(address, length, name))
                             qemu.png(raw, output / "failure.png")
                             raise RuntimeError("Missing payload terminal markers:\n" + final)
                         qmp_execute("cont")

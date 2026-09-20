@@ -89,3 +89,30 @@ fn only_the_disabled_gsc5_descriptor_is_overridden() {
         assert_eq!(mc::read_override(offset), expected);
     }
 }
+
+#[test]
+fn network_dma_high_bank_stops_before_firmware_and_rejects_bad_geometry() {
+    use switchvisor::mc::{EMEM_CFG, guest_high_end};
+    for config in [4096, 0x80001800] {
+        assert_eq!(
+            guest_high_end(|reg| if reg == EMEM_CFG { config } else { 0 }),
+            0x180000000
+        );
+        assert_eq!(
+            guest_high_end(|reg| match reg {
+                EMEM_CFG => config,
+                0x9a0 => 0x7f000000,
+                0x9a8 => 1,
+                0x9a4 => 16,
+                _ => 0,
+            }),
+            0x17f000000
+        );
+    }
+    for config in [0, 1024, 0x80000000, 0x7fffffff] {
+        assert_eq!(
+            guest_high_end(|reg| if reg == EMEM_CFG { config } else { 0 }),
+            0x100000000
+        );
+    }
+}

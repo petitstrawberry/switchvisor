@@ -10,15 +10,15 @@ use switchvisor::{
 };
 
 const BASE: u64 = RESIDENT_BASE + 0x200000;
-const RINGS: [usize; 9] = [
-    0x200, 0x300, 0x400, 0x500, 0x600, 0x700, 0x800, 0x900, 0xa00,
+const RINGS: [usize; 12] = [
+    0x200, 0x300, 0x400, 0x500, 0x600, 0x700, 0x800, 0x900, 0xa00, 0xb00, 0xc00, 0xd00,
 ];
-const EPS: [u32; 9] = [0, 2, 3, 5, 6, 7, 9, 10, 11];
+const EPS: [u32; 12] = [0, 2, 3, 5, 6, 7, 9, 10, 11, 12, 13, 15];
 struct State {
     registers: BTreeMap<u64, u32>,
     dma: [u32; DMA_SIZE / 4],
     writes: Vec<(u64, u32)>,
-    latest: [u64; 9],
+    latest: [u64; 12],
     event: usize,
     cycle: u32,
     time: u64,
@@ -36,7 +36,7 @@ impl Mock {
             registers: BTreeMap::new(),
             dma: [0; DMA_SIZE / 4],
             writes: vec![],
-            latest: [0; 9],
+            latest: [0; 12],
             event: 0,
             cycle: 1,
             time: 10_000,
@@ -168,7 +168,7 @@ impl DmaBuffer for Buffer {
         let mut state = self.mock.0.borrow_mut();
         let old = state.dma[offset / 4];
         state.dma[offset / 4] = value;
-        if (0x1000..0x1300).contains(&offset) && offset % 64 == 0 && old != value {
+        if (0x1000..0x1400).contains(&offset) && offset % 64 == 0 && old != value {
             let mask = 1 << ((offset - 0x1000) / 64);
             let old = state.registers.get(&(DEV + 0x5c)).copied().unwrap_or(0);
             state.registers.insert(DEV + 0x5c, old | mask);
@@ -185,6 +185,10 @@ impl DmaBuffer for Buffer {
 }
 type Usb = Xudc<Mock, Buffer>;
 fn new() -> (Usb, Mock) {
+    new_network(false)
+}
+
+fn new_network(network: bool) -> (Usb, Mock) {
     let mock = Mock::new();
     let mut usb = Xudc::new(
         mock.clone(),
@@ -193,6 +197,7 @@ fn new() -> (Usb, Mock) {
             base: BASE,
         },
     );
+    usb.enable_network(network);
     usb.initialize().unwrap();
     (usb, mock)
 }
@@ -568,4 +573,114 @@ fn guest_clock_writes_preserve_only_usb_bits_and_write_one_semantics() {
     );
     assert_eq!(ownership::write(ownership::DEV_ASID, 0x80000001, 0), None);
     assert_eq!(ownership::write(CAR + 0x150, 0x42, 0), Some(0x42));
+}
+
+#[path = "support/network.rs"]
+mod network_support;
+use switchvisor::{
+    drivers::usb::ncm,
+    net::{Ethernet, FRAME_SIZE, Network},
+};
+
+fn ncm_configured(usb: &mut Usb, mock: &Mock, high: bool) {
+    configured(usb, mock, high);
+    mock.setup(0x21, 0x43, 15, 5, 0);
+    usb.poll().unwrap();
+    mock.complete(0, 0, 1);
+    usb.poll().unwrap();
+    mock.setup(1, 11, 1, 6, 0);
+    usb.poll().unwrap();
+    mock.complete(0, 0, 1);
+    usb.poll().unwrap();
+    assert!(usb.link_up());
+}
+
+#[test]
+fn ncm_alternate_settings_notifications_and_input_size_are_independent() {
+    let (mut usb, mock) = new_network(true);
+    configured(&mut usb, &mock, true);
+    assert!(!usb.link_up());
+    assert_eq!(mock.0.borrow().latest[9], 0);
+    mock.setup(0x21, 0x86, 0, 5, 4);
+    usb.poll().unwrap();
+    mock.put_bytes(0x1400, &2048u32.to_le_bytes());
+    mock.complete(0, 0, 1);
+    usb.poll().unwrap();
+    mock.complete(0, 0, 1);
+    usb.poll().unwrap();
+    mock.setup(1, 11, 1, 6, 0);
+    usb.poll().unwrap();
+    mock.complete(0, 0, 1);
+    usb.poll().unwrap();
+    assert_eq!(usb.send_capacity_channel(Channel::Ncm), 2048);
+    mock.complete(15, 0, 1);
+    usb.poll().unwrap();
+    assert_eq!(mock.bytes(0x2200, 8), [0xa1, 0, 1, 0, 5, 0, 0, 0]);
+    mock.complete(15, 0, 1);
+    usb.poll().unwrap();
+    assert_eq!(
+        &mock.bytes(0x2200, 16)[..8],
+        &[0xa1, 0x2a, 0, 0, 5, 0, 8, 0]
+    );
+    assert_eq!(mock.trb(12)[2], ncm::NTB_SIZE as u32);
+    mock.setup(1, 11, 0, 6, 0);
+    usb.poll().unwrap();
+    assert!(!usb.link_up());
+    assert!(usb.connected_channel(Channel::Console));
+    assert_eq!(usb.send_capacity_channel(Channel::Ncm), 0);
+}
+
+#[test]
+fn ncm_virtio_bridge_runs_both_directions_through_real_xudc_event_handling() {
+    let (mut usb, mock) = new_network(true);
+    ncm_configured(&mut usb, &mock, true);
+    let mut network = Network::new();
+    network_support::configure(&mut network.device);
+    let mut memory = network_support::Memory::new();
+    memory.rx();
+    let frame = network_support::frame();
+    let mut ntb = [0; ncm::NTB_SIZE];
+    let length = ncm::encode(&frame, 0, &mut ntb).unwrap();
+    mock.put_bytes(0x8000, &ntb[..length]);
+    mock.complete(12, (ncm::NTB_SIZE - length) as u32, 13);
+    usb.poll().unwrap();
+    network.service(&mut memory, &mut usb);
+    assert_eq!(&memory.bytes[0x800c..0x800c + frame.len()], frame);
+    memory.tx(&frame);
+    network.service(&mut memory, &mut usb);
+    let transmitted = mock.bytes(0xc000, mock.trb(13)[2] as usize);
+    let block = ncm::decode(&transmitted).unwrap();
+    assert_eq!(block.count, 1);
+    assert_eq!(&transmitted[block.datagrams[0].offset..], frame);
+    assert_eq!(memory.get16(0x5002), 1);
+    assert!(network.device.interrupt_pending());
+}
+
+#[test]
+fn ncm_tx_short_packet_zlp_reset_and_malformed_rx_are_bounded() {
+    for high in [false, true] {
+        let (mut usb, mock) = new_network(true);
+        ncm_configured(&mut usb, &mock, high);
+        let mut frame = network_support::frame();
+        frame.resize(if high { 482 } else { 34 }, 0);
+        assert!(usb.send_frame(&frame));
+        assert!(!usb.send_frame(&frame));
+        mock.complete(13, 0, 1);
+        usb.poll().unwrap();
+        assert_eq!(mock.trb(13)[2], 0);
+        assert!(!usb.send_frame(&frame));
+        mock.complete(13, 0, 1);
+        usb.poll().unwrap();
+        assert!(usb.send_frame(&frame));
+        mock.put_bytes(0x8000, b"not an NTB header");
+        mock.complete(12, (ncm::NTB_SIZE - 17) as u32, 13);
+        usb.poll().unwrap();
+        assert_eq!(usb.receive_frame(&mut [0; FRAME_SIZE]), 0);
+        assert!(usb.link_up());
+        mock.port(1 << 17);
+        usb.poll().unwrap();
+        assert!(!usb.link_up());
+        ncm_configured(&mut usb, &mock, high);
+        assert!(usb.send_frame(&frame));
+    }
 }

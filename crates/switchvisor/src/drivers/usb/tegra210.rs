@@ -7,6 +7,8 @@
 //! SPDX-License-Identifier: GPL-2.0-only
 
 use super::composite::{CONTROL_SIZE, Composite, Reply, Setup};
+use super::ncm;
+use crate::net::{Ethernet, FRAME_SIZE, HOST_MAC};
 use crate::{
     drivers::{Clock, DmaBuffer, Driver, Mmio, RxTransport, TxTransport},
     payload::{RESIDENT_BASE, RESIDENT_SIZE},
@@ -19,24 +21,24 @@ pub const DEV: u64 = 0x700d_0000;
 pub const INTERRUPT_ID: u32 = 32 + 44;
 const PAD: u64 = 0x7009_f000;
 const VBUS_ON: u32 = 1 << 14;
-pub const DMA_SIZE: usize = 32 * 1024;
+pub const DMA_SIZE: usize = 64 * 1024;
 const EVENT0: usize = 0;
 const EVENT1: usize = 0x100;
 const CONTEXT: usize = 0x1000;
 const CONTROL: usize = 0x1400;
-const RING_BASES: [usize; 9] = [
-    0x200, 0x300, 0x400, 0x500, 0x600, 0x700, 0x800, 0x900, 0xa00,
+const RING_BASES: [usize; 12] = [
+    0x200, 0x300, 0x400, 0x500, 0x600, 0x700, 0x800, 0x900, 0xa00, 0xb00, 0xc00, 0xd00,
 ];
-const ENDPOINTS: [u8; 9] = [0, 2, 3, 5, 6, 7, 9, 10, 11];
-const ENDPOINT_KINDS: [u32; 9] = [4, 2, 6, 7, 2, 6, 7, 2, 6];
-const OUT_RINGS: [usize; 3] = [1, 4, 7];
-const IN_RINGS: [usize; 3] = [2, 5, 8];
-const NOTIFY_RINGS: [usize; 2] = [3, 6];
-const RX_BUFFERS: [usize; 3] = [0x1600, 0x1c00, 0x3000];
-const TX_BUFFERS: [usize; 3] = [0x1800, 0x1e00, 0x4000];
-const RX_CAPACITIES: [usize; 3] = [512, 512, 4096];
-const TX_CAPACITIES: [usize; 3] = [512, 512, 512];
-const NOTIFY_BUFFERS: [usize; 2] = [0x1a00, 0x2000];
+const ENDPOINTS: [u8; 12] = [0, 2, 3, 5, 6, 7, 9, 10, 11, 12, 13, 15];
+const ENDPOINT_KINDS: [u32; 12] = [4, 2, 6, 7, 2, 6, 7, 2, 6, 2, 6, 7];
+const OUT_RINGS: [usize; 4] = [1, 4, 7, 9];
+const IN_RINGS: [usize; 4] = [2, 5, 8, 10];
+const NOTIFY_RINGS: [usize; 3] = [3, 6, 11];
+const RX_BUFFERS: [usize; 4] = [0x1600, 0x1c00, 0x3000, 0x8000];
+const TX_BUFFERS: [usize; 4] = [0x1800, 0x1e00, 0x4000, 0xc000];
+const RX_CAPACITIES: [usize; 4] = [512, 512, 4096, ncm::NTB_SIZE];
+const TX_CAPACITIES: [usize; 4] = [512, 512, 512, ncm::NTB_SIZE];
+const NOTIFY_BUFFERS: [usize; 3] = [0x1a00, 0x2000, 0x2200];
 const PORT_CHANGES: u32 = (1 << 17) | (1 << 19) | (1 << 21) | (1 << 22) | (1 << 23);
 const XHCI_CTRL_IE: u32 = 1 << 4;
 const XHCI_ST_IP: u32 = 1 << 4;
@@ -84,10 +86,11 @@ pub enum Channel {
     Console = 0,
     Control = 1,
     Loader = 2,
+    Ncm = 3,
 }
 
 impl Channel {
-    const ALL: [Self; 3] = [Self::Console, Self::Control, Self::Loader];
+    const ALL: [Self; 4] = [Self::Console, Self::Control, Self::Loader, Self::Ncm];
 
     const fn index(self) -> usize {
         self as usize
@@ -113,6 +116,7 @@ impl Ring {
 enum ControlPhase {
     In { zlp: bool },
     OutLine(usize),
+    OutNcmInputSize,
     Status,
     Zlp,
 }
@@ -161,14 +165,19 @@ impl Notification {
 pub struct Xudc<H, D> {
     hardware: H,
     dma: D,
-    rings: [Ring; 9],
+    rings: [Ring; 12],
     device: Composite,
     event: usize,
     event_cycle: u32,
     sequence: u16,
     control: Option<(u64, ControlPhase)>,
-    channels: [ChannelState; 3],
-    notifications: [Notification; 2],
+    channels: [ChannelState; 4],
+    notifications: [Notification; 3],
+    ncm_rx: [u8; ncm::NTB_SIZE],
+    ncm_block: ncm::Block,
+    ncm_cursor: usize,
+    ncm_sequence: u16,
+    ncm_speed_notification: bool,
     high_speed: bool,
     initialized: bool,
     failed: bool,
@@ -180,14 +189,19 @@ impl<H, D> Xudc<H, D> {
         Self {
             hardware,
             dma,
-            rings: [const { Ring::new() }; 9],
+            rings: [const { Ring::new() }; 12],
             device: Composite::new(),
             event: 0,
             event_cycle: 1,
             sequence: 0,
             control: None,
-            channels: [const { ChannelState::new() }; 3],
-            notifications: [const { Notification::new() }; 2],
+            channels: [const { ChannelState::new() }; 4],
+            notifications: [const { Notification::new() }; 3],
+            ncm_rx: [0; ncm::NTB_SIZE],
+            ncm_block: ncm::Block::empty(),
+            ncm_cursor: 0,
+            ncm_sequence: 0,
+            ncm_speed_notification: false,
             high_speed: false,
             initialized: false,
             failed: false,
@@ -206,6 +220,75 @@ impl<H, D> Xudc<H, D> {
 }
 
 impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
+    /// Select descriptors before attaching to the host.
+    pub fn enable_network(&mut self, enabled: bool) {
+        assert!(!self.initialized);
+        self.device.ncm.enabled = enabled;
+    }
+
+    fn ncm_alternate(&mut self, alternate: u8) -> Result<(), Error> {
+        for ring in [9, 10] {
+            let ep = ENDPOINTS[ring];
+            if self.device.ncm.active() {
+                self.halt(ep, true)?;
+                self.dma.write32(CONTEXT + usize::from(ep) * 64, 0);
+                self.hardware.barrier();
+            }
+            self.clear_endpoint_state(ring);
+            if alternate == 1 {
+                self.endpoint(ring)?;
+            }
+        }
+        self.device.ncm.alternate = alternate;
+        self.ncm_block = ncm::Block::empty();
+        self.ncm_cursor = 0;
+        self.notifications[2].needed = true;
+        self.ncm_speed_notification = false;
+        Ok(())
+    }
+
+    fn notify_ncm(&mut self) -> Result<(), Error> {
+        if self.notifications[2].transfer.is_some()
+            || self.hardware.read32(DEV + 0x50) & (1 << 15) != 0
+        {
+            return Ok(());
+        }
+        let mut bytes = [0; 16];
+        bytes[0] = 0xa1;
+        bytes[4] = ncm::CONTROL_INTERFACE as u8;
+        let length = if self.notifications[2].needed {
+            bytes[2] = u8::from(self.device.ncm.active());
+            self.notifications[2].needed = false;
+            self.ncm_speed_notification = self.device.ncm.active();
+            8
+        } else if self.ncm_speed_notification {
+            bytes[1] = 0x2a;
+            bytes[6] = 8;
+            let rate: u32 = if self.high_speed {
+                480_000_000
+            } else {
+                12_000_000
+            };
+            bytes[8..12].copy_from_slice(&rate.to_le_bytes());
+            bytes[12..16].copy_from_slice(&rate.to_le_bytes());
+            self.ncm_speed_notification = false;
+            16
+        } else {
+            return Ok(());
+        };
+        self.put_bytes(NOTIFY_BUFFERS[2], &bytes[..length]);
+        self.notifications[2].transfer = Some(self.queue(
+            11,
+            [
+                self.dma_address(NOTIFY_BUFFERS[2]) as u32,
+                0,
+                length as u32,
+                (1 << 10) | (1 << 5),
+            ],
+        )?);
+        Ok(())
+    }
+
     /// Read-only boot diagnostics. Call only after successful initialization.
     pub fn snapshot(&mut self) -> Snapshot {
         Snapshot {
@@ -396,6 +479,9 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
     }
     fn stop_data(&mut self) -> Result<(), Error> {
         for &ep in ENDPOINTS.iter().skip(1) {
+            if ep >= 12 && (!self.device.ncm.enabled || (ep != 15 && !self.device.ncm.active())) {
+                continue;
+            }
             if self.device.configuration != 0 {
                 self.update(DEV + 0x50, 0, 1 << ep);
                 self.dma.write32(CONTEXT + usize::from(ep) * 64, 0);
@@ -411,7 +497,12 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
             }
             *state = ChannelState::new();
         }
-        self.notifications = [const { Notification::new() }; 2];
+        self.notifications = [const { Notification::new() }; 3];
+        self.device.ncm = ncm::Function::new(self.device.ncm.enabled);
+        self.ncm_block = ncm::Block::empty();
+        self.ncm_cursor = 0;
+        self.ncm_sequence = 0;
+        self.ncm_speed_notification = false;
         self.device.configuration = 0;
         for acm in &mut self.device.acm {
             acm.dtr = false;
@@ -455,6 +546,11 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
                 )
             }
             Reply::LineCoding(function) => self.data(7, false, ControlPhase::OutLine(function)),
+            Reply::NcmInputSize => self.data(4, false, ControlPhase::OutNcmInputSize),
+            Reply::NcmAlternate(alternate) => {
+                self.ncm_alternate(alternate)?;
+                self.status(true)
+            }
             Reply::Address(address) => {
                 self.update(DEV + 0x30, 0x7f00_0000, u32::from(address) << 24);
                 self.dma.write32(CONTEXT + 44, u32::from(address));
@@ -464,6 +560,9 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
                 self.stop_data()?;
                 if configuration != 0 {
                     for ring in 1..ENDPOINTS.len() {
+                        if ring >= 9 && (ring != 11 || !self.device.ncm.enabled) {
+                            continue;
+                        }
                         self.endpoint(ring)?;
                     }
                     self.update(DEV + 0x30, 0, 1);
@@ -536,6 +635,14 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
                         let second = self.dma.read32(CONTROL + 4).to_le_bytes();
                         self.device.acm[function].line_coding[..4].copy_from_slice(&first);
                         self.device.acm[function].line_coding[4..].copy_from_slice(&second[..3]);
+                        self.status(true)
+                    }
+                    ControlPhase::OutNcmInputSize => {
+                        let size = self.dma.read32(CONTROL) as usize;
+                        if remaining != 0 || !(2048..=ncm::NTB_SIZE).contains(&size) {
+                            return self.halt(0, true);
+                        }
+                        self.device.ncm.input_size = size;
                         self.status(true)
                     }
                     ControlPhase::Status => Ok(()),
@@ -624,6 +731,9 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
             return Ok(());
         }
         for channel in Channel::ALL {
+            if channel == Channel::Ncm && !self.device.ncm.active() {
+                continue;
+            }
             let index = channel.index();
             let ring = OUT_RINGS[index];
             let endpoint = ENDPOINTS[ring];
@@ -643,6 +753,12 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
             }
         }
         for function in 0..self.notifications.len() {
+            if function == 2 {
+                if self.device.ncm.enabled {
+                    self.notify_ncm()?;
+                }
+                continue;
+            }
             let ring = NOTIFY_RINGS[function];
             let endpoint = ENDPOINTS[ring];
             if self.notifications[function].needed
@@ -677,6 +793,9 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
             }
         }
         for channel in Channel::ALL {
+            if channel == Channel::Ncm && !self.device.ncm.active() {
+                continue;
+            }
             let index = channel.index();
             if self.channels[index].zlp_needed && self.channels[index].tx.is_none() {
                 let pointer = self.queue(
@@ -713,8 +832,8 @@ impl<H: Mmio + Clock, D: DmaBuffer> Driver for Xudc<H, D> {
         self.failed = false;
         self.device.reset();
         self.control = None;
-        self.channels = [const { ChannelState::new() }; 3];
-        self.notifications = [const { Notification::new() }; 2];
+        self.channels = [const { ChannelState::new() }; 4];
+        self.notifications = [const { Notification::new() }; 3];
         // Keep this USB client in bypass even if the guest later enables the SMMU.
         self.hardware.write32(DEV_ASID, 0);
         self.hardware.barrier();
@@ -897,6 +1016,7 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
                 Channel::Console => self.device.acm[0].dtr,
                 Channel::Control => self.device.acm[1].dtr,
                 Channel::Loader => true,
+                Channel::Ncm => self.device.ncm.active(),
             }
     }
 
@@ -923,7 +1043,11 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
             && self.channels[index].tx.is_none()
             && !self.channels[index].zlp_needed
         {
-            TX_CAPACITIES[index]
+            if channel == Channel::Ncm {
+                self.device.ncm.input_size
+            } else {
+                TX_CAPACITIES[index]
+            }
         } else {
             0
         }
@@ -960,6 +1084,79 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
 impl<H: Mmio + Clock, D: DmaBuffer> RxTransport for Xudc<H, D> {
     fn receive(&mut self, output: &mut [u8]) -> Result<usize, Error> {
         self.receive_channel(Channel::Console, output)
+    }
+}
+
+impl<H: Mmio + Clock, D: DmaBuffer> Ethernet for Xudc<H, D> {
+    fn link_up(&self) -> bool {
+        self.connected_channel(Channel::Ncm)
+    }
+
+    fn receive_frame(&mut self, output: &mut [u8; FRAME_SIZE]) -> usize {
+        if !self.link_up() {
+            return 0;
+        }
+        if self.ncm_cursor == self.ncm_block.count {
+            let Some(receive) = self.channels[3].rx else {
+                return 0;
+            };
+            // Copy without a 16 KiB temporary on the EL2 exception stack.
+            for offset in (0..receive.length).step_by(4) {
+                let word = self.dma.read32(RX_BUFFERS[3] + offset).to_le_bytes();
+                let count = (receive.length - offset).min(4);
+                self.ncm_rx[offset..offset + count].copy_from_slice(&word[..count]);
+            }
+            self.channels[3].rx = None;
+            self.ncm_cursor = 0;
+            self.ncm_block = match ncm::decode(&self.ncm_rx[..receive.length]) {
+                Ok(block) => block,
+                Err(_) => {
+                    self.statistics.dropped += 1;
+                    ncm::Block::empty()
+                }
+            };
+            if self.arm_data().is_err() {
+                self.failed = true;
+                return 0;
+            }
+        }
+        if self.ncm_cursor == self.ncm_block.count {
+            return 0;
+        }
+        let datagram = self.ncm_block.datagrams[self.ncm_cursor];
+        output[..datagram.length]
+            .copy_from_slice(&self.ncm_rx[datagram.offset..datagram.offset + datagram.length]);
+        self.ncm_cursor += 1;
+        datagram.length
+    }
+
+    fn send_frame(&mut self, frame: &[u8]) -> bool {
+        if !self.link_up() || !(14..=FRAME_SIZE).contains(&frame.len()) {
+            return false;
+        }
+        // CDC packet filters apply to traffic sent to the host. A filtered
+        // frame is consumed, so it cannot block later management traffic.
+        let filter = self.device.ncm.packet_filter;
+        let accepted = filter & 1 != 0
+            || (frame[..6] == [0xff; 6] && filter & 8 != 0)
+            || (frame[0] & 1 != 0 && filter & 2 != 0)
+            || (frame[..6] == HOST_MAC && filter & 4 != 0);
+        if !accepted {
+            return true;
+        }
+        let mut bytes = [0; FRAME_SIZE + ncm::FRAME_OFFSET];
+        let Ok(length) = ncm::encode(frame, self.ncm_sequence, &mut bytes) else {
+            return false;
+        };
+        if self.send_capacity_channel(Channel::Ncm) < length {
+            return false;
+        }
+        if self.send_channel(Channel::Ncm, &bytes[..length]) == Ok(length) {
+            self.ncm_sequence = self.ncm_sequence.wrapping_add(1);
+            true
+        } else {
+            false
+        }
     }
 }
 

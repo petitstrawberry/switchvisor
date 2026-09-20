@@ -43,6 +43,7 @@ pub fn pack(args: &[OsString]) -> Result<Value, String> {
     let mut used = [false; 9];
     let mut usb_uart = false;
     let mut usb_control = false;
+    let mut usb_net = false;
     let mut require_upload = false;
     let mut cursor = 5;
     while cursor < args.len() {
@@ -59,6 +60,14 @@ pub fn pack(args: &[OsString]) -> Result<Value, String> {
                 return Err("duplicate payload option --usb-control".into());
             }
             usb_control = true;
+            cursor += 1;
+            continue;
+        }
+        if args[cursor] == "--usb-net" {
+            if usb_net {
+                return Err("duplicate payload option --usb-net".into());
+            }
+            usb_net = true;
             cursor += 1;
             continue;
         }
@@ -97,12 +106,13 @@ pub fn pack(args: &[OsString]) -> Result<Value, String> {
         }
         cursor += 2;
     }
-    if require_upload && !(usb_uart || usb_control) {
-        return Err("--no-fallback requires --usb-control or --usb-uart".into());
+    if require_upload && !(usb_uart || usb_control || usb_net) {
+        return Err("--no-fallback requires --usb-control, --usb-uart or --usb-net".into());
     }
     let runtime_size = number(&args[3])?;
     let raw = read(Path::new(&args[0]))?;
-    if raw.get(40..48) != Some(b"SVBOOT04".as_slice())
+    let bootstrap_version = raw.get(40..48);
+    if !matches!(bootstrap_version, Some(b"SVBOOT04" | b"SVBOOT05"))
         || field(&raw, 8)? != RESIDENT_BASE
         || field(&raw, 16)? != raw.len() as u64
         || field(&raw, 24)? < raw.len() as u64
@@ -113,6 +123,9 @@ pub fn pack(args: &[OsString]) -> Result<Value, String> {
             "use a payload bootstrap linked at the fixed resident base (scripts/build-payload.sh)"
                 .into(),
         );
+    }
+    if usb_net && bootstrap_version != Some(b"SVBOOT05".as_slice()) {
+        return Err("--usb-net requires a rebuilt bootstrap (scripts/build-payload.sh)".into());
     }
     let slot = raw
         .get(CONFIG_OFFSET..CONFIG_OFFSET + CONFIG_SIZE)
@@ -155,6 +168,7 @@ pub fn pack(args: &[OsString]) -> Result<Value, String> {
         preserve_boot_args: !custom_registers,
         usb_uart,
         usb_control,
+        usb_net,
         require_upload,
         crc32: crc32(&data),
     };
@@ -206,7 +220,13 @@ pub fn pack(args: &[OsString]) -> Result<Value, String> {
             "interrupt":switchvisor::vdev::uart::INTERRUPT_ID,
             "transport":"cdc-acm","vid":switchvisor::drivers::usb::cdc::VID,
             "pid":switchvisor::drivers::usb::cdc::PID},
-        "usb_control":{"enabled":usb_control || usb_uart,"control":"cdc-acm","loader":"vendor-bulk",
+        "usb_net":{"enabled":usb_net,"transport":"cdc-ncm","compatible":"virtio,mmio",
+            "gpa":format!("{:#x}",switchvisor::vdev::virtio_net::BASE),
+            "interrupt":switchvisor::vdev::virtio_net::INTERRUPT_ID,"mmio_version":2,
+            "guest_mac":"02:53:56:00:00:02","host_mac":"02:53:56:00:00:01",
+            "management_mac":"02:53:56:00:00:03","management_ip":"192.168.77.1",
+            "management_udp_port":7777,"mtu":1500},
+        "usb_control":{"enabled":usb_control || usb_uart || usb_net,"control":"cdc-acm","loader":"vendor-bulk",
             "packaged_payload_fallback":!require_upload}
     }))
 }

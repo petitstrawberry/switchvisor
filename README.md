@@ -182,6 +182,18 @@ Baud and line-coding settings are USB metadata. Guest transmit uses THR and poll
 
 XUDC events use physical SPI 44 (architectural INTID 76), which EL2 services before delivering the same hardware-backed interrupt as the virtual UART RX line. Guest WFI remains native and USB traffic wakes EL2 through the physical interrupt. The boot probe and trapped guest exits retain bounded polling as a fallback. Guest USB controller accesses return an absent bus, while shared clock/reset/PMC writes preserve USB-owned resources and the XUDC SMMU client stays in bypass.
 
+## USB network
+
+Package with `--usb-net` to terminate USB CDC-NCM in Switchvisor and expose a
+`virtio,mmio` network device to the guest. The same Ethernet link also carries
+Switchvisor management at `192.168.77.1`; the existing USB control and loader
+remain available. Add `--usb-uart` to use the guest console alongside networking.
+The builder emits `usb-net.dtbo` for guest discovery and physical USB ownership.
+
+See [USB networking bring-up](docs/usb-network.md) for build/DTB instructions,
+static host/guest addresses, the required Scarlet virtio compatibility patch,
+and the exact boundary between automated testing and pending hardware checks.
+
 ## USB control and guest bundle loading
 
 Enable the management interfaces while packaging. Add `--usb-uart` as well if

@@ -2,4 +2,5 @@
 pub mod console;
 pub mod interrupt;
 pub mod mmio;
+pub mod network;
 pub mod vcpu;

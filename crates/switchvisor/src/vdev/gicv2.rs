@@ -25,13 +25,15 @@ const GICD_ICFGR1: u64 = 0xc04;
 const MAINTENANCE_BIT: u32 = 1 << MAINTENANCE_IRQ;
 const MAINTENANCE_PRIORITY: u32 = 0xff << 8;
 const MAINTENANCE_CONFIG: u32 = 3 << 18;
+pub const DEFAULT_OWNED_PRIORITY: u8 = 0xa0;
 
 pub struct Distributor<M> {
     mmio: M,
     layout: Layout,
     guest_control: u32,
-    owned_interrupt: u32,
-    owned_interrupt_enabled: bool,
+    owned_interrupt: [u32; 2],
+    owned_interrupt_enabled: [bool; 2],
+    owned_interrupt_priority: [u8; 2],
 }
 
 impl<M: Mmio> Distributor<M> {
@@ -40,16 +42,18 @@ impl<M: Mmio> Distributor<M> {
             mmio,
             layout,
             guest_control: 0,
-            owned_interrupt: SPURIOUS_IRQ,
-            owned_interrupt_enabled: false,
+            owned_interrupt: [SPURIOUS_IRQ; 2],
+            owned_interrupt_enabled: [false; 2],
+            owned_interrupt_priority: [DEFAULT_OWNED_PRIORITY; 2],
         }
     }
 
     pub fn set_owned_interrupt(&mut self, interrupt: Option<u32>) {
-        self.owned_interrupt = interrupt
+        self.owned_interrupt[0] = interrupt
             .filter(|id| (32..1020).contains(id))
             .unwrap_or(SPURIOUS_IRQ);
-        self.owned_interrupt_enabled = false;
+        self.owned_interrupt_enabled[0] = false;
+        self.owned_interrupt_priority[0] = DEFAULT_OWNED_PRIORITY;
     }
 
     /// Keep the physical Non-secure group enabled for the maintenance PPI,
@@ -66,34 +70,56 @@ impl<M: Mmio> Distributor<M> {
     }
 
     pub const fn owned_interrupt_enabled(&self) -> bool {
-        self.owned_interrupt_enabled
+        self.owned_interrupt_enabled[0]
     }
 
-    fn owned_word_mask(&self, offset: u64, base: u64) -> u32 {
-        let id = self.owned_interrupt;
+    pub fn owned_interrupt_priority(&self) -> u8 {
+        self.owned_interrupt_priority[0]
+    }
+
+    pub fn network_interrupt_priority(&self) -> u8 {
+        self.owned_interrupt_priority[1]
+    }
+
+    pub fn set_network_interrupt(&mut self, interrupt: Option<u32>) {
+        self.owned_interrupt[1] = interrupt
+            .filter(|id| (32..1020).contains(id))
+            .unwrap_or(SPURIOUS_IRQ);
+        self.owned_interrupt_enabled[1] = false;
+        self.owned_interrupt_priority[1] = DEFAULT_OWNED_PRIORITY;
+    }
+    pub fn network_interrupt_enabled(&self) -> bool {
+        self.owned_interrupt_enabled[1]
+    }
+    fn word_mask(id: u32, offset: u64, base: u64) -> u32 {
         if id < 1020 && offset == base + u64::from(id / 32) * 4 {
             1 << (id % 32)
         } else {
             0
         }
     }
-
-    fn owned_byte_mask(&self, offset: u64, base: u64) -> u32 {
-        let id = self.owned_interrupt;
-        if id < 1020 && offset == base + u64::from(id / 4) * 4 {
-            0xff << ((id % 4) * 8)
-        } else {
-            0
-        }
+    fn owned_word_mask(&self, offset: u64, base: u64) -> u32 {
+        self.owned_interrupt
+            .iter()
+            .fold(0, |mask, &id| mask | Self::word_mask(id, offset, base))
     }
-
+    fn owned_byte_mask(&self, offset: u64, base: u64) -> u32 {
+        self.owned_interrupt.iter().fold(0, |mask, &id| {
+            mask | if id < 1020 && offset == base + u64::from(id / 4) * 4 {
+                0xff << ((id % 4) * 8)
+            } else {
+                0
+            }
+        })
+    }
     fn owned_config_mask(&self, offset: u64) -> u32 {
-        let id = self.owned_interrupt;
-        if id < 1020 && offset == GICD_ICFGR0 + u64::from(id / 16) * 4 {
-            3 << ((id % 16) * 2)
-        } else {
-            0
-        }
+        self.owned_interrupt.iter().fold(0, |mask, &id| {
+            mask | if id < 1020 && offset == GICD_ICFGR0 + u64::from(id / 16) * 4 {
+                3 << ((id % 16) * 2)
+            } else {
+                0
+            }
+        })
     }
 
     fn owned_action_mask(&self, offset: u64) -> u32 {
@@ -165,11 +191,18 @@ impl<M: Mmio> Distributor<M> {
         let owned = self.owned_action_mask(offset);
         if owned != 0 {
             value &= !owned;
-            if self.owned_interrupt_enabled
-                && (self.owned_word_mask(offset, GICD_ISENABLER0) != 0
-                    || self.owned_word_mask(offset, GICD_ICENABLER0) != 0)
-            {
-                value |= owned;
+            for (index, &id) in self.owned_interrupt.iter().enumerate() {
+                if self.owned_interrupt_enabled[index] {
+                    value |= Self::word_mask(id, offset, GICD_ISENABLER0)
+                        | Self::word_mask(id, offset, GICD_ICENABLER0);
+                }
+            }
+        }
+        for (index, &id) in self.owned_interrupt.iter().enumerate() {
+            if id < 1020 && offset == GICD_IPRIORITYR0 + u64::from(id / 4) * 4 {
+                let shift = (id % 4) * 8;
+                value = (value & !(0xff << shift))
+                    | (u32::from(self.owned_interrupt_priority[index]) << shift);
             }
         }
         value
@@ -194,11 +227,20 @@ impl<M: Mmio> VirtualDevice for Distributor<M> {
         let value = ((value as u32) << shift) & mask;
         let address = self.layout.distributor + word;
 
-        if value & self.owned_word_mask(word, GICD_ISENABLER0) != 0 {
-            self.owned_interrupt_enabled = true;
-        }
-        if value & self.owned_word_mask(word, GICD_ICENABLER0) != 0 {
-            self.owned_interrupt_enabled = false;
+        for (index, &id) in self.owned_interrupt.iter().enumerate() {
+            if value & Self::word_mask(id, word, GICD_ISENABLER0) != 0 {
+                self.owned_interrupt_enabled[index] = true;
+            }
+            if value & Self::word_mask(id, word, GICD_ICENABLER0) != 0 {
+                self.owned_interrupt_enabled[index] = false;
+            }
+            if id < 1020 && word == GICD_IPRIORITYR0 + u64::from(id / 4) * 4 {
+                let shift = (id % 4) * 8;
+                if mask & (0xff << shift) != 0 {
+                    // The virtual GIC implements five priority bits.
+                    self.owned_interrupt_priority[index] = ((value >> shift) as u8) & 0xf8;
+                }
+            }
         }
 
         if word == GICD_CTLR {
@@ -250,6 +292,52 @@ mod tests {
 
     fn distributor() -> Distributor<Mock> {
         Distributor::new(Mock { words: [0; 1024] }, LAYOUT)
+    }
+
+    #[test]
+    fn usb_and_network_enables_are_independent_and_physical_bits_are_protected() {
+        let mut d = distributor();
+        d.set_owned_interrupt(Some(76));
+        d.set_network_interrupt(Some(71));
+        d.initialize();
+        d.write(GICD_ISENABLER0 + 8, 4, 1 << 7).unwrap();
+        assert!(d.network_interrupt_enabled());
+        assert!(!d.owned_interrupt_enabled());
+        assert_eq!(d.read(GICD_ISENABLER0 + 8, 4), Ok(1 << 7));
+        assert_eq!(d.mmio.words[(GICD_ISENABLER0 + 8) as usize / 4], 0);
+        d.write(GICD_ISENABLER0 + 8, 4, 1 << 12).unwrap();
+        d.write(GICD_ICENABLER0 + 8, 4, 1 << 7).unwrap();
+        assert!(!d.network_interrupt_enabled());
+        assert!(d.owned_interrupt_enabled());
+        assert_eq!(d.read(GICD_ISENABLER0 + 8, 4), Ok(1 << 12));
+    }
+
+    #[test]
+    fn guest_priorities_are_independent_from_physical_service_priorities() {
+        let mut d = distributor();
+        d.set_owned_interrupt(Some(76));
+        d.set_network_interrupt(Some(71));
+        let network = GICD_IPRIORITYR0 + 68;
+        let console = GICD_IPRIORITYR0 + 76;
+        d.mmio.words[network as usize / 4] = 0x0033_2211;
+        d.mmio.words[console as usize / 4] = 0x7766_5500;
+        assert_eq!(
+            d.read(network + 3, 1),
+            Ok(u64::from(DEFAULT_OWNED_PRIORITY))
+        );
+        d.write(network + 3, 1, 0xe3).unwrap();
+        assert_eq!(d.network_interrupt_priority(), 0xe0);
+        assert_eq!(d.read(network, 4), Ok(0xe033_2211));
+        assert_eq!(d.mmio.words[network as usize / 4], 0x0033_2211);
+        // Writes to neighboring bytes still pass through, without changing
+        // the protected source or the independently shadowed priority.
+        d.write(network, 1, 0x48).unwrap();
+        assert_eq!(d.read(network, 4), Ok(0xe033_2248));
+        d.write(console, 4, 0x4433_2261).unwrap();
+        assert_eq!(d.owned_interrupt_priority(), 0x60);
+        assert_eq!(d.network_interrupt_priority(), 0xe0);
+        assert_eq!(d.read(console, 4), Ok(0x4433_2260));
+        assert_eq!(d.mmio.words[console as usize / 4], 0x4433_2200);
     }
 
     #[test]

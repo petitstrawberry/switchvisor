@@ -321,6 +321,10 @@ wait_irq:
     str wzr, [x10]
     ldr w12, [x10]
     str x12, [x9, #64]
+.elseif SV_ACTION == 16 // A console-disabled profile must not expose a virtual UART.
+    ldr x10, =SV_ADDRESS
+    ldrb w11, [x10]
+    b failure
 .elseif SV_ACTION == 15 // Unsupported UART access width must not touch the physical page.
     ldr x10, =SV_ADDRESS
     ldr w11, [x10]

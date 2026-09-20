@@ -1,6 +1,7 @@
 //! USB descriptors and EP0 routing for the Switchvisor composite device.
 
 use super::cdc::{Acm, PID, VID};
+use super::ncm::{self, Function};
 
 pub const CONTROL_SIZE: usize = 256;
 pub const ACM_COUNT: usize = 2;
@@ -31,6 +32,8 @@ impl Setup {
 pub enum Reply {
     Data(usize),
     LineCoding(usize),
+    NcmInputSize,
+    NcmAlternate(u8),
     Status,
     Address(u8),
     Configuration(u8),
@@ -41,6 +44,7 @@ pub enum Reply {
 pub struct Composite {
     pub acm: [Acm; ACM_COUNT],
     pub configuration: u8,
+    pub ncm: Function,
     halted: u16,
 }
 
@@ -55,12 +59,15 @@ impl Composite {
         Self {
             acm: [Acm::new(); ACM_COUNT],
             configuration: 0,
+            ncm: Function::new(false),
             halted: 0,
         }
     }
 
     pub fn reset(&mut self) {
+        let ncm_enabled = self.ncm.enabled;
         *self = Self::new();
+        self.ncm.enabled = ncm_enabled;
     }
 
     pub fn setup(
@@ -100,10 +107,10 @@ impl Composite {
                     } else {
                         high_speed
                     };
-                    configuration(output, (setup.value >> 8) as u8, high)
+                    configuration(output, (setup.value >> 8) as u8, high, self.ncm.enabled)
                 }
                 (3, 0) if setup.index == 0 => copy(output, &[4, 3, 9, 4]),
-                (3, index @ 1..=6) if setup.index == 0x0409 || setup.index == 0 => {
+                (3, index @ 1..=8) if setup.index == 0x0409 || setup.index == 0 => {
                     string(output, index)
                 }
                 (6, 0) if setup.index == 0 => copy(output, &[10, 6, 0, 2, 0xef, 2, 1, 64, 1, 0]),
@@ -121,11 +128,44 @@ impl Composite {
             (0x80, 0) if setup.value == 0 && setup.index == 0 && setup.length == 2 => {
                 copy(output, &[1, 0])
             }
-            (0x81, 0) if setup.value == 0 && setup.index <= 4 && setup.length == 2 => {
+            (0x81, 0)
+                if setup.value == 0
+                    && setup.index <= if self.ncm.enabled { 6 } else { 4 }
+                    && setup.length == 2 =>
+            {
                 copy(output, &[0, 0])
             }
-            (0x81, 10) if setup.value == 0 && setup.index <= 4 && setup.length == 1 => {
-                copy(output, &[0])
+            (0x81, 10)
+                if setup.value == 0
+                    && setup.index <= if self.ncm.enabled { 6 } else { 4 }
+                    && setup.length == 1 =>
+            {
+                copy(
+                    output,
+                    &[if setup.index == ncm::DATA_INTERFACE {
+                        self.ncm.alternate
+                    } else {
+                        0
+                    }],
+                )
+            }
+            (0x01, 11)
+                if self.ncm.enabled
+                    && self.configuration == 1
+                    && setup.index == ncm::DATA_INTERFACE
+                    && setup.value <= 1
+                    && setup.length == 0 =>
+            {
+                return Reply::NcmAlternate(setup.value as u8);
+            }
+            (0x01, 11)
+                if self.ncm.enabled
+                    && self.configuration == 1
+                    && setup.index == ncm::CONTROL_INTERFACE
+                    && setup.value == 0
+                    && setup.length == 0 =>
+            {
+                return Reply::Status;
             }
             (0x01, 11) if setup.value == 0 && setup.index <= 4 && setup.length == 0 => {
                 return Reply::Status;
@@ -134,15 +174,22 @@ impl Composite {
                 let Some(endpoint) = endpoint(setup.index) else {
                     return Reply::Stall;
                 };
+                if endpoint >= 12 && (!self.ncm.enabled || (endpoint != 15 && !self.ncm.active())) {
+                    return Reply::Stall;
+                }
                 copy(output, &[u8::from(self.halted & (1 << endpoint) != 0), 0])
             }
             (0x02, request @ (1 | 3))
                 if setup.value == 0 && setup.length == 0 && self.configuration == 1 =>
             {
-                let Some(endpoint @ (2 | 3 | 5 | 6 | 7 | 9 | 10 | 11)) = endpoint(setup.index)
+                let Some(endpoint @ (2 | 3 | 5 | 6 | 7 | 9 | 10 | 11 | 12 | 13 | 15)) =
+                    endpoint(setup.index)
                 else {
                     return Reply::Stall;
                 };
+                if endpoint >= 12 && (!self.ncm.enabled || (endpoint != 15 && !self.ncm.active())) {
+                    return Reply::Stall;
+                }
                 let halted = request == 3;
                 if halted {
                     self.halted |= 1 << endpoint;
@@ -150,6 +197,24 @@ impl Composite {
                     self.halted &= !(1 << endpoint);
                 }
                 return Reply::Halt { endpoint, halted };
+            }
+            (kind @ (0x21 | 0xa1), request)
+                if self.configuration == 1
+                    && self.ncm.enabled
+                    && setup.index == ncm::CONTROL_INTERFACE =>
+            {
+                match (kind, request, setup.value, setup.length) {
+                    (0xa1, 0x80, 0, _) => copy(output, &self.ncm.parameters()),
+                    (0xa1, 0x83 | 0x89, 0, 2) => copy(output, &[0, 0]),
+                    (0x21, 0x84 | 0x8a, 0, 0) if self.ncm.alternate == 0 => return Reply::Status,
+                    (0xa1, 0x85, 0, 4) => copy(output, &(self.ncm.input_size as u32).to_le_bytes()),
+                    (0x21, 0x86, 0, 4) if self.ncm.alternate == 0 => return Reply::NcmInputSize,
+                    (0x21, 0x43, filter, 0) if filter & !0x1f == 0 => {
+                        self.ncm.packet_filter = filter;
+                        return Reply::Status;
+                    }
+                    _ => return Reply::Stall,
+                }
             }
             (request_type @ (0x21 | 0xa1), request) if self.configuration == 1 => {
                 let Some(function) = acm_function(setup.index) else {
@@ -176,19 +241,25 @@ impl Composite {
     }
 }
 
-fn configuration(output: &mut [u8; CONTROL_SIZE], descriptor_type: u8, high: bool) -> usize {
+fn configuration(
+    output: &mut [u8; CONTROL_SIZE],
+    descriptor_type: u8,
+    high: bool,
+    ncm: bool,
+) -> usize {
     let packet: u16 = if high { 512 } else { 64 };
     let interval = if high { 9 } else { 16 };
     let mut cursor = 0;
+    let size = CONFIGURATION_SIZE + if ncm { ncm::DESCRIPTOR_SIZE } else { 0 };
     append(
         output,
         &mut cursor,
         &[
             9,
             descriptor_type,
-            CONFIGURATION_SIZE as u8,
-            (CONFIGURATION_SIZE >> 8) as u8,
-            5,
+            size as u8,
+            (size >> 8) as u8,
+            if ncm { 7 } else { 5 },
             1,
             0,
             0xc0,
@@ -246,7 +317,100 @@ fn configuration(output: &mut [u8; CONTROL_SIZE], descriptor_type: u8, high: boo
             0,
         ],
     );
-    debug_assert_eq!(cursor, CONFIGURATION_SIZE);
+    if ncm {
+        append(
+            output,
+            &mut cursor,
+            &[
+                8,
+                11,
+                5,
+                2,
+                2,
+                0x0d,
+                0,
+                7,
+                9,
+                4,
+                5,
+                0,
+                1,
+                2,
+                0x0d,
+                0,
+                7,
+                5,
+                0x24,
+                0,
+                0x20,
+                0x01,
+                5,
+                0x24,
+                6,
+                5,
+                6,
+                13,
+                0x24,
+                0x0f,
+                8,
+                0,
+                0,
+                0,
+                0,
+                0xea,
+                0x05,
+                0,
+                0,
+                0,
+                6,
+                0x24,
+                0x1a,
+                0,
+                1,
+                1, // NCM 1.0, packet filter capability.
+                7,
+                5,
+                0x87,
+                3,
+                16,
+                0,
+                interval,
+                9,
+                4,
+                6,
+                0,
+                0,
+                0x0a,
+                0,
+                1,
+                7,
+                9,
+                4,
+                6,
+                1,
+                2,
+                0x0a,
+                0,
+                1,
+                7,
+                7,
+                5,
+                0x06,
+                2,
+                packet as u8,
+                (packet >> 8) as u8,
+                0,
+                7,
+                5,
+                0x86,
+                2,
+                packet as u8,
+                (packet >> 8) as u8,
+                0,
+            ],
+        );
+    }
+    debug_assert_eq!(cursor, size);
     cursor
 }
 
@@ -345,6 +509,8 @@ fn string(output: &mut [u8; CONTROL_SIZE], index: u8) -> usize {
         4 => "Guest console",
         5 => "Switchvisor control",
         6 => "Guest bundle loader",
+        7 => "Switchvisor network",
+        8 => "025356000001",
         _ => return 0,
     };
     let size = 2 + text.len() * 2;
@@ -386,6 +552,9 @@ fn endpoint(address: u16) -> Option<u8> {
         0x84 => Some(9),
         0x05 => Some(10),
         0x85 => Some(11),
+        0x06 => Some(12),
+        0x86 => Some(13),
+        0x87 => Some(15),
         _ => None,
     }
 }

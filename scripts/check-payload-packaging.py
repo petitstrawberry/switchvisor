@@ -48,6 +48,10 @@ def main():
         struct.pack_into("<Q", data, 16, len(data))
         struct.pack_into("<Q", data, 24, len(data))
         unaligned.write_bytes(data)
+        old_bootstrap = temp / "old-bootstrap.raw"
+        data = bytearray(bootstrap.read_bytes())
+        data[40:48] = b"SVBOOT04"
+        old_bootstrap.write_bytes(data)
 
         def run(name, raw=bootstrap, payload=opaque, runtime="0x10000", options=(), succeeds=False, exists=False):
             output = temp / f"{name}.bin"
@@ -63,6 +67,7 @@ def main():
                 assert copied == payload.read_bytes()
                 assert manifest["payload"]["preserve_boot_args"]
                 assert manifest["usb_control"]["packaged_payload_fallback"] == ("--no-fallback" not in options)
+                assert manifest["usb_net"]["enabled"] == ("--usb-net" in options)
                 detail = manifest
             else:
                 assert digest(output) == before if exists else not output.exists(), name
@@ -81,6 +86,12 @@ def main():
         run("unknown-options", options=["--format", "elf"])
         run("no-fallback-requires-usb", options=["--no-fallback"])
         run("no-fallback", options=["--usb-control", "--no-fallback"], succeeds=True)
+        run("usb-net", options=["--usb-net"], succeeds=True)
+        run("usb-net-with-console", options=["--usb-net", "--usb-uart"], succeeds=True)
+        run("usb-net-no-fallback", options=["--usb-net", "--no-fallback"], succeeds=True)
+        run("usb-net-duplicate", options=["--usb-net", "--usb-net"])
+        run("old-bootstrap-without-net", raw=old_bootstrap, succeeds=True)
+        run("old-bootstrap-with-net", raw=old_bootstrap, options=["--usb-net"])
         run("wrong-bootstrap-base", raw=wrong_base)
         run("populated-descriptor", raw=populated)
         run("unaligned-bootstrap", raw=unaligned)

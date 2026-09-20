@@ -115,6 +115,7 @@ pub struct Payload {
     pub preserve_boot_args: bool,
     pub usb_uart: bool,
     pub usb_control: bool,
+    pub usb_net: bool,
     pub require_upload: bool,
     pub crc32: u32,
 }
@@ -154,7 +155,7 @@ impl Payload {
         if self.preserve_boot_args && self.registers.iter().any(|value| *value != 0) {
             return Err(PayloadError::Header);
         }
-        if self.require_upload && !(self.usb_uart || self.usb_control) {
+        if self.require_upload && !(self.usb_uart || self.usb_control || self.usb_net) {
             return Err(PayloadError::Header);
         }
         Ok(())
@@ -183,7 +184,8 @@ impl Payload {
             &(u32::from(self.preserve_boot_args)
                 | (u32::from(self.usb_uart) << 1)
                 | (u32::from(self.usb_control) << 2)
-                | (u32::from(self.require_upload) << 3))
+                | (u32::from(self.require_upload) << 3)
+                | (u32::from(self.usb_net) << 4))
                 .to_le_bytes(),
         );
         for (i, value) in [
@@ -218,7 +220,7 @@ impl Payload {
         }
         if bytes.get(..8) != Some(MAGIC.as_slice())
             || u32_at(bytes, 8)? != 1
-            || u32_at(bytes, 12)? & !15 != 0
+            || u32_at(bytes, 12)? & !31 != 0
         {
             return Err(PayloadError::Header);
         }
@@ -240,6 +242,7 @@ impl Payload {
             preserve_boot_args: u32_at(bytes, 12)? & 1 != 0,
             usb_uart: u32_at(bytes, 12)? & 2 != 0,
             usb_control: u32_at(bytes, 12)? & 4 != 0,
+            usb_net: u32_at(bytes, 12)? & 16 != 0,
             require_upload: u32_at(bytes, 12)? & 8 != 0,
             crc32: u32_at(bytes, 128)?,
         };

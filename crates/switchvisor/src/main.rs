@@ -120,7 +120,7 @@ fn launch_payload(payload: Payload, handoff: &[u64; 8], screen: &mut Screen) -> 
     }
     let gic = cpu::interrupt::detect_layout();
     cpu::interrupt::select_layout(gic);
-    let physical_usb = payload.usb_uart || payload.usb_control;
+    let physical_usb = payload.usb_uart || payload.usb_control || payload.usb_net;
     if stage2::prepare(physical_usb, gic).is_err() || mmu::prepare().is_err() {
         let _ = writeln!(screen, "STAGE2 REJECTED: TABLE PLACEMENT");
         park()
@@ -133,6 +133,7 @@ fn launch_payload(payload: Payload, handoff: &[u64; 8], screen: &mut Screen) -> 
     match usb::initialize(
         physical_usb,
         payload.usb_uart,
+        payload.usb_net,
         payload.require_upload,
         entry,
     ) {
@@ -150,8 +151,12 @@ fn launch_payload(payload: Payload, handoff: &[u64; 8], screen: &mut Screen) -> 
     vm::interrupt::initialize(
         gic,
         usb::available().then_some(switchvisor::drivers::usb::tegra210::INTERRUPT_ID),
+        payload
+            .usb_net
+            .then_some(switchvisor::vdev::virtio_net::INTERRUPT_ID),
     );
     cpu::interrupt::select_usb_interrupt(usb::available());
+    cpu::interrupt::select_network_interrupt(payload.usb_net);
     if let Err(error) = cpu::interrupt::initialize() {
         let _ = writeln!(screen, "VGIC INIT FAILED: {error:?}");
         park()
