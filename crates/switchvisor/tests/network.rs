@@ -160,6 +160,44 @@ fn bridge_and_virtqueues_forward_both_directions_and_backpressure_tx() {
 }
 
 #[test]
+fn full_guest_rx_queue_does_not_block_guest_tx() {
+    let mut network = Network::new();
+    configure(&mut network.device);
+    let mut memory = Memory::new();
+    let mut link = Link {
+        up: true,
+        input: vec![],
+        output: vec![],
+        busy: true,
+    };
+    network.service(&mut memory, &mut link);
+
+    // No guest RX descriptors are available. A driver can still need to send
+    // a TCP ACK before it reposts RX buffers, so TX must make independent progress.
+    let frame = frame();
+    while !network.bridge.guest.full() {
+        assert!(network.bridge.guest.push(&frame));
+    }
+    let mut queued_for_host = 0;
+    while !network.bridge.host.full() {
+        assert!(network.bridge.host.push(&frame));
+        queued_for_host += 1;
+    }
+    memory.tx(&frame);
+
+    network.service(&mut memory, &mut link);
+    assert_eq!(memory.get16(0x5002), 0); // Host egress still backpressures TX.
+    assert!(link.output.is_empty());
+
+    link.busy = false;
+    network.service(&mut memory, &mut link);
+    assert_eq!(memory.get16(0x5002), 1); // TX completed without any RX progress.
+    assert_eq!(link.output, vec![frame; queued_for_host + 1]);
+    assert!(network.bridge.guest.full());
+    assert!(network.bridge.host.front().is_none());
+}
+
+#[test]
 fn idle_and_backpressured_service_does_not_repeatedly_scan_guest_ram() {
     let mut network = Network::new();
     configure(&mut network.device);

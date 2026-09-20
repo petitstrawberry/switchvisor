@@ -92,7 +92,7 @@ timer latency, interrupt rate and SMP lock contention remain to be measured.
 
 ## Scarlet compatibility
 
-The local Scarlet revision inspected was
+The initial Scarlet revision inspected was
 `1eddc988a5c741f9bbb9a4d05a1cc25f7419badf`. Its driver requires MMIO version 2,
 but omits `VIRTIO_F_VERSION_1` from accepted network features and always uses a
 10-byte network header. Modern virtio requires VERSION_1 and a 12-byte header,
@@ -106,10 +106,10 @@ submitted as [Scarlet PR #569](https://github.com/petitstrawberry/Scarlet/pull/5
 including a modern-header regression assertion. In an isolated worktree based
 on current `dev`, the AArch64 library check and all 1288 RISC-V QEMU kernel tests
 passed using Scarlet's pinned Nix environment. The original Scarlet working
-checkout was preserved. Scarlet over the physical Switch USB link has not been
-tested.
+checkout was preserved. The PR is now merged as
+`2907183585d869158f70f2116c89950d2907fdae`; current Scarlet `dev` includes it.
 
-From the Scarlet checkout:
+Only for an older Scarlet checkout that does not contain that change:
 
 ```sh
 git apply --check /path/to/switchvisor/docs/patches/scarlet-virtio-net-v1.patch
@@ -140,9 +140,34 @@ control/loader functions. A guest is not needed for these management replies.
 
 Set the guest to `192.168.77.3/24`, then check host ↔ guest ping and VMM ping
 from both sides. Verify simultaneous console traffic if using `--usb-uart`.
-Unplug/replug and repeat after guest network reset. Enumeration on macOS/PC,
-Tegra DMA/cache behavior under SMP, and sustained throughput need real hardware
-validation; none of these physical-device checks were run here.
+Unplug/replug and repeat after guest network reset. The following bring-up
+records macOS enumeration and basic guest traffic; USB reset/replug stress,
+interrupt latency, SMP contention and sustained throughput remain unmeasured.
+
+### Switch / macOS bring-up, 2026-09-21
+
+The USB-NCM interface enumerated as `en13`, with the host at `.2` and Scarlet
+`veth0` at `.3`. Management ICMP and UDP ping/status worked before guest boot.
+Guest and host ICMP worked in both directions, and a guest HTTP server served
+its 6619-byte index with a matching SHA-256.
+
+The first 1 MiB host-to-guest TCP transfer exposed a deadlock: guest RX filled
+the bridge while Scarlet waited for synchronous TX completion holding its
+combined RX/TX lock. Gating TX on RX capacity prevented TCP ACK completion.
+The fix gates guest TX only on host egress capacity. The regression
+`full_guest_rx_queue_does_not_block_guest_tx` failed before this change and
+passes with it; all 112 workspace tests passed.
+
+After deployment, a 1 MiB upload took 2.174 seconds and its download took
+1.983 seconds, with exact byte comparison and SHA-256
+`f443f5f87314e70000f7cc4715f041d19ba44748d0f705839735ed4cd7c1383c`.
+The console remained responsive. These are individual bring-up transfers,
+not sustained-throughput measurements. Host PF NAT then enabled guest DNS and
+an external HTTP 200 response from `example.com`.
+
+Evidence: `.cache/net-bringup-20260921/tcp-roundtrip-fixed.json`,
+`backpressure-before.log` and `tests-after.log`. The tested monitor payload
+SHA-256 is `61d28a1cd2f207e2a686f036ab6a7dda5301a73d0522e371954a86e121cb6647`.
 
 ## Implementation bounds
 
@@ -160,7 +185,9 @@ validation; none of these physical-device checks were run here.
   Descriptor loops, overflow, wrong direction and invalid queues set
   DEVICE_NEEDS_RESET and raise a configuration interrupt.
 - Each bridge egress has eight frame slots, with bounded work per service.
-  Guest TX is backpressured when queues fill; ingress destined for a stalled
+  Guest TX is backpressured only when host egress fills. A full guest RX queue
+  must not prevent TX completion: a guest may need to send TCP ACKs before
+  recycling receive buffers. Ingress destined for a stalled
   guest may be dropped so host management stays responsive. Link reset flushes
   pending bridge packets. There is no per-packet allocation.
 

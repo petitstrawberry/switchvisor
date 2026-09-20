@@ -98,10 +98,12 @@ impl Bridge {
         }
     }
 
-    /// Keep both egress queues available before accepting ingress. This also
-    /// reserves space for a management response to a broadcast ARP request.
-    pub fn can_receive(&self) -> bool {
-        !self.host.full() && !self.guest.full()
+    /// Backpressure guest TX only on host egress. Waiting for guest RX space
+    /// here creates a cycle when a guest sends an ACK before recycling RX
+    /// buffers. Local management replies may be dropped when guest RX is full,
+    /// just like incoming host frames; they must not stall outbound traffic.
+    pub fn can_receive_from_guest(&self) -> bool {
+        !self.host.full()
     }
 
     pub fn receive(&mut self, port: Port, frame: &[u8]) -> bool {
@@ -198,7 +200,7 @@ impl Network {
                 self.bridge.receive(Port::Host, &frame[..length]);
                 progressed = true;
             }
-            if self.bridge.can_receive() {
+            if self.bridge.can_receive_from_guest() {
                 let length = self.device.transmit(memory, &mut frame);
                 if length != 0 {
                     self.bridge.receive(Port::Guest, &frame[..length]);
