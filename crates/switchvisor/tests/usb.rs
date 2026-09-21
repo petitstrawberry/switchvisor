@@ -1,5 +1,10 @@
 //! Run the production XUDC driver against its MMIO and DMA contracts.
-use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, VecDeque},
+    rc::Rc,
+};
+use switchvisor::vdev::VirtualDevice;
 use switchvisor::vdev::usb_ownership::{self as ownership, CAR, PMC};
 use switchvisor::{
     drivers::{
@@ -19,6 +24,8 @@ struct State {
     dma: [u32; DMA_SIZE / 4],
     writes: Vec<(u64, u32)>,
     latest: [u64; 12],
+    ncm_out: VecDeque<u64>,
+    cpu_buffers: Vec<(usize, usize)>,
     event: usize,
     cycle: u32,
     time: u64,
@@ -37,6 +44,8 @@ impl Mock {
             dma: [0; DMA_SIZE / 4],
             writes: vec![],
             latest: [0; 12],
+            ncm_out: VecDeque::new(),
+            cpu_buffers: vec![],
             event: 0,
             cycle: 1,
             time: 10_000,
@@ -66,7 +75,15 @@ impl Mock {
     }
     fn complete(&self, ep: u32, remaining: u32, code: u32) {
         let ring = EPS.iter().position(|&id| id == ep).unwrap();
-        let pointer = self.0.borrow().latest[ring];
+        let pointer = if ep == 12 {
+            self.0
+                .borrow_mut()
+                .ncm_out
+                .pop_front()
+                .expect("no NCM OUT was armed")
+        } else {
+            self.0.borrow().latest[ring]
+        };
         self.event([
             pointer as u32,
             (pointer >> 32) as u32,
@@ -153,6 +170,20 @@ impl Clock for Mock {
     }
 }
 impl DmaBuffer for Buffer {
+    fn with_cpu_buffer<R>(
+        &mut self,
+        offset: usize,
+        length: usize,
+        f: impl FnOnce(&mut [u8]) -> R,
+    ) -> R {
+        let mut state = self.mock.0.borrow_mut();
+        assert!(offset <= DMA_SIZE && length <= DMA_SIZE - offset);
+        state.cpu_buffers.push((offset, length));
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(state.dma.as_mut_ptr().cast::<u8>().add(offset), length)
+        };
+        f(bytes)
+    }
     fn physical_base(&self) -> u64 {
         self.base
     }
@@ -168,6 +199,9 @@ impl DmaBuffer for Buffer {
         let mut state = self.mock.0.borrow_mut();
         let old = state.dma[offset / 4];
         state.dma[offset / 4] = value;
+        if offset == RINGS[9] && value == 0 {
+            state.ncm_out.clear();
+        }
         if (0x1000..0x1400).contains(&offset) && offset % 64 == 0 && old != value {
             let mask = 1 << ((offset - 0x1000) / 64);
             let old = state.registers.get(&(DEV + 0x5c)).copied().unwrap_or(0);
@@ -179,6 +213,9 @@ impl DmaBuffer for Buffer {
                 && matches!((value >> 10) & 63, 1 | 3 | 4)
             {
                 state.latest[ring] = BASE + (offset - 12) as u64;
+                if ring == 9 {
+                    state.ncm_out.push_back(BASE + (offset - 12) as u64);
+                }
             }
         }
     }
@@ -579,7 +616,7 @@ fn guest_clock_writes_preserve_only_usb_bits_and_write_one_semantics() {
 mod network_support;
 use switchvisor::{
     drivers::usb::ncm,
-    net::{Ethernet, FRAME_SIZE, Network},
+    net::{Ethernet, Network},
 };
 
 fn ncm_configured(usb: &mut Usb, mock: &Mock, high: bool) {
@@ -647,6 +684,7 @@ fn ncm_virtio_bridge_runs_both_directions_through_real_xudc_event_handling() {
     network.service(&mut memory, &mut usb);
     assert_eq!(&memory.bytes[0x800c..0x800c + frame.len()], frame);
     memory.tx(&frame);
+    network.device.write(0x50, 4, 1).unwrap();
     network.service(&mut memory, &mut usb);
     let transmitted = mock.bytes(0xc000, mock.trb(13)[2] as usize);
     let block = ncm::decode(&transmitted).unwrap();
@@ -675,7 +713,7 @@ fn ncm_tx_short_packet_zlp_reset_and_malformed_rx_are_bounded() {
         mock.put_bytes(0x8000, b"not an NTB header");
         mock.complete(12, (ncm::NTB_SIZE - 17) as u32, 13);
         usb.poll().unwrap();
-        assert_eq!(usb.receive_frame(&mut [0; FRAME_SIZE]), 0);
+        assert!(!usb.receive_frame(|_| panic!("malformed NTB exposed a frame")));
         assert!(usb.link_up());
         mock.port(1 << 17);
         usb.poll().unwrap();
@@ -683,4 +721,122 @@ fn ncm_tx_short_packet_zlp_reset_and_malformed_rx_are_bounded() {
         ncm_configured(&mut usb, &mock, high);
         assert!(usb.send_frame(&frame));
     }
+}
+
+#[test]
+fn ncm_receive_slots_are_borrowed_until_the_last_datagram_and_wrap_in_order() {
+    let (mut usb, mock) = new_network(true);
+    ncm_configured(&mut usb, &mock, true);
+    assert_eq!(mock.0.borrow().ncm_out.len(), 2);
+    let mut next = 0u8;
+    for round in 0..20 {
+        for (slot, offset) in [0x8000, 0x10000].into_iter().enumerate() {
+            let mut bytes = [0xa5; ncm::NTB_SIZE];
+            let mut encoder = ncm::Encoder::new();
+            for item in 0..2 {
+                encoder
+                    .push(&[next + (slot * 2 + item) as u8; 61], &mut bytes)
+                    .unwrap();
+            }
+            let length = encoder.finish(round, &mut bytes).unwrap();
+            mock.put_bytes(offset, &bytes[..length]);
+            mock.complete(12, (ncm::NTB_SIZE - length) as u32, 13);
+        }
+        usb.poll().unwrap();
+        assert!(mock.0.borrow().ncm_out.is_empty());
+        for packet in 0usize..4 {
+            let dma = mock.0.borrow().dma.as_ptr() as usize;
+            assert!(usb.receive_frame(|frame| {
+                assert_eq!(frame, &[next; 61]);
+                let base = dma + if packet < 2 { 0x8000 } else { 0x10000 };
+                assert!((base..base + ncm::NTB_SIZE).contains(&(frame.as_ptr() as usize)));
+            }));
+            next += 1;
+            usb.poll().unwrap();
+            assert_eq!(mock.0.borrow().ncm_out.len(), packet.div_ceil(2));
+        }
+        assert!(!usb.receive_frame(|_| panic!("replayed consumed DMA data")));
+    }
+    assert_eq!(
+        usb.receive_channel(Channel::Ncm, &mut [0; 1]),
+        Err(Error::Transfer)
+    );
+}
+
+#[test]
+fn ncm_batches_queued_frames_and_keeps_unaccepted_frames_owned_by_the_bridge() {
+    use switchvisor::net::Frames;
+    let (mut usb, mock) = new_network(true);
+    ncm_configured(&mut usb, &mock, true);
+    let mut queue = Frames::new();
+    let mut expected = Vec::new();
+    for index in 0..8 {
+        let mut frame = network_support::frame();
+        frame.resize(1514, index);
+        assert!(queue.push(&frame));
+        expected.push(frame);
+    }
+    assert_eq!(usb.send_frames(&mut queue), 8);
+    assert!(queue.empty());
+    let length = mock.trb(13)[2] as usize;
+    let bytes = mock.bytes(0xc000, length);
+    let block = ncm::decode(&bytes).unwrap();
+    assert_eq!(block.count, 8);
+    for (d, frame) in block.datagrams[..block.count].iter().zip(&expected) {
+        assert_eq!(&bytes[d.offset..d.offset + d.length], frame);
+    }
+    queue.push(&expected[0]);
+    queue.push(&expected[1]);
+    let borrows = mock.0.borrow().cpu_buffers.len();
+    assert_eq!(usb.send_frames(&mut queue), 0);
+    assert_eq!(mock.0.borrow().cpu_buffers.len(), borrows); // Busy means no payload access.
+    assert_eq!(queue.iter().count(), 2);
+    assert_eq!(mock.bytes(0xc000, length), bytes); // In-flight DMA was untouched.
+    mock.complete(13, 0, 1);
+    usb.poll().unwrap();
+
+    // Host input limits can split a batch; consume only what was submitted.
+    mock.setup(1, 11, 0, 6, 0);
+    usb.poll().unwrap();
+    mock.complete(0, 0, 1);
+    usb.poll().unwrap();
+    mock.setup(0x21, 0x86, 0, 5, 4);
+    usb.poll().unwrap();
+    mock.put_bytes(0x1400, &2048u32.to_le_bytes());
+    mock.complete(0, 0, 1);
+    usb.poll().unwrap();
+    mock.complete(0, 0, 1);
+    usb.poll().unwrap();
+    mock.setup(1, 11, 1, 6, 0);
+    usb.poll().unwrap();
+    mock.complete(0, 0, 1);
+    usb.poll().unwrap();
+    assert_eq!(usb.send_capacity_channel(Channel::Ncm), 2048);
+    assert_eq!(usb.send_frames(&mut queue), 1);
+    assert_eq!(queue.front(), Some(expected[1].as_slice()));
+    let bytes = mock.bytes(0xc000, mock.trb(13)[2] as usize);
+    assert_eq!(ncm::decode(&bytes).unwrap().count, 1);
+    assert!(bytes.len() <= 2048);
+}
+
+#[test]
+fn ncm_clear_halt_discards_partial_block_before_rearming_receive_slots() {
+    let (mut usb, mock) = new_network(true);
+    ncm_configured(&mut usb, &mock, true);
+    let mut bytes = [0; ncm::NTB_SIZE];
+    let mut encoder = ncm::Encoder::new();
+    for _ in 0..2 {
+        encoder.push(&[7; 60], &mut bytes).unwrap();
+    }
+    let length = encoder.finish(0, &mut bytes).unwrap();
+    mock.put_bytes(0x8000, &bytes[..length]);
+    mock.complete(12, (ncm::NTB_SIZE - length) as u32, 13);
+    usb.poll().unwrap();
+    assert!(usb.receive_frame(|frame| assert_eq!(frame, &[7; 60])));
+    mock.setup(2, 1, 0, 6, 0); // CLEAR_FEATURE(ENDPOINT_HALT), OUT endpoint 6.
+    usb.poll().unwrap();
+    mock.complete(0, 0, 1);
+    usb.poll().unwrap();
+    assert_eq!(mock.0.borrow().ncm_out.len(), 2);
+    assert!(!usb.receive_frame(|_| panic!("exposed packet from reset DMA ownership")));
 }

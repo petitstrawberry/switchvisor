@@ -3,6 +3,7 @@
 use crate::arch::aarch64::sync::Mutex;
 use core::sync::atomic::{AtomicBool, Ordering};
 use switchvisor::vdev::{self, uart::Uart};
+use switchvisor::{mmio::Access, vdev::uart};
 
 static UART: Mutex<Uart> = Mutex::new(Uart::new());
 static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -28,9 +29,12 @@ pub fn emulate_uart(esr: u64, far: u64, hpfar: u64, registers: &mut [u64; 31]) -
     if !ENABLED.load(Ordering::Acquire) {
         return false;
     }
+    let Some(access) = Access::decode_region(esr, far, hpfar, uart::BASE, uart::SIZE) else {
+        return false;
+    };
     let (handled, asserted) = unsafe {
         UART.with(|uart| {
-            let handled = vdev::emulate(uart, esr, far, hpfar, registers);
+            let handled = vdev::emulate_access(uart, access, registers);
             let asserted = uart.interrupt_pending();
             (handled, asserted)
         })

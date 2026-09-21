@@ -8,10 +8,10 @@
 
 use super::composite::{CONTROL_SIZE, Composite, Reply, Setup};
 use super::ncm;
-use crate::net::{Ethernet, FRAME_SIZE, HOST_MAC};
+use crate::net::{Ethernet, FRAME_SIZE, Frames, HOST_MAC};
 use crate::{
     drivers::{Clock, DmaBuffer, Driver, Mmio, RxTransport, TxTransport},
-    payload::{RESIDENT_BASE, RESIDENT_SIZE},
+    el2_mmu::{DMA_BASE, DMA_END},
 };
 
 pub const CAR: u64 = 0x6000_6000;
@@ -21,7 +21,7 @@ pub const DEV: u64 = 0x700d_0000;
 pub const INTERRUPT_ID: u32 = 32 + 44;
 const PAD: u64 = 0x7009_f000;
 const VBUS_ON: u32 = 1 << 14;
-pub const DMA_SIZE: usize = 64 * 1024;
+pub const DMA_SIZE: usize = 80 * 1024;
 const EVENT0: usize = 0;
 const EVENT1: usize = 0x100;
 const CONTEXT: usize = 0x1000;
@@ -35,6 +35,9 @@ const OUT_RINGS: [usize; 4] = [1, 4, 7, 9];
 const IN_RINGS: [usize; 4] = [2, 5, 8, 10];
 const NOTIFY_RINGS: [usize; 3] = [3, 6, 11];
 const RX_BUFFERS: [usize; 4] = [0x1600, 0x1c00, 0x3000, 0x8000];
+// Two queued OUT slots overlap USB reception with CPU consumption, without
+// copying a complete NTB out of DMA just to rearm the endpoint early.
+const NCM_RX_BUFFERS: [usize; 2] = [0x8000, 0x10000];
 const TX_BUFFERS: [usize; 4] = [0x1800, 0x1e00, 0x4000, 0xc000];
 const RX_CAPACITIES: [usize; 4] = [512, 512, 4096, ncm::NTB_SIZE];
 const TX_CAPACITIES: [usize; 4] = [512, 512, 512, ncm::NTB_SIZE];
@@ -135,6 +138,20 @@ struct ChannelState {
     zlp_needed: bool,
 }
 
+#[derive(Clone, Copy)]
+struct NcmReceive {
+    out: Option<u64>,
+    length: Option<usize>,
+}
+impl NcmReceive {
+    const fn new() -> Self {
+        Self {
+            out: None,
+            length: None,
+        }
+    }
+}
+
 impl ChannelState {
     const fn new() -> Self {
         Self {
@@ -173,7 +190,8 @@ pub struct Xudc<H, D> {
     control: Option<(u64, ControlPhase)>,
     channels: [ChannelState; 4],
     notifications: [Notification; 3],
-    ncm_rx: [u8; ncm::NTB_SIZE],
+    ncm_receives: [NcmReceive; 2],
+    ncm_receive_index: usize,
     ncm_block: ncm::Block,
     ncm_cursor: usize,
     ncm_sequence: u16,
@@ -197,7 +215,8 @@ impl<H, D> Xudc<H, D> {
             control: None,
             channels: [const { ChannelState::new() }; 4],
             notifications: [const { Notification::new() }; 3],
-            ncm_rx: [0; ncm::NTB_SIZE],
+            ncm_receives: [NcmReceive::new(); 2],
+            ncm_receive_index: 0,
             ncm_block: ncm::Block::empty(),
             ncm_cursor: 0,
             ncm_sequence: 0,
@@ -240,6 +259,8 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
             }
         }
         self.device.ncm.alternate = alternate;
+        self.ncm_receives = [NcmReceive::new(); 2];
+        self.ncm_receive_index = 0;
         self.ncm_block = ncm::Block::empty();
         self.ncm_cursor = 0;
         self.notifications[2].needed = true;
@@ -499,6 +520,8 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
         }
         self.notifications = [const { Notification::new() }; 3];
         self.device.ncm = ncm::Function::new(self.device.ncm.enabled);
+        self.ncm_receives = [NcmReceive::new(); 2];
+        self.ncm_receive_index = 0;
         self.ncm_block = ncm::Block::empty();
         self.ncm_cursor = 0;
         self.ncm_sequence = 0;
@@ -512,6 +535,12 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
     }
 
     fn clear_endpoint_state(&mut self, ring: usize) {
+        if ring == OUT_RINGS[3] {
+            self.ncm_receives = [NcmReceive::new(); 2];
+            self.ncm_receive_index = 0;
+            self.ncm_block.count = 0;
+            self.ncm_cursor = 0;
+        }
         if let Some(channel) = OUT_RINGS.iter().position(|&candidate| candidate == ring) {
             self.channels[channel].out = None;
             self.channels[channel].rx = None;
@@ -648,6 +677,22 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
                     ControlPhase::Status => Ok(()),
                 }
             }
+            ring if ring == OUT_RINGS[3] => {
+                let Some(slot) = self
+                    .ncm_receives
+                    .iter_mut()
+                    .find(|slot| slot.out == Some(pointer))
+                else {
+                    return Ok(());
+                };
+                if remaining > ncm::NTB_SIZE {
+                    return Err(Error::Transfer);
+                }
+                slot.out = None;
+                slot.length = Some(ncm::NTB_SIZE - remaining);
+                self.statistics.received += (ncm::NTB_SIZE - remaining) as u64;
+                Ok(())
+            }
             ring if OUT_RINGS.contains(&ring) => {
                 let channel = OUT_RINGS
                     .iter()
@@ -731,7 +776,7 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
             return Ok(());
         }
         for channel in Channel::ALL {
-            if channel == Channel::Ncm && !self.device.ncm.active() {
+            if channel == Channel::Ncm {
                 continue;
             }
             let index = channel.index();
@@ -750,6 +795,28 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
                         (1 << 10) | (1 << 2) | (1 << 5),
                     ],
                 )?);
+            }
+        }
+        if self.device.ncm.active()
+            && self.hardware.read32(DEV + 0x50) & (1 << ENDPOINTS[OUT_RINGS[3]]) == 0
+        {
+            // Refill in consumption order even if both slots are free.
+            for delta in 0..NCM_RX_BUFFERS.len() {
+                let index = (self.ncm_receive_index + delta) % NCM_RX_BUFFERS.len();
+                if self.ncm_receives[index].out.is_none()
+                    && self.ncm_receives[index].length.is_none()
+                {
+                    let pointer = self.queue(
+                        OUT_RINGS[3],
+                        [
+                            self.dma_address(NCM_RX_BUFFERS[index]) as u32,
+                            0,
+                            ncm::NTB_SIZE as u32,
+                            (1 << 10) | (1 << 2) | (1 << 5),
+                        ],
+                    )?;
+                    self.ncm_receives[index].out = Some(pointer);
+                }
             }
         }
         for function in 0..self.notifications.len() {
@@ -821,10 +888,10 @@ impl<H: Mmio + Clock, D: DmaBuffer> Driver for Xudc<H, D> {
         let base = self.dma.physical_base();
         if base % 4096 != 0
             || self.dma.size() < DMA_SIZE
-            || base < RESIDENT_BASE
+            || base < DMA_BASE
             || base
                 .checked_add(DMA_SIZE as u64)
-                .is_none_or(|end| end > RESIDENT_BASE + RESIDENT_SIZE || end > 1 << 32)
+                .is_none_or(|end| end > DMA_END || end > 1 << 32)
         {
             return Err(Error::DmaRegion);
         }
@@ -833,6 +900,10 @@ impl<H: Mmio + Clock, D: DmaBuffer> Driver for Xudc<H, D> {
         self.device.reset();
         self.control = None;
         self.channels = [const { ChannelState::new() }; 4];
+        self.ncm_receives = [NcmReceive::new(); 2];
+        self.ncm_receive_index = 0;
+        self.ncm_block = ncm::Block::empty();
+        self.ncm_cursor = 0;
         self.notifications = [const { Notification::new() }; 3];
         // Keep this USB client in bypass even if the guest later enables the SMMU.
         self.hardware.write32(DEV_ASID, 0);
@@ -1021,6 +1092,11 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
     }
 
     pub fn receive_channel(&mut self, channel: Channel, output: &mut [u8]) -> Result<usize, Error> {
+        // NCM retains OUT ownership across all datagrams in a block. A raw
+        // channel read must never rearm that slot behind the frame API's back.
+        if channel == Channel::Ncm {
+            return Err(Error::Transfer);
+        }
         let index = channel.index();
         let Some(mut receive) = self.channels[index].rx else {
             return Ok(0);
@@ -1065,9 +1141,20 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
             return Ok(0);
         }
         let length = bytes.len().min(capacity);
-        self.put_bytes(TX_BUFFERS[index], &bytes[..length]);
+        self.dma
+            .with_cpu_buffer(TX_BUFFERS[index], length, |output| {
+                output.copy_from_slice(&bytes[..length]);
+            });
+        self.submit_channel(channel, length)?;
+        Ok(length)
+    }
+
+    // Payload is already in its DMA slot. Publish ownership only after all
+    // writes finish; queue() supplies the release barrier before the doorbell.
+    fn submit_channel(&mut self, channel: Channel, length: usize) -> Result<(), Error> {
+        let index = channel.index();
         let pointer = self.queue(
-            ring,
+            IN_RINGS[index],
             [
                 self.dma_address(TX_BUFFERS[index]) as u32,
                 0,
@@ -1077,7 +1164,17 @@ impl<H: Mmio + Clock, D: DmaBuffer> Xudc<H, D> {
         )?;
         self.channels[index].tx = Some((pointer, length));
         self.channels[index].zlp_needed = length % self.packet_size() as usize == 0;
-        Ok(length)
+        Ok(())
+    }
+
+    fn release_ncm_receive(&mut self) {
+        self.ncm_receives[self.ncm_receive_index].length = None;
+        self.ncm_receive_index = (self.ncm_receive_index + 1) % NCM_RX_BUFFERS.len();
+        self.ncm_block.count = 0;
+        self.ncm_cursor = 0;
+        if self.arm_data().is_err() {
+            self.failed = true;
+        }
     }
 }
 
@@ -1092,42 +1189,44 @@ impl<H: Mmio + Clock, D: DmaBuffer> Ethernet for Xudc<H, D> {
         self.connected_channel(Channel::Ncm)
     }
 
-    fn receive_frame(&mut self, output: &mut [u8; FRAME_SIZE]) -> usize {
+    fn receive_frame(&mut self, receive_frame: impl FnOnce(&[u8])) -> bool {
         if !self.link_up() {
-            return 0;
+            return false;
         }
         if self.ncm_cursor == self.ncm_block.count {
-            let Some(receive) = self.channels[3].rx else {
-                return 0;
+            let Some(length) = self.ncm_receives[self.ncm_receive_index].length else {
+                return false;
             };
-            // Copy without a 16 KiB temporary on the EL2 exception stack.
-            for offset in (0..receive.length).step_by(4) {
-                let word = self.dma.read32(RX_BUFFERS[3] + offset).to_le_bytes();
-                let count = (receive.length - offset).min(4);
-                self.ncm_rx[offset..offset + count].copy_from_slice(&word[..count]);
-            }
-            self.channels[3].rx = None;
             self.ncm_cursor = 0;
-            self.ncm_block = match ncm::decode(&self.ncm_rx[..receive.length]) {
+            self.ncm_block = match self.dma.with_cpu_buffer(
+                NCM_RX_BUFFERS[self.ncm_receive_index],
+                length,
+                |bytes| ncm::decode(bytes),
+            ) {
                 Ok(block) => block,
                 Err(_) => {
                     self.statistics.dropped += 1;
                     ncm::Block::empty()
                 }
             };
-            if self.arm_data().is_err() {
-                self.failed = true;
-                return 0;
-            }
         }
         if self.ncm_cursor == self.ncm_block.count {
-            return 0;
+            self.release_ncm_receive();
+            return false;
         }
         let datagram = self.ncm_block.datagrams[self.ncm_cursor];
-        output[..datagram.length]
-            .copy_from_slice(&self.ncm_rx[datagram.offset..datagram.offset + datagram.length]);
+        // Keep the completed OUT slot CPU-owned across every datagram. Poll
+        // cannot rearm it while length is Some; the callback cannot retain it.
+        self.dma.with_cpu_buffer(
+            NCM_RX_BUFFERS[self.ncm_receive_index] + datagram.offset,
+            datagram.length,
+            |bytes| receive_frame(bytes),
+        );
         self.ncm_cursor += 1;
-        datagram.length
+        if self.ncm_cursor == self.ncm_block.count {
+            self.release_ncm_receive();
+        }
+        true
     }
 
     fn send_frame(&mut self, frame: &[u8]) -> bool {
@@ -1136,28 +1235,86 @@ impl<H: Mmio + Clock, D: DmaBuffer> Ethernet for Xudc<H, D> {
         }
         // CDC packet filters apply to traffic sent to the host. A filtered
         // frame is consumed, so it cannot block later management traffic.
-        let filter = self.device.ncm.packet_filter;
-        let accepted = filter & 1 != 0
-            || (frame[..6] == [0xff; 6] && filter & 8 != 0)
-            || (frame[0] & 1 != 0 && filter & 2 != 0)
-            || (frame[..6] == HOST_MAC && filter & 4 != 0);
-        if !accepted {
+        if !accepts_frame(frame, self.device.ncm.packet_filter) {
             return true;
         }
-        let mut bytes = [0; FRAME_SIZE + ncm::FRAME_OFFSET];
-        let Ok(length) = ncm::encode(frame, self.ncm_sequence, &mut bytes) else {
-            return false;
-        };
-        if self.send_capacity_channel(Channel::Ncm) < length {
+        let length = frame.len() + ncm::FRAME_OFFSET;
+        if self.send_capacity_channel(Channel::Ncm) < length
+            || self.hardware.read32(DEV + 0x50) & (1 << ENDPOINTS[IN_RINGS[3]]) != 0
+        {
             return false;
         }
-        if self.send_channel(Channel::Ncm, &bytes[..length]) == Ok(length) {
+        if self
+            .dma
+            .with_cpu_buffer(TX_BUFFERS[3], length, |bytes| {
+                ncm::encode(frame, self.ncm_sequence, bytes)
+            })
+            .is_err()
+        {
+            return false;
+        }
+        if self.submit_channel(Channel::Ncm, length).is_ok() {
             self.ncm_sequence = self.ncm_sequence.wrapping_add(1);
             true
         } else {
             false
         }
     }
+
+    fn send_frames(&mut self, frames: &mut Frames) -> usize {
+        if !self.link_up() {
+            return 0;
+        }
+        let filter = self.device.ncm.packet_filter;
+        let mut consumed = 0;
+        while frames
+            .front()
+            .is_some_and(|frame| !accepts_frame(frame, filter))
+        {
+            frames.pop();
+            consumed += 1;
+        }
+        // Do not delay individual ACKs or management replies to form a batch.
+        if frames.iter().count() < 2 {
+            if frames.front().is_some_and(|frame| self.send_frame(frame)) {
+                frames.pop();
+                consumed += 1;
+            }
+            return consumed;
+        }
+        let capacity = self.send_capacity_channel(Channel::Ncm);
+        if capacity == 0 || self.hardware.read32(DEV + 0x50) & (1 << ENDPOINTS[IN_RINGS[3]]) != 0 {
+            return consumed;
+        }
+        let (result, count) = self.dma.with_cpu_buffer(TX_BUFFERS[3], capacity, |output| {
+            let mut encoder = ncm::Encoder::new();
+            let mut count = 0;
+            for frame in frames.iter() {
+                if accepts_frame(frame, filter) && encoder.push(frame, output).is_err() {
+                    break;
+                }
+                count += 1;
+            }
+            (encoder.finish(self.ncm_sequence, output), count)
+        });
+        if let Ok(length) = result {
+            if self.submit_channel(Channel::Ncm, length).is_ok() {
+                self.ncm_sequence = self.ncm_sequence.wrapping_add(1);
+                for _ in 0..count {
+                    frames.pop();
+                }
+                consumed += count;
+            }
+        }
+        consumed
+    }
+}
+
+fn accepts_frame(frame: &[u8], filter: u16) -> bool {
+    filter & 1 != 0
+        || (frame[..6] == [0xff; 6] && filter & 8 != 0)
+        || (frame[0] & 1 != 0 && filter & 2 != 0)
+        || (frame[..6] == HOST_MAC && filter & 4 != 0)
 }
 
 impl<H: Mmio + Clock, D: DmaBuffer> TxTransport for Xudc<H, D> {

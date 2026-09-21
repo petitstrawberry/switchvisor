@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Reject FP/SIMD and atomic RMW instructions in the linked cache-off EL2 image."""
+"""Reject FP/SIMD and exclusive/atomic RMW across the complete EL2 image.
+
+Private runtime RAM is cacheable; bootstrap still executes with caches off.
+The existing load/store-only synchronization contract applies to both paths.
+"""
 import argparse
 import hashlib
 import json
@@ -20,7 +24,7 @@ for line in assembly.splitlines():
     operands = fields[2].split("<",1)[0] if len(fields)>2 else ""
     instructions += 1
     if re.fullmatch(r"(?:ld(?:a)?x(?:r|p)|st(?:l)?x(?:r|p))[bh]?",opcode) or re.fullmatch(r"(?:casp?|swp|ldadd|ldclr|ldeor|ldset|ldsmax|ldsmin|ldumax|ldumin|stadd|stclr|steor|stset|stsmax|stsmin|stumax|stumin)[albh]*",opcode):
-        raise SystemExit("Atomic RMW instruction in cache-off EL2: "+line.strip())
+        raise SystemExit("Atomic RMW instruction violates EL2 bootstrap contract: "+line.strip())
     if opcode.startswith("f") or opcode in ["ld1","ld2","ld3","ld4","st1","st2","st3","st4"] or re.search(r"\b(?:v[0-9]+(?:\.[0-9]+[bhsd])?|[bhsdq][0-9]+)\b",operands):
         raise SystemExit("FP/SIMD instruction: "+line.strip())
 assert instructions>0,"no disassembly found"

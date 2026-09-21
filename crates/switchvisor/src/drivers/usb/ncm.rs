@@ -157,6 +157,82 @@ pub fn encode(frame: &[u8], sequence: u16, output: &mut [u8]) -> Result<usize, E
     Ok(length)
 }
 
+/// Build a multi-datagram NTB in its final DMA slot. The NDP follows the data,
+/// so a new frame never moves previously copied payload or reserves MTU-sized
+/// holes. Failed appends leave both metadata and the output unchanged.
+pub struct Encoder {
+    block: Block,
+    end: usize,
+}
+impl Default for Encoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl Encoder {
+    pub const fn new() -> Self {
+        Self {
+            block: Block::empty(),
+            end: 12,
+        }
+    }
+    pub fn push(&mut self, frame: &[u8], output: &mut [u8]) -> Result<(), Error> {
+        if self.block.count == MAX_DATAGRAMS {
+            return Err(Error::TooMany);
+        }
+        if !(14..=FRAME_SIZE).contains(&frame.len()) {
+            return Err(Error::Length);
+        }
+        let offset = ((self.end + 14 + 3) & !3) - 14;
+        let end = offset + frame.len();
+        let ndp = (end + 3) & !3;
+        let total = ndp + 8 + (self.block.count + 2) * 4;
+        if total > output.len().min(NTB_SIZE) {
+            return Err(Error::Length);
+        }
+        output[self.end..offset].fill(0);
+        output[offset..end].copy_from_slice(frame);
+        self.block.datagrams[self.block.count] = Datagram {
+            offset,
+            length: frame.len(),
+        };
+        self.block.count += 1;
+        self.end = end;
+        Ok(())
+    }
+    pub fn finish(self, sequence: u16, output: &mut [u8]) -> Result<usize, Error> {
+        let ndp = (self.end + 3) & !3;
+        let size = 8 + (self.block.count + 1) * 4;
+        let length = ndp + size;
+        if self.block.count == 0 || length > output.len().min(NTB_SIZE) {
+            return Err(Error::Length);
+        }
+        output[..12].copy_from_slice(&[
+            b'N',
+            b'C',
+            b'M',
+            b'H',
+            12,
+            0,
+            sequence as u8,
+            (sequence >> 8) as u8,
+            length as u8,
+            (length >> 8) as u8,
+            ndp as u8,
+            (ndp >> 8) as u8,
+        ]);
+        output[self.end..length].fill(0);
+        output[ndp..ndp + 4].copy_from_slice(b"NCM0");
+        output[ndp + 4..ndp + 6].copy_from_slice(&(size as u16).to_le_bytes());
+        for (index, frame) in self.block.datagrams[..self.block.count].iter().enumerate() {
+            let at = ndp + 8 + index * 4;
+            output[at..at + 2].copy_from_slice(&(frame.offset as u16).to_le_bytes());
+            output[at + 2..at + 4].copy_from_slice(&(frame.length as u16).to_le_bytes());
+        }
+        Ok(length)
+    }
+}
+
 pub struct Function {
     pub enabled: bool,
     pub alternate: u8,

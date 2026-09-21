@@ -39,6 +39,7 @@ def main():
                                        diagnostic_regions=[(0x08000000, 0x1000), (0x08030000, 0x200)])
         report.update({"guest_mmu_enabled": bool(mmu), "physical_usb_emulated": False,
                        "network_virtual_intid": 71, "management_arp_reply_verified": True,
+                       "empty_queue_kick_recovery_verified": True,
                        "guest_irq_priority": priority, "guest_priority_mask_verified": True})
         reports.append(report)
     (output / "verification.json").write_text(json.dumps(

@@ -1,7 +1,7 @@
 //! Four pinned virtual CPUs. Firmware always receives the EL2 trampoline.
 //!
-//! EL2 keeps its data cache off. Use only atomic loads/stores, never exclusive
-//! read-modify-write instructions that require an external memory-system monitor.
+//! Shared state uses ordered loads/stores and Bakery claims. Keep this protocol
+//! independent of exclusive atomics, including bootstrap cache-off paths.
 use crate::{
     IPA_LIMIT,
     payload::{RESIDENT_BASE, RESIDENT_SIZE},
@@ -52,7 +52,7 @@ impl Cpu {
 // Each participant owns one slot. Bit 0 means choosing; the other bits hold its
 // Bakery number. Sequentially consistent accesses order the selection protocol.
 // This is Lamport's algorithm, independently implemented using loads/stores.
-// TF-A uses Bakery locks for its cache-off power-state paths for the same reason:
+// TF-A also uses Bakery locks for its cache-off power-state paths:
 // https://trustedfirmware-a.readthedocs.io/en/latest/design/firmware-design.html#runtime-services-initialization
 struct Claims {
     slots: [AtomicU64; CPU_COUNT],

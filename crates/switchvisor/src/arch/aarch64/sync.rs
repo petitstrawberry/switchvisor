@@ -1,4 +1,4 @@
-//! Cache-off mutual exclusion using only atomic loads/stores.
+//! Cache-independent mutual exclusion using only ordered atomic loads/stores.
 use core::{
     arch::asm,
     cell::UnsafeCell,

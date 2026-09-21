@@ -77,6 +77,14 @@ network overlay alone does not change `/chosen/stdout-path`.
   register reads and ACKs do not directly drain queues; explicit queue/status
   writes can service them. Processing stops as soon as a round makes no progress,
   with a maximum of 16 rounds per call.
+- Once a virtqueue is observed empty, it waits for its `QueueNotify` instead
+  of reading guest RAM again on every USB service. Queue enable and entry into
+  `DRIVER_OK` also schedule an initial check. Queues with remaining descriptors
+  stay runnable across the service budget and host egress backpressure. Available
+  buffer notifications are never suppressed; guests must notify RX after
+  replenishing buffers and TX after posting packets, as required by Virtio 1.2
+  section 2.7.10.1. Console and descriptor scratch storage is retained between
+  calls. Ethernet payloads use borrowed DMA storage or final ring slots.
 - CPU0 resumes its guest after EL2 service. Other guest CPUs are not deliberately
   stopped, but simultaneous access to shared USB/network state can wait on its
   lock. Packet copies and cache maintenance still consume time with local
@@ -169,10 +177,41 @@ Evidence: `.cache/net-bringup-20260921/tcp-roundtrip-fixed.json`,
 `backpressure-before.log` and `tests-after.log`. The tested monitor payload
 SHA-256 is `61d28a1cd2f207e2a686f036ab6a7dda5301a73d0522e371954a86e121cb6647`.
 
+### Idle service overhead, 2026-09-22
+
+The empty-queue notification gating and retained scratch buffers were deployed
+with USB UART/control/NCM enabled and GDB disabled. Only the SD monitor payload
+changed. The guest kernel and initramfs from the earlier measurement were kept
+in a separate bundle after detecting a concurrent rebuild of the shared console
+package. The archived initramfs was restored with its recorded length, header
+CRC and data CRC; the kernel matched its recorded SHA-256.
+
+With no applications opened for the comparison, the earlier connected-host
+samples were 39.9%, 39.1%, 37.6% and 37.6% total CPU busy. The first four samples
+after the monitor update were 24.0%, 33.5%, 20.7% and 20.5%; after settling,
+four more were 21.3%, 19.7%, 20.9% and 20.2% (mean 20.525%). These are short
+guest `top` samples across separate boots, not a controlled repeated A/B trial
+or a measurement separating the individual optimizations. The user also reported
+that interaction felt responsive again.
+
+Management and guest ICMP each completed 5/5 replies. Guest external HTTP
+returned 200, and a host-served 1 MiB HTTP body was received in 2.102 seconds.
+All 115 workspace tests, Clippy, EL2 ISA validation and four QEMU network cases
+passed. The host serial readers were closed after verification.
+
+Monitor payload SHA-256:
+`e2ce4c30cec59f6e3ef92309bf6f448d2a41afd51e83673786c45b8914b01faf`.
+Evidence is in `.cache/idle-network-fix/` and the companion Switch project's
+`.cache/switchvisor-internet/idle-fix-verification.json`, `idle-fix-cpu.json`,
+`idle-fix-stable-cpu.json` and `idle-fix-guest-bundle/provenance.json`.
+
 ## Implementation bounds
 
-- NCM 1.0, USB 2 full/high speed, NTB16 without CRC. IN sends one frame per NTB;
-  OUT accepts up to 16 datagrams in a 16 KiB block, including chained NDPs.
+- NCM 1.0, USB 2 full/high speed, NTB16 without CRC. IN batches queued frames
+  directly into one DMA NTB, bounded by the host's input size and the eight-slot
+  egress queue. A lone frame is sent immediately. OUT accepts up to 16 datagrams
+  in a 16 KiB block, including chained NDPs, with two independently owned DMA
+  slots so USB reception can overlap CPU consumption.
   Alternate setting 0 stops bulk traffic; setting 1 enables it. EP0 negotiates
   NTB input size and packet filters, and the interrupt endpoint reports link
   and speed changes. Existing CDC and vendor interface numbers do not change.
@@ -191,6 +230,72 @@ SHA-256 is `61d28a1cd2f207e2a686f036ab6a7dda5301a73d0522e371954a86e121cb6647`.
   guest may be dropped so host management stays responsive. Link reset flushes
   pending bridge packets. There is no per-packet allocation.
 
+## Monitor memory and packet ownership
+
+EL2 enables its instruction/data caches on every CPU. Only its private resident
+RAM is mapped Normal WB, inner-shareable. The separate 2 MiB block starting at
+`0xfee00000` stays Normal NC and execute-never; the linker places the 80 KiB USB
+DMA arena there. MMIO remains Device-nGnRnE. Guest RAM and the framebuffer retain
+their NC EL2 aliases: guests with different stage-1 attributes and MMU-off boot
+code do not acquire a new cacheable alias. Guest shared-memory access still
+performs the existing cache maintenance, followed by bounded volatile 64-bit
+copies with byte handling for alignment/tails. No access extends past the
+validated buffer. These memory-type and table-walk controls follow Arm's
+[AArch64 memory management guide](https://developer.arm.com/documentation/101811/latest).
+
+CPU0 constructs the immutable maps before enabling caches. Secondary CPUs
+install the same mappings before touching shared state. The existing ordered
+load/store Bakery synchronization remains; the linked image still prohibits
+FP/SIMD and exclusive/atomic RMW instructions, including bootstrap paths.
+
+Normal host-to-guest forwarding borrows a completed XUDC OUT buffer, validates
+the entire NTB, and writes its datagram directly to the guest RX descriptor
+chain: **one payload copy**, previously five. The DMA slot cannot be rearmed
+until the last datagram callback returns. A second queued OUT slot lets USB
+receive another NTB meanwhile. If guest RX stalls, the bridge retains a frame
+in its bounded queue; that path needs an additional copy and preserves ordering.
+
+Guest TX reads directly into a reserved host egress ring slot, then NCM encodes
+directly into its final IN DMA buffer: **two payload copies**, previously five.
+The ring snapshot lets the guest recycle a completed TX descriptor while USB
+is busy. Both directions process the 12-byte virtio header separately, without
+assembling another full-size packet. Descriptor scratch is reused, and only
+the validated descriptor count is read. Management replies are generated in
+their final ring slots with padding and UDP checksum fields explicitly cleared.
+
+Queued TX frames can share one NTB and one USB completion. Busy IN storage is
+not read or rewritten; only frames successfully submitted are removed from the
+bridge. Host input-size limits, packet filters, ZLP, endpoint reset, alternate
+settings, and ring wrap keep the same ownership/backpressure rules.
+
+### Device verification, 2026-09-22
+
+Payload `94ebc3983ea789b4227e34643c805eb9541dcb51ddb5df1f080658937c999e32`
+was installed with SD readback verification. The monitor was the only changed
+SD file; 49 protected files were verified unchanged. The uploaded guest booted
+all four CPUs with USB UART/control/NCM enabled and no GDB.
+
+Management and guest ICMP each returned 3/3 replies. External HTTP returned
+200 in 54 ms. In the same request invocation, a host-served 1 MiB body completed
+in **134 ms** (1048576 bytes, HTTP 200). The earlier bring-up record was 2102 ms.
+The user requested no repeat of the old-version measurement; these are separate
+single-transfer records, with different guest builds and active applications,
+not a controlled A/B or sustained-bandwidth claim. `yt` was already running in
+the new CPU snapshot, so it is not an idle-CPU comparison.
+
+All 125 workspace tests, Clippy, formatting, the linked ISA guard, four QEMU
+network cases, five QEMU SMP cases, and 22 packaging cases passed. QEMU does
+not model physical XUDC or prove real cache coherence; the physical checks
+above exercise the deployed DMA and guest-memory paths.
+
+Evidence: `.cache/cache-copy-fix/` in this repository and
+`.cache/switchvisor-internet/cache-copy-verification.json`,
+`cache-copy-http.txt`, `cache-copy-deploy.log`, and `cache-copy-sd-backup/`
+in the companion Switch project. The copied guest kernel SHA-256 is
+`d57ef5ceb0aa14b66ad0e3e354a7105717f448013d5f5a6f5356389164cb1bbb`;
+initramfs SHA-256 is
+`e14dbc6b95d3b06ba09b74a3216a8a71a5cdd9cc202c3d8851c3d450fbf798a4`.
+
 ## Reproducible verification without a Switch
 
 ```sh
@@ -208,6 +313,10 @@ The QEMU output directory must be new. QEMU runs the real EL2 binary with guest
 MMU/cache configuration both off and on, checks both virtqueues using a local
 management ARP exchange, and verifies virtual INTID 71 delivery and acknowledgement,
 priority register readback, injected priority and masking by the guest's GICC_PMR.
+It also drains each queue, then verifies that separate TX and RX notifications
+resume processing after the queue becomes empty. Host tests check that repeated
+idle service performs no guest RAM accesses, and that one notification continues
+to make progress across the service budget and egress backpressure.
 It does not emulate Tegra XUDC. Host tests drive the actual XUDC event-ring code
 with simulated MMIO and DMA, covering NCM enumeration, control requests, both
 transfer directions through virtio-net, short packets/ZLP, malformed input,

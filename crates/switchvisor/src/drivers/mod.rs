@@ -50,4 +50,16 @@ pub trait DmaBuffer {
     fn size(&self) -> usize;
     fn read32(&mut self, offset: usize) -> u32;
     fn write32(&mut self, offset: usize, value: u32);
+    /// Borrow a CPU-owned payload range for the duration of `f`. The driver
+    /// calls this only after OUT completion or before publishing an IN TRB,
+    /// and cannot rearm/submit the range until `f` returns. Other DMA ranges
+    /// (event rings, contexts, other endpoints) may still be hardware-owned.
+    /// The adapter must bounds-check and provide a non-cacheable view without
+    /// copying. References cannot escape the callback.
+    fn with_cpu_buffer<R>(
+        &mut self,
+        offset: usize,
+        length: usize,
+        f: impl FnOnce(&mut [u8]) -> R,
+    ) -> R;
 }

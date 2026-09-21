@@ -1,4 +1,5 @@
-//! EL2 entry, translation control and cache-off synchronization.
+//! EL2 entry, translation control and shared-state synchronization.
+pub mod copy;
 use core::arch::{asm, global_asm};
 
 pub mod interrupt;

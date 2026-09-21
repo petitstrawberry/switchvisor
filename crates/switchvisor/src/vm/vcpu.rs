@@ -154,9 +154,10 @@ pub fn handle(registers: &mut [u64; 31]) -> bool {
 #[unsafe(no_mangle)]
 extern "C" fn rust_secondary() -> ! {
     // No BSS clearing or table construction occurs on a secondary CPU.
-    record(Stage::Entry);
     unsafe {
         cpu::mmu::enable();
+        // CPU0 uses WB state. Install the same mapping before shared accesses.
+        record(Stage::Entry);
         record(Stage::Mmu);
         cpu::stage2::enable();
     }

@@ -18,7 +18,7 @@ SECTIONS {
     .bss (NOLOAD) : {
         __bss_start = .;
         *(.bss .bss.* COMMON)
-        . = ALIGN(16);
+        . = ALIGN(64);
         __boot_stack_bottom = .;
         __boot_stack_top = . + 64K;
         . += 256K;
@@ -29,5 +29,9 @@ SECTIONS {
     }
     ASSERT(__bss_end - _start <= 1M, "bootstrap exceeds relocation budget")
     ASSERT(__bss_end <= 0xFFC00000, "VMM exceeds protected region")
+    /* A separate NC block: never share a cache line with monitor state. The
+       driver initializes this storage before giving any descriptor to XUDC. */
+    .dma 0xFEE00000 (NOLOAD) : { KEEP(*(.dma)) }
+    ASSERT(SIZEOF(.dma) <= 2M, "DMA exceeds its non-cacheable block")
     /DISCARD/ : { *(.eh_frame*) *(.comment*) *(.note*) }
 }

@@ -7,7 +7,7 @@ use core::{
 use switchvisor::{
     drivers::Mmio,
     mmio::Access,
-    net::{Ethernet, FRAME_SIZE, Network},
+    net::{Ethernet, Network},
     vdev::{
         self,
         virtio_net::{BASE, GuestMemory, MemoryError, SIZE},
@@ -55,9 +55,7 @@ impl GuestMemory for Memory {
             // The guest maps RAM cacheable while EL2 uses a noncacheable alias.
             // Clean to PoC before EL2 reads, without discarding guest writes.
             cache_range(address, output.len(), false);
-            for (i, byte) in output.iter_mut().enumerate() {
-                *byte = core::ptr::read_volatile((address + i as u64) as *const u8);
-            }
+            crate::arch::aarch64::copy::read(address as *const u8, output);
         }
         Ok(())
     }
@@ -67,9 +65,7 @@ impl GuestMemory for Memory {
         }
         unsafe {
             cache_range(address, bytes.len(), true);
-            for (i, byte) in bytes.iter().enumerate() {
-                core::ptr::write_volatile((address + i as u64) as *mut u8, *byte);
-            }
+            crate::arch::aarch64::copy::write(address as *mut u8, bytes);
             asm!("dsb sy", options(nostack));
             cache_range(address, bytes.len(), true);
         }
@@ -139,8 +135,8 @@ impl Ethernet for Disconnected {
     fn link_up(&self) -> bool {
         false
     }
-    fn receive_frame(&mut self, _: &mut [u8; FRAME_SIZE]) -> usize {
-        0
+    fn receive_frame(&mut self, _: impl FnOnce(&[u8])) -> bool {
+        false
     }
     fn send_frame(&mut self, _: &[u8]) -> bool {
         false

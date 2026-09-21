@@ -32,6 +32,7 @@ pub trait GuestMemory {
 struct Queue {
     num: u32,
     ready: bool,
+    poll_pending: bool,
     desc: u64,
     avail: u64,
     used: u64,
@@ -43,6 +44,7 @@ impl Queue {
         Self {
             num: 0,
             ready: false,
+            poll_pending: false,
             desc: 0,
             avail: 0,
             used: 0,
@@ -62,12 +64,13 @@ impl Queue {
             && memory.valid(self.used, 6 + self.num as usize * 8)
     }
     fn next(
-        &self,
+        &mut self,
         memory: &mut impl GuestMemory,
         writable: bool,
-    ) -> Result<Option<Chain>, MemoryError> {
-        if !self.ready {
-            return Ok(None);
+        chain: &mut Chain,
+    ) -> Result<bool, MemoryError> {
+        if !self.ready || !self.poll_pending {
+            return Ok(false);
         }
         if !self.valid(memory) {
             return Err(MemoryError);
@@ -76,7 +79,12 @@ impl Queue {
         memory.barrier();
         let count = available.wrapping_sub(self.next_avail);
         if count == 0 {
-            return Ok(None);
+            // We never suppress available-buffer notifications. Once empty,
+            // wait for QueueNotify instead of cleaning guest cache lines and
+            // reading avail.idx on every unrelated USB service. The monitor
+            // serializes this observation and MMIO kicks under NETWORK.
+            self.poll_pending = false;
+            return Ok(false);
         }
         if u32::from(count) > self.num {
             return Err(MemoryError);
@@ -85,12 +93,11 @@ impl Queue {
             memory,
             self.avail + 4 + u64::from(self.next_avail % self.num as u16) * 2,
         )?;
-        let mut chain = Chain {
-            head,
-            segments: [Segment::EMPTY; QUEUE_SIZE],
-            count: 0,
-            length: 0,
-        };
+        // Snapshot only descriptors actually supplied by the guest. The rest
+        // of this reusable scratch array is never read (and need not be zeroed).
+        chain.head = head;
+        chain.count = 0;
+        chain.length = 0;
         let mut index = head;
         let mut seen = [0u64; QUEUE_SIZE / 64];
         loop {
@@ -122,7 +129,7 @@ impl Queue {
             }
             index = u16::from_le_bytes(descriptor[14..16].try_into().unwrap());
         }
-        Ok(Some(chain))
+        Ok(true)
     }
     fn finish(
         &mut self,
@@ -168,34 +175,77 @@ struct Chain {
     length: usize,
 }
 impl Chain {
-    fn read(&self, memory: &mut impl GuestMemory, bytes: &mut [u8]) -> Result<(), MemoryError> {
-        let mut cursor = 0;
-        for segment in &self.segments[..self.count] {
-            let count = segment.length.min(bytes.len() - cursor);
-            memory.read(segment.address, &mut bytes[cursor..cursor + count])?;
-            cursor += count;
-            if cursor == bytes.len() {
-                break;
-            }
+    const fn new() -> Self {
+        Self {
+            head: 0,
+            segments: [Segment::EMPTY; QUEUE_SIZE],
+            count: 0,
+            length: 0,
         }
-        Ok(())
     }
-    fn write(&self, memory: &mut impl GuestMemory, bytes: &[u8]) -> Result<(), MemoryError> {
+    fn read(
+        &self,
+        memory: &mut impl GuestMemory,
+        mut offset: usize,
+        bytes: &mut [u8],
+    ) -> Result<(), MemoryError> {
         let mut cursor = 0;
         for segment in &self.segments[..self.count] {
-            let count = segment.length.min(bytes.len() - cursor);
-            memory.write(segment.address, &bytes[cursor..cursor + count])?;
+            if offset >= segment.length {
+                offset -= segment.length;
+                continue;
+            }
+            let count = (segment.length - offset).min(bytes.len() - cursor);
+            memory.read(
+                segment.address + offset as u64,
+                &mut bytes[cursor..cursor + count],
+            )?;
             cursor += count;
+            offset = 0;
             if cursor == bytes.len() {
                 break;
             }
         }
-        Ok(())
+        if cursor == bytes.len() {
+            Ok(())
+        } else {
+            Err(MemoryError)
+        }
+    }
+    fn write(
+        &self,
+        memory: &mut impl GuestMemory,
+        mut offset: usize,
+        bytes: &[u8],
+    ) -> Result<(), MemoryError> {
+        let mut cursor = 0;
+        for segment in &self.segments[..self.count] {
+            if offset >= segment.length {
+                offset -= segment.length;
+                continue;
+            }
+            let count = (segment.length - offset).min(bytes.len() - cursor);
+            memory.write(
+                segment.address + offset as u64,
+                &bytes[cursor..cursor + count],
+            )?;
+            cursor += count;
+            offset = 0;
+            if cursor == bytes.len() {
+                break;
+            }
+        }
+        if cursor == bytes.len() {
+            Ok(())
+        } else {
+            Err(MemoryError)
+        }
     }
 }
 
 pub struct Net {
     queues: [Queue; 2],
+    chain: Chain,
     queue_sel: u32,
     device_features_sel: u32,
     driver_features_sel: u32,
@@ -217,6 +267,7 @@ impl Net {
     pub const fn new() -> Self {
         Self {
             queues: [Queue::new(); 2],
+            chain: Chain::new(),
             queue_sel: 0,
             device_features_sel: 0,
             driver_features_sel: 0,
@@ -273,19 +324,20 @@ impl Net {
         frame: &mut [u8; FRAME_SIZE],
     ) -> Result<usize, MemoryError> {
         let queue = &mut self.queues[1];
-        let Some(chain) = queue.next(memory, false)? else {
+        let chain = &mut self.chain;
+        if !queue.next(memory, false, chain)? {
             return Ok(0);
-        };
+        }
         if !(HEADER_SIZE + 14..=HEADER_SIZE + FRAME_SIZE).contains(&chain.length) {
             return Err(MemoryError);
         }
-        let mut packet = [0; HEADER_SIZE + FRAME_SIZE];
-        chain.read(memory, &mut packet[..chain.length])?;
-        if packet[0] != 0 || packet[1] != 0 || packet[10..12] != [0, 0] {
+        let mut header = [0; HEADER_SIZE];
+        chain.read(memory, 0, &mut header)?;
+        if header[0] != 0 || header[1] != 0 || header[10..12] != [0, 0] {
             return Err(MemoryError);
         }
         let length = chain.length - HEADER_SIZE;
-        frame[..length].copy_from_slice(&packet[HEADER_SIZE..chain.length]);
+        chain.read(memory, HEADER_SIZE, &mut frame[..length])?;
         if queue.finish(memory, chain.head, 0)? {
             self.interrupt |= 1;
         }
@@ -310,17 +362,18 @@ impl Net {
         frame: &[u8],
     ) -> Result<bool, MemoryError> {
         let queue = &mut self.queues[0];
-        let Some(chain) = queue.next(memory, true)? else {
+        let chain = &mut self.chain;
+        if !queue.next(memory, true, chain)? {
             return Ok(false);
-        };
+        }
         let length = HEADER_SIZE + frame.len();
         if chain.length < length {
             return Err(MemoryError);
         }
-        let mut packet = [0; HEADER_SIZE + FRAME_SIZE];
-        packet[10] = 1; // num_buffers is present even without MRG_RXBUF in v1+.
-        packet[HEADER_SIZE..length].copy_from_slice(frame);
-        chain.write(memory, &packet[..length])?;
+        let mut header = [0; HEADER_SIZE];
+        header[10] = 1; // num_buffers is present even without MRG_RXBUF in v1+.
+        chain.write(memory, 0, &header)?;
+        chain.write(memory, HEADER_SIZE, frame)?;
         if queue.finish(memory, chain.head, length)? {
             self.interrupt |= 1;
         }
@@ -397,6 +450,11 @@ impl VirtualDevice for Net {
                     | (u64::from(value) << shift);
             }
             0x30 => self.queue_sel = value,
+            0x50 => {
+                if let Some(queue) = self.queues.get_mut(value as usize) {
+                    queue.poll_pending = queue.ready;
+                }
+            }
             0x64 => self.interrupt &= !(value & 3),
             0x70 => {
                 if value == 0 {
@@ -414,7 +472,13 @@ impl VirtualDevice for Net {
                     if next & (FEATURES_OK | 3) != FEATURES_OK | 3 {
                         next &= !DRIVER_OK;
                     }
+                    let was_running = self.running();
                     self.status = next & 0xcf;
+                    if !was_running && self.running() {
+                        for queue in &mut self.queues {
+                            queue.poll_pending = queue.ready;
+                        }
+                    }
                 }
             }
             0x38 | 0x44 | 0x80 | 0x84 | 0x90 | 0x94 | 0xa0 | 0xa4 => {
@@ -422,8 +486,10 @@ impl VirtualDevice for Net {
                     if offset == 0x44 {
                         if value == 0 {
                             queue.ready = false;
+                            queue.poll_pending = false;
                         } else if value == 1 {
                             queue.ready = true;
+                            queue.poll_pending = true;
                         }
                     } else if !queue.ready {
                         match offset {
@@ -445,7 +511,7 @@ impl VirtualDevice for Net {
                     }
                 }
             }
-            _ => {} // QueueNotify is a hint; service observes both queues.
+            _ => {}
         }
         Ok(())
     }

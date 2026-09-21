@@ -10,11 +10,23 @@ pub const MANAGEMENT_IP: [u8; 4] = [192, 168, 77, 1];
 pub const MANAGEMENT_PORT: u16 = 7777;
 const QUEUE_SIZE: usize = 8;
 
-/// Packet operations are atomic: false/zero means retry the entire frame.
+/// A received frame is borrowed until the callback returns, then consumed.
+/// A failed send leaves ownership with the caller; retry the entire frame.
 pub trait Ethernet {
     fn link_up(&self) -> bool;
-    fn receive_frame(&mut self, output: &mut [u8; FRAME_SIZE]) -> usize;
+    fn receive_frame(&mut self, receive: impl FnOnce(&[u8])) -> bool;
     fn send_frame(&mut self, frame: &[u8]) -> bool;
+    /// Consume only accepted frames, preserving order across backpressure.
+    /// A transport may combine queued frames into one hardware transfer.
+    fn send_frames(&mut self, frames: &mut Frames) -> usize {
+        if let Some(frame) = frames.front() {
+            if self.send_frame(frame) {
+                frames.pop();
+                return 1;
+            }
+        }
+        0
+    }
 }
 
 pub struct Frames {
@@ -42,18 +54,40 @@ impl Frames {
     pub fn full(&self) -> bool {
         self.count == QUEUE_SIZE
     }
+    pub fn empty(&self) -> bool {
+        self.count == 0
+    }
+    /// Reserve the tail in place. It stays invisible until `commit` succeeds;
+    /// an empty/invalid packet can simply abandon the reservation.
+    fn spare(&mut self) -> Option<&mut [u8; FRAME_SIZE]> {
+        if self.full() {
+            return None;
+        }
+        Some(&mut self.bytes[(self.head + self.count) % QUEUE_SIZE])
+    }
+    fn commit(&mut self, length: usize) -> bool {
+        if self.full() || !(14..=FRAME_SIZE).contains(&length) {
+            return false;
+        }
+        self.lengths[(self.head + self.count) % QUEUE_SIZE] = length;
+        self.count += 1;
+        true
+    }
     pub fn push(&mut self, frame: &[u8]) -> bool {
         if self.full() || !(14..=FRAME_SIZE).contains(&frame.len()) {
             return false;
         }
-        let tail = (self.head + self.count) % QUEUE_SIZE;
-        self.bytes[tail][..frame.len()].copy_from_slice(frame);
-        self.lengths[tail] = frame.len();
-        self.count += 1;
-        true
+        self.spare().unwrap()[..frame.len()].copy_from_slice(frame);
+        self.commit(frame.len())
     }
     pub fn front(&self) -> Option<&[u8]> {
         (self.count != 0).then(|| &self.bytes[self.head][..self.lengths[self.head]])
+    }
+    pub fn iter(&self) -> impl Iterator<Item = &[u8]> {
+        (0..self.count).map(|offset| {
+            let index = (self.head + offset) % QUEUE_SIZE;
+            &self.bytes[index][..self.lengths[index]]
+        })
     }
     pub fn pop(&mut self) {
         if self.count != 0 {
@@ -107,36 +141,81 @@ impl Bridge {
     }
 
     pub fn receive(&mut self, port: Port, frame: &[u8]) -> bool {
-        if !(14..=FRAME_SIZE).contains(&frame.len()) || frame[6] & 1 != 0 {
+        let (reply, forward) = match port {
+            Port::Host => (&mut self.host, &mut self.guest),
+            Port::Guest => (&mut self.guest, &mut self.host),
+        };
+        if Self::route(
+            frame,
+            reply,
+            &mut self.received,
+            &mut self.rejected,
+            &mut self.management_replies,
+        ) && !forward.push(frame)
+        {
             self.rejected = self.rejected.saturating_add(1);
-            return true;
         }
-        self.received = self.received.saturating_add(1);
+        true
+    }
+
+    // Classify and generate replies directly into their egress ring slot.
+    fn route(
+        frame: &[u8],
+        reply: &mut Frames,
+        received: &mut u64,
+        rejected: &mut u64,
+        replies: &mut u64,
+    ) -> bool {
+        if !(14..=FRAME_SIZE).contains(&frame.len()) || frame[6] & 1 != 0 {
+            *rejected = rejected.saturating_add(1);
+            return false;
+        }
+        *received = received.saturating_add(1);
         let local = frame[..6] == MANAGEMENT_MAC;
-        let multicast = frame[0] & 1 != 0;
-        if local || multicast {
-            let mut reply = [0; FRAME_SIZE];
-            let length = management(frame, &mut reply);
-            if length != 0 {
-                let queue = match port {
-                    Port::Host => &mut self.host,
-                    Port::Guest => &mut self.guest,
-                };
-                if queue.push(&reply[..length]) {
-                    self.management_replies = self.management_replies.saturating_add(1);
-                } else {
-                    self.rejected = self.rejected.saturating_add(1);
+        if local || frame[0] & 1 != 0 {
+            if let Some(output) = reply.spare() {
+                let length = management(frame, output);
+                if reply.commit(length) {
+                    *replies = replies.saturating_add(1);
                 }
+            } else {
+                // Management must never stall forwarding or a guest's TX ACK.
+                *rejected = rejected.saturating_add(1);
             }
         }
-        if !local {
-            let queue = match port {
-                Port::Host => &mut self.guest,
-                Port::Guest => &mut self.host,
-            };
-            if !queue.push(frame) {
-                self.rejected = self.rejected.saturating_add(1);
-            }
+        !local
+    }
+
+    fn receive_host(&mut self, frame: &[u8], deliver: impl FnOnce(&[u8]) -> bool) {
+        if Self::route(
+            frame,
+            &mut self.host,
+            &mut self.received,
+            &mut self.rejected,
+            &mut self.management_replies,
+        ) && !(self.guest.empty() && deliver(frame))
+            && !self.guest.push(frame)
+        {
+            self.rejected = self.rejected.saturating_add(1);
+        }
+    }
+
+    fn receive_guest(&mut self, fill: impl FnOnce(&mut [u8; FRAME_SIZE]) -> usize) -> bool {
+        let Some(slot) = self.host.spare() else {
+            return false;
+        };
+        let length = fill(slot);
+        if length == 0 {
+            return false;
+        }
+        if Self::route(
+            &slot[..length],
+            &mut self.guest,
+            &mut self.received,
+            &mut self.rejected,
+            &mut self.management_replies,
+        ) {
+            self.host.commit(length);
         }
         true
     }
@@ -180,14 +259,10 @@ impl Network {
         if !up {
             self.bridge.host.clear();
         }
-        let mut frame = [0; FRAME_SIZE];
         for _ in 0..16 {
             let mut progressed = false;
-            if let Some(bytes) = self.bridge.host.front() {
-                if ethernet.send_frame(bytes) {
-                    self.bridge.host.pop();
-                    progressed = true;
-                }
+            if ethernet.send_frames(&mut self.bridge.host) != 0 {
+                progressed = true;
             }
             if let Some(bytes) = self.bridge.guest.front() {
                 if self.device.receive(memory, bytes) {
@@ -195,17 +270,17 @@ impl Network {
                     progressed = true;
                 }
             }
-            let length = ethernet.receive_frame(&mut frame);
-            if length != 0 {
-                self.bridge.receive(Port::Host, &frame[..length]);
+            if ethernet.receive_frame(|frame| {
+                self.bridge
+                    .receive_host(frame, |bytes| self.device.receive(memory, bytes));
+            }) {
                 progressed = true;
             }
-            if self.bridge.can_receive_from_guest() {
-                let length = self.device.transmit(memory, &mut frame);
-                if length != 0 {
-                    self.bridge.receive(Port::Guest, &frame[..length]);
-                    progressed = true;
-                }
+            if self
+                .bridge
+                .receive_guest(|slot| self.device.transmit(memory, slot))
+            {
+                progressed = true;
             }
             if !progressed {
                 break;
@@ -246,7 +321,8 @@ fn management(frame: &[u8], out: &mut [u8; FRAME_SIZE]) -> usize {
         out[22..28].copy_from_slice(&MANAGEMENT_MAC);
         out[28..32].copy_from_slice(&MANAGEMENT_IP);
         out[32..42].copy_from_slice(&frame[22..32]);
-        return 60; // Ethernet minimum, excluding FCS; output was zeroed.
+        out[42..60].fill(0); // Reused ring slots must not leak old padding.
+        return 60; // Ethernet minimum, excluding FCS.
     }
     if frame.len() < 42
         || frame[..6] != MANAGEMENT_MAC
@@ -281,12 +357,16 @@ fn management(frame: &[u8], out: &mut [u8; FRAME_SIZE]) -> usize {
             // IPv4 permits a zero UDP checksum. Verify a supplied one, including
             // the pseudo-header, before interpreting even read-only commands.
             if be16(payload, 6) != 0 {
-                let mut pseudo = [0u8; FRAME_SIZE + 12];
-                pseudo[..8].copy_from_slice(&frame[26..34]);
-                pseudo[9] = 17;
-                pseudo[10..12].copy_from_slice(&(payload.len() as u16).to_be_bytes());
-                pseudo[12..12 + payload.len()].copy_from_slice(payload);
-                if checksum(&pseudo[..12 + payload.len()]) != 0 {
+                // Even-length pseudo-header components can be summed without
+                // copying the UDP payload into a second full-size packet.
+                let mut sum = u32::from(!checksum(&frame[26..34]))
+                    + 17
+                    + payload.len() as u32
+                    + u32::from(!checksum(payload));
+                while sum >> 16 != 0 {
+                    sum = (sum & 0xffff) + (sum >> 16);
+                }
+                if sum != 0xffff {
                     return 0;
                 }
             }
@@ -300,6 +380,7 @@ fn management(frame: &[u8], out: &mut [u8; FRAME_SIZE]) -> usize {
             out[34..36].copy_from_slice(&MANAGEMENT_PORT.to_be_bytes());
             out[36..38].copy_from_slice(&payload[..2]);
             out[38..40].copy_from_slice(&((8 + response.len()) as u16).to_be_bytes());
+            out[40..42].fill(0); // IPv4 permits an omitted UDP checksum.
             out[42..42 + response.len()].copy_from_slice(response);
             28 + response.len()
         }
@@ -316,5 +397,7 @@ fn management(frame: &[u8], out: &mut [u8; FRAME_SIZE]) -> usize {
     out[30..34].copy_from_slice(&frame[26..30]);
     let sum = checksum(&out[14..34]);
     out[24..26].copy_from_slice(&sum.to_be_bytes());
-    (14 + length).max(60)
+    let end = (14 + length).max(60);
+    out[14 + length..end].fill(0);
+    end
 }

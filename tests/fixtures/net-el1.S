@@ -117,6 +117,7 @@ copy_packet:
     str w10, [x20, #0x44]
     mov w10, #15
     str w10, [x20, #0x70]
+    mov w10, #1
     str w10, [x20, #0x50]
     mov x9, #0xaa080000
     ldr w10, [x20, #0x70]
@@ -170,6 +171,33 @@ received:
     str x11, [x9, #48]
     ldrb w11, [x24, #33]
     str x11, [x9, #56]
+
+    // TX went empty after the first packet. Repost it and kick TX, while RX
+    // has no buffers. Then replenish and kick RX separately: both sleeping
+    // queues must resume through real EL2 MMIO, without periodic polling.
+    add x10, x22, #0x1000
+    mov w11, #2
+    strh w11, [x10, #2]
+    dsb sy
+    mov w11, #1
+    str w11, [x20, #0x50]
+    add x10, x22, #0x2000
+    ldrh w11, [x10, #2]
+    cmp w11, #2
+    b.ne failure
+    add x10, x21, #0x2000
+    ldrh w11, [x10, #2]
+    cmp w11, #1
+    b.ne failure
+    add x10, x21, #0x1000
+    mov w11, #2
+    strh w11, [x10, #2]
+    dsb sy
+    str wzr, [x20, #0x50]
+    add x10, x21, #0x2000
+    ldrh w11, [x10, #2]
+    cmp w11, #2
+    b.ne failure
     mov x10, #1
     str x10, [x9, #8]
     mov x0, #0

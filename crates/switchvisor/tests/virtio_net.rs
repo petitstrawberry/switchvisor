@@ -127,3 +127,109 @@ fn ring_indices_wrap_and_notification_suppression_is_respected() {
     net.write(0x64, 4, 2).unwrap();
     assert!(!net.interrupt_pending());
 }
+
+#[test]
+fn empty_tx_waits_for_its_queue_notification_without_reading_guest_ram() {
+    let mut memory = Memory::new();
+    let mut net = Net::new();
+    configure(&mut net);
+    let mut out = [0; FRAME_SIZE];
+    assert_eq!(net.transmit(&mut memory, &mut out), 0);
+    let reads = memory.reads;
+    assert_eq!(reads, 1);
+
+    // A posted descriptor becomes visible to the device when the driver kicks
+    // TX. RX notifications and invalid queue indices must not wake TX.
+    let frame = frame();
+    memory.tx(&frame);
+    for queue in [0, 2, u64::from(u32::MAX)] {
+        net.write(0x50, 4, queue).unwrap();
+        for _ in 0..100 {
+            assert_eq!(net.transmit(&mut memory, &mut out), 0);
+        }
+    }
+    assert_eq!(memory.reads, reads);
+    assert_eq!(memory.writes, 0);
+
+    net.write(0x50, 4, 1).unwrap();
+    assert_eq!(net.transmit(&mut memory, &mut out), frame.len());
+    assert_eq!(&out[..frame.len()], frame);
+    assert_eq!(memory.get16(0x5002), 1);
+    assert_eq!(net.transmit(&mut memory, &mut out), 0);
+    let reads = memory.reads;
+    assert_eq!(net.transmit(&mut memory, &mut out), 0);
+    assert_eq!(memory.reads, reads);
+
+    // Reset and DRIVER_OK must discover buffers posted during setup, even if
+    // the old queue had already gone idle.
+    net.write(0x70, 4, 0).unwrap();
+    memory = Memory::new();
+    memory.tx(&frame);
+    configure(&mut net);
+    assert_eq!(net.transmit(&mut memory, &mut out), frame.len());
+}
+
+#[test]
+fn stalled_rx_resumes_when_the_driver_replenishes_and_notifies_it() {
+    let mut memory = Memory::new();
+    let mut net = Net::new();
+    configure(&mut net);
+    let frame = frame();
+    assert!(!net.receive(&mut memory, &frame));
+    let reads = memory.reads;
+    assert_eq!(reads, 1);
+    memory.rx();
+    net.write(0x50, 4, 1).unwrap();
+    for _ in 0..100 {
+        assert!(!net.receive(&mut memory, &frame));
+    }
+    assert_eq!(memory.reads, reads);
+    assert_eq!(memory.writes, 0);
+    net.write(0x50, 4, 0).unwrap();
+    assert!(net.receive(&mut memory, &frame));
+    assert_eq!(&memory.bytes[0x800c..0x800c + frame.len()], frame);
+    assert_eq!(memory.get16(0x2002), 1);
+}
+
+#[test]
+fn direct_payload_copies_cross_every_header_boundary_without_writing_slack() {
+    let frame: Vec<u8> = (0..FRAME_SIZE).map(|n| (n * 37) as u8).collect();
+    for split in [1, 5, 11, 12, 13, 14, 63, 64, 1513, 1525] {
+        let mut memory = Memory::new();
+        let mut net = Net::new();
+        configure(&mut net);
+        let mut packet = vec![0; 12];
+        packet.extend_from_slice(&frame);
+        memory.bytes[0x7000..0x7000 + split].copy_from_slice(&packet[..split]);
+        memory.bytes[0x9000..0x9000 + packet.len() - split].copy_from_slice(&packet[split..]);
+        memory.descriptor(1, 0, RAM + 0x7000, split, 1, 1);
+        memory.descriptor(1, 1, RAM + 0x9000, packet.len() - split, 0, 0);
+        memory.post(1, 0);
+        let mut output = [0; FRAME_SIZE];
+        assert_eq!(net.transmit(&mut memory, &mut output), frame.len());
+        assert_eq!(output.as_slice(), frame);
+
+        memory.bytes[0xa000..0xb800].fill(0xa5);
+        memory.descriptor(0, 0, RAM + 0xa000, split, 3, 1);
+        memory.descriptor(0, 1, RAM + 0xb000, packet.len() - split + 7, 2, 0);
+        memory.post(0, 0);
+        assert!(net.receive(&mut memory, &frame));
+        packet[10] = 1;
+        assert_eq!(&memory.bytes[0xa000..0xa000 + split], &packet[..split]);
+        assert_eq!(
+            &memory.bytes[0xb000..0xb000 + packet.len() - split],
+            &packet[split..]
+        );
+        assert!(
+            memory.bytes[0xb000 + packet.len() - split..0xb007 + packet.len() - split]
+                .iter()
+                .all(|&b| b == 0xa5)
+        );
+
+        // The descriptor snapshot is reusable; a shorter next chain must not
+        // revisit its old tail.
+        memory.tx(&frame);
+        assert_eq!(net.transmit(&mut memory, &mut output), frame.len());
+        assert_eq!(output.as_slice(), frame);
+    }
+}

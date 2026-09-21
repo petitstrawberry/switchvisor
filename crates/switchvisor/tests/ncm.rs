@@ -133,3 +133,49 @@ fn chained_ndps_with_host_payload_alignment_are_accepted() {
     bytes[34..36].copy_from_slice(&12u16.to_le_bytes());
     assert!(ncm::decode(&bytes).is_err());
 }
+
+#[test]
+fn batch_encoder_preserves_order_bounds_padding_and_full_block_retries() {
+    for capacity in [2048, ncm::NTB_SIZE] {
+        for sizes in [vec![14; 16], vec![1514; 16], vec![61, 62, 63, 64, 1514, 15]] {
+            let mut output = vec![0xa5; capacity];
+            let mut encoder = ncm::Encoder::new();
+            let mut expected = Vec::new();
+            for (index, size) in sizes.into_iter().enumerate() {
+                let frame = vec![index as u8; size];
+                let before = output.clone();
+                if encoder.push(&frame, &mut output).is_err() {
+                    assert_eq!(output, before); // Backpressure cannot overwrite an accepted frame.
+                    break;
+                }
+                expected.push(frame);
+            }
+            let length = encoder.finish(u16::MAX, &mut output).unwrap();
+            let block = ncm::decode(&output[..length]).unwrap();
+            assert_eq!(block.count, expected.len());
+            assert_eq!(&output[6..8], &[255, 255]);
+            for (datagram, frame) in block.datagrams[..block.count].iter().zip(expected) {
+                assert_eq!(
+                    &output[datagram.offset..datagram.offset + datagram.length],
+                    frame
+                );
+                assert_eq!((datagram.offset + 14) % 4, 0);
+            }
+            assert!(output[length..].iter().all(|&byte| byte == 0xa5));
+            // Every gap actually transmitted must be initialized, even if the
+            // DMA slot previously held unrelated traffic.
+            let ndp = u16::from_le_bytes(output[10..12].try_into().unwrap()) as usize;
+            for (index, &byte) in output.iter().enumerate().take(ndp).skip(12) {
+                if !block.datagrams[..block.count]
+                    .iter()
+                    .any(|d| (d.offset..d.offset + d.length).contains(&index))
+                {
+                    assert_eq!(byte, 0, "uninitialized NTB padding at {index}");
+                }
+            }
+        }
+    }
+    let mut output = [0xa5; ncm::NTB_SIZE];
+    assert!(ncm::Encoder::new().finish(0, &mut output).is_err());
+    assert!(output.iter().all(|&b| b == 0xa5));
+}

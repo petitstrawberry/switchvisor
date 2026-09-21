@@ -68,6 +68,7 @@ impl<const N: usize> Write for Output<N> {
 
 struct Service {
     driver: Xudc<Hardware, UsbDma>,
+    console_buffer: [u8; 512],
     control: Parser,
     control_output: Output<512>,
     loader: Loader,
@@ -79,6 +80,7 @@ struct Service {
 
 static USB: Mutex<Service> = Mutex::new(Service {
     driver: Xudc::new(Hardware, UsbDma),
+    console_buffer: [0; 512],
     control: Parser::new(),
     control_output: Output::new(),
     loader: Loader::new(),
@@ -251,7 +253,9 @@ fn service_locked(state: &mut Service) {
 }
 
 fn service_guest_console(state: &mut Service) {
-    let mut bytes = [0; 512];
+    // RX/TX return the initialized length; no need to clear this buffer on
+    // every USB poll, especially while the console is idle or disconnected.
+    let bytes = &mut state.console_buffer;
     let capacity = guest_console::receive_capacity().min(bytes.len());
     if capacity != 0 {
         match state
