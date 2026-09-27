@@ -85,6 +85,15 @@ network overlay alone does not change `/chosen/stdout-path`.
   replenishing buffers and TX after posting packets, as required by Virtio 1.2
   section 2.7.10.1. Console and descriptor scratch storage is retained between
   calls. Ethernet payloads use borrowed DMA storage or final ring slots.
+- If guest RX and the eight-frame bridge queue are full, forwarded unicast
+  stays in its completed NCM DMA slot. Rejecting a receive callback does not
+  advance the datagram cursor or rearm that slot; USB OUT backpressure gives the
+  guest time to replenish RX. Guest TX and the separate USB control/console
+  channels remain serviceable. RX progress restarts a 2 ms grace interval. At
+  the next service call after 2 ms without progress, ingress resumes with drops
+  until RX recovers, allowing management behind guest traffic to be reached.
+  Local management and broadcast frames at the head are processed immediately.
+  Link changes and virtio reset discard the pending bridge grace state.
 - CPU0 resumes its guest after EL2 service. Other guest CPUs are not deliberately
   stopped, but simultaneous access to shared USB/network state can wait on its
   lock. Packet copies and cache maintenance still consume time with local
@@ -146,11 +155,114 @@ returns endpoint identity, management IP and MTU. This endpoint is read-only;
 reboot and uploads continue to use `switchvisorctl` over the existing USB
 control/loader functions. A guest is not needed for these management replies.
 
+With `--usb-control`, `switchvisorctl status` also exposes cumulative ingress
+diagnostics. Capture it before and after a traffic run, outside the timed send
+interval. The UDP management `status` response above remains an identity probe.
+
+| Field | Meaning |
+| --- | --- |
+| `net-host-received` | Ethernet frames consumed from the host transport, including management traffic |
+| `net-guest-delivered` | Frames written into guest virtio RX descriptors |
+| `net-guest-rx-dropped` | Forwarded host frames discarded when immediate delivery and the bridge RX queue cannot accept them |
+| `net-guest-queue-high-water` | Maximum queued guest frames; the bridge queue holds eight |
+| `net-rejected` | Aggregate bridge rejections, including malformed frames and full queues |
+| `net-service-calls`, `net-service-total-us`, `net-service-max-us` | Service call count, accumulated execution time and maximum execution time, excluding network-lock wait |
+| `net-lock-max-us` | Maximum wait to enter the network critical section |
+| `usb-events`, `usb-errors`, `usb-resets` | USB driver event, error and reset counts |
+| `usb-dropped` | Existing USB aggregate: dropped bytes on some paths and malformed NCM blocks on another; not an Ethernet packet count |
+
+Read counters as deltas on the same boot; maxima are lifetime high-water marks,
+not per-run values. Guest virtio reset may restart `net-guest-delivered` while
+bridge counters remain cumulative. These counters do not measure downstream
+guest worker or socket drops. Matching probe loss and bridge-drop deltas on an
+otherwise quiet link localizes loss to guest ingress; host-received minus
+guest-delivered alone is insufficient because management frames stay in EL2.
+
 Set the guest to `192.168.77.3/24`, then check host ↔ guest ping and VMM ping
 from both sides. Verify simultaneous console traffic if using `--usb-uart`.
 Unplug/replug and repeat after guest network reset. The following bring-up
 records macOS enumeration and basic guest traffic; USB reset/replug stress,
 interrupt latency, SMP contention and sustained throughput remain unmeasured.
+
+### Burst ingress loss localization, 2026-09-27
+
+On Switch, the instrumented `8a84a0b` monitor (SD `bl33.bin` SHA-256
+`fefb72d85d92a2e803f37db1d2cd52985e0cdff6563a2811f36f69879484fb5d`)
+ran Scarlet `4a3d0f3`. Only counters/timing changed; queue sizes and forwarding
+policy remained unchanged. The companion Switch project's `tests/net-qa`
+receiver/sender at `23871ce` sent 1024-byte UDP payloads from Mac `.2` to guest
+`.3`, at 10 Mbps, with Moonlight stopped and the desktop running. Status was
+captured over USB control immediately before/after each run.
+
+| Profile | Sent | Probe loss | Bridge RX drops | Host frames consumed | Guest frames delivered |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Paced, 10 seconds | 12207 | 0 | 0 | 12217 | 12217 |
+| 100 ms bursts, 30 seconds | 36621 | 1471 (4.017%) | 1471 | 36635 | 35164 |
+| Same, repeat | 36621 | 1595 (4.355%) | 1492 | 36535 | 35043 |
+| Same, third run | 36621 | 1649 (4.503%) | 1649 | 36643 | 34994 |
+
+All table counters are per-run deltas. Sender errors, receiver duplicates,
+reordering and invalid packets were zero. Bursts contained at most 123 packets;
+maximum sender lateness was 239, 197 and 195 microseconds respectively. USB error,
+drop and reset deltas were zero in every run. Bridge occupancy reached eight in
+the first burst run; maximum service duration across these runs was 164 us and
+maximum network-lock wait was 2 us. These maxima cover individual service calls,
+not cumulative guest interrupt latency.
+
+The first and third burst runs account for every missing probe packet at the
+Switchvisor host-to-guest bridge. `Network::service` continues consuming host
+frames while guest RX is unavailable; `Bridge::receive_host` discards a frame
+when immediate delivery fails and its eight-entry queue is full. Scarlet posts
+16 RX buffers. This identifies insufficient burst headroom / guest replenishment
+as a concrete problem even with video decoding absent. It does not yet separate
+the contribution of guest scheduling from EL2 interrupt service timing, nor
+prove that every Moonlight freeze has this cause.
+
+The second run has 103 additional losses not explained by bridge drops; total
+host frames consumed were already below the probe send count. That points to an
+additional loss before bridge ingress but does not distinguish the Mac stack,
+USB transport and NCM receive handling. Do not count these as bridge drops or
+claim zero USB errors proves a lossless transport. A third run with Mac interface,
+IP and ARP statistics had no unexplained loss and no new host drop counters.
+Host packet capture was unavailable due to BPF device permissions.
+
+Raw probe JSON, status snapshots, Mac statistics, binary/SD readback receipts and
+the comparison are in the companion Switch project's
+`.cache/net-qa/diagnostics-boot/`. No forwarding fix was applied in these runs.
+
+### Burst ingress backpressure validation, 2026-09-27
+
+The fix retains forwarded unicast in the completed NCM slot while the bridge
+queue is full, until guest RX progresses or the 2 ms no-progress grace expires.
+Queue capacities remain unchanged. SD monitor SHA-256:
+`ba579e6db200006ba37fd8f6c6c973ace4029ee8ddaed254fca02649b28dd4fd`.
+The same Scarlet kernel, net-qa binary, desktop and 10 Mbps / 1024-byte / 100 ms
+burst profile were used, without Moonlight running.
+
+The initial 30-second hardware run received all 36621 packets with zero bridge
+RX drops, compared with 4.017–4.503% probe loss in the three baseline runs. The
+queue still reached eight: retaining pending USB input avoided the former drop.
+USB error, drop and reset deltas were zero. This run's sender had one late group
+(maximum 1720 us); sender errors, duplicates, reordering and invalid packets were
+zero.
+
+A subsequent 180-second run received 219562/219726 packets: 164 losses
+(0.074638%) and 11 reordered packets, with **zero bridge RX drops**. The ingress
+counters already reflect the missing packets, locating the remaining loss before
+bridge ingress. USB error/drop/reset deltas remained zero; this does not prove
+the USB transport is lossless. Thirty management pings during this run all
+replied (maximum RTT 3.195 ms). One additional mid-run status snapshot was taken.
+The sender reported no send errors and six groups over 1 ms late (maximum
+6504 us). The bridge overflow regression is fixed in these runs; occasional
+upstream loss and actual Moonlight playback still need separate validation.
+
+Workspace tests (127), Clippy with warnings denied, the EL2 ISA audit (no FP/SIMD
+or atomic RMW instructions), and four QEMU network cases passed. Regression
+coverage exercises 128 ordered frames through repeated guest replenishment,
+TX completion during blocked RX, timeout reaching management behind guest
+traffic, and rejected NCM callbacks retaining DMA ownership across polling and
+ring wrap. Hardware receipts and raw results live in the companion project's
+`.cache/net-qa/backpressure/`.
 
 ### Switch / macOS bring-up, 2026-09-21
 

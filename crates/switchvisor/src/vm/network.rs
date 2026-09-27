@@ -5,7 +5,7 @@ use core::{
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use switchvisor::{
-    drivers::Mmio,
+    drivers::{Clock, Mmio},
     mmio::Access,
     net::{Ethernet, Network},
     vdev::{
@@ -14,7 +14,20 @@ use switchvisor::{
     },
 };
 
-static NETWORK: Mutex<Network> = Mutex::new(Network::new());
+struct State {
+    network: Network,
+    calls: u64,
+    total_us: u64,
+    max_us: u64,
+    lock_max_us: u64,
+}
+static NETWORK: Mutex<State> = Mutex::new(State {
+    network: Network::new(),
+    calls: 0,
+    total_us: 0,
+    max_us: 0,
+    lock_max_us: 0,
+});
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static PENDING: AtomicBool = AtomicBool::new(false);
 static HIGH_END: AtomicU64 = AtomicU64::new(0x1_0000_0000);
@@ -35,6 +48,26 @@ pub fn enabled() -> bool {
 }
 pub fn interrupt_pending() -> bool {
     PENDING.load(Ordering::Acquire)
+}
+
+/// Called in USB -> NETWORK lock order, like packet service. No counters reset.
+pub fn diagnostics() -> [u64; 9] {
+    unsafe {
+        NETWORK.with(|state| {
+            let network = &state.network;
+            [
+                network.bridge.host_received,
+                network.device.rx_packets,
+                network.bridge.guest_rx_dropped,
+                network.bridge.guest_high_water as u64,
+                network.bridge.rejected,
+                state.calls,
+                state.total_us,
+                state.max_us,
+                state.lock_max_us,
+            ]
+        })
+    }
 }
 
 struct Memory;
@@ -98,10 +131,18 @@ pub fn service(ethernet: &mut impl Ethernet) {
     if !enabled() {
         return;
     }
+    let requested = Hardware.now_us();
     unsafe {
-        NETWORK.with(|network| {
-            network.service(&mut Memory, ethernet);
+        NETWORK.with(|state| {
+            let started = Hardware.now_us();
+            let network = &mut state.network;
+            network.service(&mut Memory, ethernet, started);
             PENDING.store(network.device.interrupt_pending(), Ordering::Release);
+            let elapsed = Hardware.now_us().wrapping_sub(started);
+            state.calls = state.calls.saturating_add(1);
+            state.total_us = state.total_us.saturating_add(elapsed);
+            state.max_us = state.max_us.max(elapsed);
+            state.lock_max_us = state.lock_max_us.max(started.wrapping_sub(requested));
         })
     }
 }
@@ -116,7 +157,8 @@ pub fn emulate(esr: u64, far: u64, hpfar: u64, registers: &mut [u64; 31]) -> boo
     };
     let service = access.write && matches!(access.offset, 0x44 | 0x50 | 0x70);
     let handled = unsafe {
-        NETWORK.with(|network| {
+        NETWORK.with(|state| {
+            let network = &mut state.network;
             let handled = vdev::emulate_access(&mut network.device, access, registers);
             PENDING.store(network.device.interrupt_pending(), Ordering::Release);
             handled
@@ -135,7 +177,7 @@ impl Ethernet for Disconnected {
     fn link_up(&self) -> bool {
         false
     }
-    fn receive_frame(&mut self, _: impl FnOnce(&[u8])) -> bool {
+    fn receive_frame(&mut self, _: impl FnOnce(&[u8]) -> bool) -> bool {
         false
     }
     fn send_frame(&mut self, _: &[u8]) -> bool {

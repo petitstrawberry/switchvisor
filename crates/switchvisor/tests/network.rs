@@ -116,12 +116,14 @@ impl Ethernet for Link {
     fn link_up(&self) -> bool {
         self.up
     }
-    fn receive_frame(&mut self, receive: impl FnOnce(&[u8])) -> bool {
+    fn receive_frame(&mut self, receive: impl FnOnce(&[u8]) -> bool) -> bool {
         if self.input.is_empty() {
             return false;
         }
-        let frame = self.input.remove(0);
-        receive(&frame);
+        if !receive(&self.input[0]) {
+            return false;
+        }
+        self.input.remove(0);
         true
     }
     fn send_frame(&mut self, frame: &[u8]) -> bool {
@@ -147,16 +149,16 @@ fn bridge_and_virtqueues_forward_both_directions_and_backpressure_tx() {
         output: vec![],
         busy: true,
     };
-    network.service(&mut memory, &mut link);
+    network.service(&mut memory, &mut link, 0);
     assert_eq!(&memory.bytes[0x800c..0x800c + frame.len()], frame);
     assert!(link.output.is_empty());
     assert!(network.bridge.host.front().is_some());
     link.busy = false;
-    network.service(&mut memory, &mut link);
+    network.service(&mut memory, &mut link, 0);
     assert_eq!(link.output, vec![frame]);
     network.bridge.host.push(&support::frame());
     link.up = false;
-    network.service(&mut memory, &mut link);
+    network.service(&mut memory, &mut link, 0);
     assert!(network.bridge.host.front().is_none());
 }
 
@@ -171,7 +173,7 @@ fn full_guest_rx_queue_does_not_block_guest_tx() {
         output: vec![],
         busy: true,
     };
-    network.service(&mut memory, &mut link);
+    network.service(&mut memory, &mut link, 0);
 
     // No guest RX descriptors are available. A driver can still need to send
     // a TCP ACK before it reposts RX buffers, so TX must make independent progress.
@@ -187,16 +189,94 @@ fn full_guest_rx_queue_does_not_block_guest_tx() {
     memory.tx(&frame);
 
     network.device.write(0x50, 4, 1).unwrap();
-    network.service(&mut memory, &mut link);
+    network.service(&mut memory, &mut link, 0);
     assert_eq!(memory.get16(0x5002), 0); // Host egress still backpressures TX.
     assert!(link.output.is_empty());
 
     link.busy = false;
-    network.service(&mut memory, &mut link);
+    network.service(&mut memory, &mut link, 0);
     assert_eq!(memory.get16(0x5002), 1); // TX completed without any RX progress.
     assert_eq!(link.output, vec![frame; queued_for_host + 1]);
     assert!(network.bridge.guest.full());
     assert!(network.bridge.host.front().is_none());
+}
+
+#[test]
+fn burst_ingress_waits_for_rx_replenishment_without_loss_or_reordering() {
+    let mut network = Network::new();
+    configure(&mut network.device);
+    let mut memory = Memory::new();
+    memory.rx();
+    let input: Vec<_> = (0..128)
+        .map(|seq| {
+            let mut bytes = frame();
+            bytes[20] = seq;
+            bytes
+        })
+        .collect();
+    let mut link = Link {
+        up: true,
+        input: input.clone(),
+        output: vec![],
+        busy: false,
+    };
+    network.service(&mut memory, &mut link, 0);
+    assert_eq!(network.bridge.host_received, 9);
+    assert_eq!(network.device.rx_packets, 1);
+    assert_eq!(network.bridge.guest_high_water, 8);
+    assert_eq!(network.bridge.guest_rx_dropped, 0);
+    assert_eq!(&memory.bytes[0x800c..0x800c + 60], input[0]);
+    // Total run exceeds the grace interval, but each replenishment makes progress.
+    for (seq, expected) in input.iter().enumerate().skip(1) {
+        memory.rx();
+        network.device.write(0x50, 4, 0).unwrap();
+        network.service(&mut memory, &mut link, seq as u64 * 100);
+        assert_eq!(&memory.bytes[0x800c..0x800c + 60], expected);
+    }
+    assert!(link.input.is_empty());
+    assert!(network.bridge.guest.empty());
+    assert_eq!(network.device.rx_packets, 128);
+    assert_eq!(network.bridge.host_received, 128);
+    assert_eq!(network.bridge.guest_rx_dropped, 0);
+}
+
+#[test]
+fn stalled_rx_keeps_tx_running_and_times_out_to_reach_management() {
+    let mut network = Network::new();
+    configure(&mut network.device);
+    let mut memory = Memory::new();
+    memory.rx();
+    let mut echo = [8, 0, 0, 0, 0x12, 0x34, 0, 1];
+    let sum = checksum(&echo);
+    echo[2..4].copy_from_slice(&sum.to_be_bytes());
+    let mut input = vec![frame(); 16];
+    input.push(ip_packet(1, &echo));
+    let mut link = Link {
+        up: true,
+        input,
+        output: vec![],
+        busy: false,
+    };
+    network.service(&mut memory, &mut link, 0);
+    assert_eq!(network.bridge.host_received, 9);
+    assert_eq!(network.bridge.guest_rx_dropped, 0);
+    memory.tx(&frame());
+    network.device.write(0x50, 4, 1).unwrap();
+    network.service(&mut memory, &mut link, RX_STALL_GRACE_US - 1);
+    assert_eq!(network.bridge.host_received, 9);
+    assert_eq!(link.output, vec![frame()]); // ACK can complete before RX recycles.
+    network.service(&mut memory, &mut link, RX_STALL_GRACE_US);
+    assert!(link.input.is_empty());
+    assert_eq!(network.bridge.host_received, 17);
+    assert_eq!(network.bridge.guest_rx_dropped, 7);
+    assert_eq!(link.output.len(), 2);
+    assert_eq!(link.output[1][34], 0); // Management behind the blocked frame replied.
+    while !network.bridge.guest.empty() {
+        memory.rx();
+        network.device.write(0x50, 4, 0).unwrap();
+        network.service(&mut memory, &mut link, RX_STALL_GRACE_US + 1);
+    }
+    assert_eq!(network.device.rx_packets, 9);
 }
 
 struct CopyProbe {
@@ -251,7 +331,7 @@ fn network_passes_receive_storage_directly_and_fills_transmit_ring_in_place() {
         busy: true,
     };
     let input_pointer = link.input[0].as_ptr() as usize;
-    network.service(&mut memory, &mut link);
+    network.service(&mut memory, &mut link, 0);
     assert_eq!(memory.rx_source, input_pointer); // No packet staging or bridge copy.
     assert_eq!(
         memory.tx_target,
@@ -274,12 +354,12 @@ fn direct_rx_preserves_order_after_backpressure_and_recycled_slots_zero_padding(
         output: vec![],
         busy: false,
     };
-    network.service(&mut memory, &mut link);
+    network.service(&mut memory, &mut link, 0);
     assert_eq!(network.bridge.guest.front(), Some(first.as_slice()));
     memory.rx();
     network.device.write(0x50, 4, 0).unwrap();
     link.input.push(second.clone());
-    network.service(&mut memory, &mut link);
+    network.service(&mut memory, &mut link, 0);
     assert_eq!(&memory.bytes[0x800c..0x800c + first.len()], first);
     assert_eq!(network.bridge.guest.front(), Some(second.as_slice()));
 
@@ -337,18 +417,18 @@ fn idle_and_backpressured_service_does_not_repeatedly_scan_guest_ram() {
         output: vec![],
         busy: true,
     };
-    network.service(&mut memory, &mut link);
+    network.service(&mut memory, &mut link, 0);
     assert_eq!(memory.reads, 1); // Check TX avail.idx once, then return to EL1.
     assert_eq!(memory.writes, 0);
     network.bridge.guest.push(&frame());
     memory.reads = 0;
-    network.service(&mut memory, &mut link);
+    network.service(&mut memory, &mut link, 0);
     assert_eq!(memory.reads, 1); // Only RX needs its initial empty check.
     assert_eq!(memory.writes, 0);
     assert!(network.bridge.guest.front().is_some());
     memory.reads = 0;
     for _ in 0..1000 {
-        network.service(&mut memory, &mut link);
+        network.service(&mut memory, &mut link, 0);
     }
     assert_eq!(memory.reads, 0); // Both empty queues now wait for a kick.
     assert_eq!(memory.writes, 0);
@@ -377,12 +457,12 @@ fn a_single_kick_keeps_tx_runnable_across_the_service_budget() {
         output: vec![],
         busy: false,
     };
-    network.service(&mut memory, &mut link);
+    network.service(&mut memory, &mut link, 0);
     assert_eq!(memory.get16(0x5002), 16);
-    network.service(&mut memory, &mut link);
+    network.service(&mut memory, &mut link, 0);
     assert_eq!(memory.get16(0x5002), 24);
     assert_eq!(link.output, vec![frame; 24]);
     let reads = memory.reads;
-    network.service(&mut memory, &mut link);
+    network.service(&mut memory, &mut link, 0);
     assert_eq!(memory.reads, reads);
 }

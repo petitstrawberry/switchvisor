@@ -70,7 +70,7 @@ struct Service {
     driver: Xudc<Hardware, UsbDma>,
     console_buffer: [u8; 512],
     control: Parser,
-    control_output: Output<512>,
+    control_output: Output<2048>,
     loader: Loader,
     loader_input: [u8; MAX_MESSAGE_SIZE],
     loader_output: Output<MAX_RESPONSE_SIZE>,
@@ -360,6 +360,28 @@ fn control_reply(state: &mut Service, command: Result<Command, ParseError>) {
                 "guest-entry={:#x}",
                 GUEST_ENTRY.load(Ordering::Acquire)
             );
+            let stats = &state.driver.statistics;
+            let _ = writeln!(state.control_output, "usb-events={}", stats.events);
+            let _ = writeln!(state.control_output, "usb-errors={}", stats.errors);
+            let _ = writeln!(state.control_output, "usb-dropped={}", stats.dropped);
+            let _ = writeln!(state.control_output, "usb-resets={}", stats.resets);
+            let metrics = crate::vm::network::diagnostics();
+            for (name, value) in [
+                "net-host-received",
+                "net-guest-delivered",
+                "net-guest-rx-dropped",
+                "net-guest-queue-high-water",
+                "net-rejected",
+                "net-service-calls",
+                "net-service-total-us",
+                "net-service-max-us",
+                "net-lock-max-us",
+            ]
+            .into_iter()
+            .zip(metrics)
+            {
+                let _ = writeln!(state.control_output, "{name}={value}");
+            }
             let _ = writeln!(state.control_output, "OK");
         }
         Ok(Command::Reboot) => {

@@ -1189,7 +1189,7 @@ impl<H: Mmio + Clock, D: DmaBuffer> Ethernet for Xudc<H, D> {
         self.connected_channel(Channel::Ncm)
     }
 
-    fn receive_frame(&mut self, receive_frame: impl FnOnce(&[u8])) -> bool {
+    fn receive_frame(&mut self, receive_frame: impl FnOnce(&[u8]) -> bool) -> bool {
         if !self.link_up() {
             return false;
         }
@@ -1217,11 +1217,14 @@ impl<H: Mmio + Clock, D: DmaBuffer> Ethernet for Xudc<H, D> {
         let datagram = self.ncm_block.datagrams[self.ncm_cursor];
         // Keep the completed OUT slot CPU-owned across every datagram. Poll
         // cannot rearm it while length is Some; the callback cannot retain it.
-        self.dma.with_cpu_buffer(
+        let accepted = self.dma.with_cpu_buffer(
             NCM_RX_BUFFERS[self.ncm_receive_index] + datagram.offset,
             datagram.length,
             |bytes| receive_frame(bytes),
         );
+        if !accepted {
+            return false; // Keep the cursor and completed DMA slot CPU-owned.
+        }
         self.ncm_cursor += 1;
         if self.ncm_cursor == self.ncm_block.count {
             self.release_ncm_receive();

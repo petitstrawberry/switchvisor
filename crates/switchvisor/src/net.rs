@@ -9,12 +9,15 @@ pub const MANAGEMENT_MAC: [u8; 6] = [0x02, 0x53, 0x56, 0, 0, 3];
 pub const MANAGEMENT_IP: [u8; 4] = [192, 168, 77, 1];
 pub const MANAGEMENT_PORT: u16 = 7777;
 const QUEUE_SIZE: usize = 8;
+/// Grace for guest RX replenishment before dropping to keep management reachable.
+pub const RX_STALL_GRACE_US: u64 = 2_000;
 
-/// A received frame is borrowed until the callback returns, then consumed.
+/// A received frame is borrowed until the callback returns. Returning false
+/// retains that frame and its DMA ownership for a later receive attempt.
 /// A failed send leaves ownership with the caller; retry the entire frame.
 pub trait Ethernet {
     fn link_up(&self) -> bool;
-    fn receive_frame(&mut self, receive: impl FnOnce(&[u8])) -> bool;
+    fn receive_frame(&mut self, receive: impl FnOnce(&[u8]) -> bool) -> bool;
     fn send_frame(&mut self, frame: &[u8]) -> bool;
     /// Consume only accepted frames, preserving order across backpressure.
     /// A transport may combine queued frames into one hardware transfer.
@@ -113,6 +116,9 @@ pub struct Bridge {
     pub received: u64,
     pub rejected: u64,
     pub management_replies: u64,
+    pub host_received: u64,
+    pub guest_rx_dropped: u64,
+    pub guest_high_water: usize,
 }
 
 impl Default for Bridge {
@@ -129,6 +135,9 @@ impl Bridge {
             received: 0,
             rejected: 0,
             management_replies: 0,
+            host_received: 0,
+            guest_rx_dropped: 0,
+            guest_high_water: 0,
         }
     }
 
@@ -141,6 +150,9 @@ impl Bridge {
     }
 
     pub fn receive(&mut self, port: Port, frame: &[u8]) -> bool {
+        if port == Port::Host {
+            self.host_received = self.host_received.saturating_add(1);
+        }
         let (reply, forward) = match port {
             Port::Host => (&mut self.host, &mut self.guest),
             Port::Guest => (&mut self.guest, &mut self.host),
@@ -154,7 +166,11 @@ impl Bridge {
         ) && !forward.push(frame)
         {
             self.rejected = self.rejected.saturating_add(1);
+            if port == Port::Host {
+                self.guest_rx_dropped = self.guest_rx_dropped.saturating_add(1);
+            }
         }
+        self.guest_high_water = self.guest_high_water.max(self.guest.count);
         true
     }
 
@@ -187,6 +203,7 @@ impl Bridge {
     }
 
     fn receive_host(&mut self, frame: &[u8], deliver: impl FnOnce(&[u8]) -> bool) {
+        self.host_received = self.host_received.saturating_add(1);
         if Self::route(
             frame,
             &mut self.host,
@@ -197,7 +214,9 @@ impl Bridge {
             && !self.guest.push(frame)
         {
             self.rejected = self.rejected.saturating_add(1);
+            self.guest_rx_dropped = self.guest_rx_dropped.saturating_add(1);
         }
+        self.guest_high_water = self.guest_high_water.max(self.guest.count);
     }
 
     fn receive_guest(&mut self, fill: impl FnOnce(&mut [u8; FRAME_SIZE]) -> usize) -> bool {
@@ -225,6 +244,7 @@ pub struct Network {
     pub device: crate::vdev::virtio_net::Net,
     pub bridge: Bridge,
     link: bool,
+    rx_stall_since: Option<u64>,
 }
 impl Default for Network {
     fn default() -> Self {
@@ -237,6 +257,7 @@ impl Network {
             device: crate::vdev::virtio_net::Net::new(),
             bridge: Bridge::new(),
             link: false,
+            rx_stall_since: None,
         }
     }
     /// Bounded work per exit. A stalled guest may lose Ethernet frames but
@@ -245,15 +266,18 @@ impl Network {
         &mut self,
         memory: &mut impl crate::vdev::virtio_net::GuestMemory,
         ethernet: &mut impl Ethernet,
+        now_us: u64,
     ) {
         let up = ethernet.link_up();
         if self.link != up {
             self.bridge.host.clear();
             self.bridge.guest.clear();
             self.link = up;
+            self.rx_stall_since = None;
         }
         self.device.set_link(up);
         if !self.device.running() {
+            self.rx_stall_since = None;
             self.bridge.guest.clear();
         }
         if !up {
@@ -267,12 +291,33 @@ impl Network {
             if let Some(bytes) = self.bridge.guest.front() {
                 if self.device.receive(memory, bytes) {
                     self.bridge.guest.pop();
+                    self.rx_stall_since = None;
                     progressed = true;
                 }
             }
+            let defer = if self.device.running() && self.bridge.guest.full() {
+                let since = *self.rx_stall_since.get_or_insert(now_us);
+                now_us.wrapping_sub(since) < RX_STALL_GRACE_US
+            } else {
+                self.rx_stall_since = None;
+                false
+            };
             if ethernet.receive_frame(|frame| {
+                // Retain valid forwarded unicast in transport storage. Local
+                // management, broadcasts and invalid frames still get classified.
+                // After a no-progress timeout, consume/drop until RX resumes so
+                // management behind guest traffic cannot remain blocked forever.
+                if defer
+                    && (14..=FRAME_SIZE).contains(&frame.len())
+                    && frame[0] & 1 == 0
+                    && frame[6] & 1 == 0
+                    && frame[..6] != MANAGEMENT_MAC
+                {
+                    return false;
+                }
                 self.bridge
                     .receive_host(frame, |bytes| self.device.receive(memory, bytes));
+                true
             }) {
                 progressed = true;
             }

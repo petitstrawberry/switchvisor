@@ -681,11 +681,11 @@ fn ncm_virtio_bridge_runs_both_directions_through_real_xudc_event_handling() {
     mock.put_bytes(0x8000, &ntb[..length]);
     mock.complete(12, (ncm::NTB_SIZE - length) as u32, 13);
     usb.poll().unwrap();
-    network.service(&mut memory, &mut usb);
+    network.service(&mut memory, &mut usb, 0);
     assert_eq!(&memory.bytes[0x800c..0x800c + frame.len()], frame);
     memory.tx(&frame);
     network.device.write(0x50, 4, 1).unwrap();
-    network.service(&mut memory, &mut usb);
+    network.service(&mut memory, &mut usb, 0);
     let transmitted = mock.bytes(0xc000, mock.trb(13)[2] as usize);
     let block = ncm::decode(&transmitted).unwrap();
     assert_eq!(block.count, 1);
@@ -746,10 +746,20 @@ fn ncm_receive_slots_are_borrowed_until_the_last_datagram_and_wrap_in_order() {
         assert!(mock.0.borrow().ncm_out.is_empty());
         for packet in 0usize..4 {
             let dma = mock.0.borrow().dma.as_ptr() as usize;
+            let armed = mock.0.borrow().ncm_out.len();
+            for _ in 0..3 {
+                assert!(!usb.receive_frame(|frame| {
+                    assert_eq!(frame, &[next; 61]);
+                    false
+                }));
+                usb.poll().unwrap();
+                assert_eq!(mock.0.borrow().ncm_out.len(), armed);
+            }
             assert!(usb.receive_frame(|frame| {
                 assert_eq!(frame, &[next; 61]);
                 let base = dma + if packet < 2 { 0x8000 } else { 0x10000 };
                 assert!((base..base + ncm::NTB_SIZE).contains(&(frame.as_ptr() as usize)));
+                true
             }));
             next += 1;
             usb.poll().unwrap();
@@ -832,7 +842,10 @@ fn ncm_clear_halt_discards_partial_block_before_rearming_receive_slots() {
     mock.put_bytes(0x8000, &bytes[..length]);
     mock.complete(12, (ncm::NTB_SIZE - length) as u32, 13);
     usb.poll().unwrap();
-    assert!(usb.receive_frame(|frame| assert_eq!(frame, &[7; 60])));
+    assert!(usb.receive_frame(|frame| {
+        assert_eq!(frame, &[7; 60]);
+        true
+    }));
     mock.setup(2, 1, 0, 6, 0); // CLEAR_FEATURE(ENDPOINT_HALT), OUT endpoint 6.
     usb.poll().unwrap();
     mock.complete(0, 0, 1);
