@@ -1,0 +1,8 @@
+[[layers]]
+kind = "cargo"
+source = "."
+package = "scarlet-switchvisor"
+bin = "swvctl"
+features = ["cli"]
+architectures = ["aarch64"]
+to = "/bin/swvctl"

@@ -1,0 +1,25 @@
+[workspace]
+
+[package]
+name = "scarlet-switchvisor"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-only"
+description = "Switchvisor control device and CLI for Scarlet guests"
+
+[[bin]]
+name = "swvctl"
+path = "src/bin/swvctl.rs"
+required-features = ["cli"]
+
+[features]
+cli = ["dep:clap", "dep:scarlet-sys"]
+
+[dependencies]
+clap = { version = "4.5.32", default-features = false, features = ["derive", "std", "help", "usage", "error-context"], optional = true }
+
+[target.'cfg(all(target_arch = "aarch64", target_os = "none"))'.dependencies]
+scarlet = { git = "https://github.com/petitstrawberry/Scarlet", rev = "79f6736eeb4fb595b8baf74cdc6fa245dd8d74e9", default-features = false, features = ["network"] }
+
+[target.'cfg(all(target_arch = "aarch64", target_os = "scarlet"))'.dependencies]
+scarlet-sys = { git = "https://github.com/petitstrawberry/Scarlet", rev = "79f6736eeb4fb595b8baf74cdc6fa245dd8d74e9", optional = true }
