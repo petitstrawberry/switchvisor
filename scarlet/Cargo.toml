@@ -19,7 +19,7 @@ cli = ["dep:clap", "dep:scarlet-sys"]
 clap = { version = "4.5.32", default-features = false, features = ["derive", "std", "help", "usage", "error-context"], optional = true }
 
 [target.'cfg(all(target_arch = "aarch64", target_os = "none"))'.dependencies]
-scarlet = { git = "https://github.com/petitstrawberry/Scarlet", rev = "79f6736eeb4fb595b8baf74cdc6fa245dd8d74e9", default-features = false, features = ["network"] }
+scarlet = { git = "https://github.com/petitstrawberry/Scarlet", rev = "34e337b9c10ccdcbc97ef51e684d89d4c4625f8c", default-features = false, features = ["network"] }
 
 [target.'cfg(all(target_arch = "aarch64", target_os = "scarlet"))'.dependencies]
-scarlet-sys = { git = "https://github.com/petitstrawberry/Scarlet", rev = "79f6736eeb4fb595b8baf74cdc6fa245dd8d74e9", optional = true }
+scarlet-sys = { git = "https://github.com/petitstrawberry/Scarlet", rev = "34e337b9c10ccdcbc97ef51e684d89d4c4625f8c", optional = true }

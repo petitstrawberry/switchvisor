@@ -334,7 +334,7 @@ dependencies = [
 [[package]]
 name = "scarlet"
 version = "1.0.1"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=79f6736eeb4fb595b8baf74cdc6fa245dd8d74e9#79f6736eeb4fb595b8baf74cdc6fa245dd8d74e9"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=34e337b9c10ccdcbc97ef51e684d89d4c4625f8c#34e337b9c10ccdcbc97ef51e684d89d4c4625f8c"
 dependencies = [
  "aes",
  "ccm",
@@ -352,7 +352,7 @@ dependencies = [
 [[package]]
 name = "scarlet-abi"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=79f6736eeb4fb595b8baf74cdc6fa245dd8d74e9#79f6736eeb4fb595b8baf74cdc6fa245dd8d74e9"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=34e337b9c10ccdcbc97ef51e684d89d4c4625f8c#34e337b9c10ccdcbc97ef51e684d89d4c4625f8c"
 
 [[package]]
 name = "scarlet-switchvisor"
@@ -366,7 +366,7 @@ dependencies = [
 [[package]]
 name = "scarlet-sys"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=79f6736eeb4fb595b8baf74cdc6fa245dd8d74e9#79f6736eeb4fb595b8baf74cdc6fa245dd8d74e9"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=34e337b9c10ccdcbc97ef51e684d89d4c4625f8c#34e337b9c10ccdcbc97ef51e684d89d4c4625f8c"
 dependencies = [
  "scarlet-abi",
 ]
